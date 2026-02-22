@@ -578,6 +578,45 @@ pub fn graph_health(brain: &Brain) -> Result<HashMap<String, f64>, rusqlite::Err
     Ok(stats)
 }
 
+/// Clustering coefficient per entity: fraction of neighbour pairs that are connected.
+pub fn clustering_coefficients(brain: &Brain) -> Result<HashMap<i64, f64>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let mut coeffs = HashMap::new();
+    for (&node, neighbors) in &adj {
+        let k = neighbors.len();
+        if k < 2 {
+            coeffs.insert(node, 0.0);
+            continue;
+        }
+        let nb_set: HashSet<i64> = neighbors.iter().copied().collect();
+        let mut triangles = 0usize;
+        for i in 0..neighbors.len() {
+            for j in (i + 1)..neighbors.len() {
+                if nb_set.contains(&neighbors[j])
+                    && adj
+                        .get(&neighbors[i])
+                        .is_some_and(|v| v.contains(&neighbors[j]))
+                {
+                    triangles += 1;
+                }
+            }
+        }
+        let possible = k * (k - 1) / 2;
+        coeffs.insert(node, triangles as f64 / possible as f64);
+    }
+    Ok(coeffs)
+}
+
+/// Global clustering coefficient (average of local coefficients).
+pub fn global_clustering(brain: &Brain) -> Result<f64, rusqlite::Error> {
+    let coeffs = clustering_coefficients(brain)?;
+    if coeffs.is_empty() {
+        return Ok(0.0);
+    }
+    let sum: f64 = coeffs.values().sum();
+    Ok(sum / coeffs.len() as f64)
+}
+
 /// Find hub entities (highest degree) — returns (entity_id, degree) sorted descending.
 pub fn find_hubs(brain: &Brain, limit: usize) -> Result<Vec<(i64, usize)>, rusqlite::Error> {
     let relations = brain.all_relations()?;

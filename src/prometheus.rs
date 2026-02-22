@@ -46,6 +46,51 @@ const HIGH_VALUE_TYPES: &[&str] = &[
     "event",
 ];
 
+/// Stopword entity names that sneak through NLP extraction.
+const NOISE_NAMES: &[&str] = &[
+    "however",
+    "this",
+    "that",
+    "what",
+    "which",
+    "these",
+    "those",
+    "where",
+    "when",
+    "there",
+    "here",
+    "also",
+    "other",
+    "such",
+    "some",
+    "many",
+    "most",
+    "more",
+    "very",
+    "just",
+    "only",
+    "even",
+    "still",
+    "already",
+    "often",
+    "never",
+    "pages",
+    "adding",
+    "besides",
+    "journal",
+    "pdf",
+    "time",
+    "see",
+    "new",
+    "used",
+    "using",
+    "based",
+    "known",
+    "called",
+    "named",
+    "including",
+];
+
 fn is_noise_type(t: &str) -> bool {
     NOISE_TYPES.contains(&t)
 }
@@ -54,12 +99,44 @@ fn is_generic_predicate(p: &str) -> bool {
     GENERIC_PREDICATES.contains(&p)
 }
 
-/// Filter entity IDs to only meaningful ones (non-noise type, reasonable name length).
+/// Check if an entity name looks like noise (stopword, too short, numeric, etc.)
+fn is_noise_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    if NOISE_NAMES.contains(&lower.as_str()) {
+        return true;
+    }
+    // Single word under 3 chars
+    if !name.contains(' ') && name.len() < 3 {
+        return true;
+    }
+    // Mostly non-alphabetic (URLs, references, etc.)
+    let alpha_count = name.chars().filter(|c| c.is_alphabetic()).count();
+    let total = name.len().max(1);
+    if alpha_count < total / 2 {
+        return true;
+    }
+    // Starts with common fragment indicators
+    let lower_trimmed = lower.trim();
+    if lower_trimmed.starts_with("pdf ")
+        || lower_trimmed.starts_with("the original")
+        || lower_trimmed.starts_with("archived")
+    {
+        return true;
+    }
+    false
+}
+
+/// Filter entity IDs to only meaningful ones (non-noise type, reasonable name, quality).
 fn meaningful_ids(brain: &Brain) -> Result<HashSet<i64>> {
     let entities = brain.all_entities()?;
     Ok(entities
         .iter()
-        .filter(|e| !is_noise_type(&e.entity_type) && e.name.len() <= 80)
+        .filter(|e| {
+            !is_noise_type(&e.entity_type)
+                && e.name.len() <= 80
+                && e.name.len() >= 2
+                && !is_noise_name(&e.name)
+        })
         .map(|e| e.id)
         .collect())
 }
@@ -1240,9 +1317,13 @@ impl<'a> Prometheus<'a> {
         // Cross-domain gap analysis
         let cross_gaps = self.find_cross_domain_gaps().unwrap_or_default();
         let frontiers = self.find_knowledge_frontiers().unwrap_or_default();
+        let bridges = self.find_bridge_entities().unwrap_or_default();
+
+        // Decay old hypotheses (meta-learning)
+        let decayed = self.decay_old_hypotheses(7).unwrap_or(0);
 
         let summary = format!(
-            "Discovered {} patterns, generated {} hypotheses ({} confirmed, {} rejected), {} island entities, {} meaningful relations, {} cross-domain gaps, {} knowledge frontiers",
+            "Discovered {} patterns, generated {} hypotheses ({} confirmed, {} rejected), {} island entities, {} meaningful relations, {} cross-domain gaps, {} knowledge frontiers, {} bridge entities, {} old hypotheses decayed",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1251,6 +1332,8 @@ impl<'a> Prometheus<'a> {
             meaningful_rels,
             cross_gaps.len(),
             frontiers.len(),
+            bridges.len(),
+            decayed,
         );
 
         Ok(DiscoveryReport {
@@ -1324,6 +1407,65 @@ impl<'a> Prometheus<'a> {
             }
         }
         Ok(gaps)
+    }
+
+    /// Find entities that bridge multiple communities — potential cross-domain connectors.
+    pub fn find_bridge_entities(&self) -> Result<Vec<(String, String, usize)>> {
+        let components = crate::graph::connected_components(self.brain)?;
+        if components.len() < 2 {
+            return Ok(vec![]);
+        }
+        // Map entity → component index
+        let mut entity_comp: HashMap<i64, usize> = HashMap::new();
+        for (idx, comp) in components.iter().enumerate() {
+            for &id in comp {
+                entity_comp.insert(id, idx);
+            }
+        }
+        // Find entities whose neighbours span multiple components (via relations)
+        let relations = self.brain.all_relations()?;
+        let mut entity_comps: HashMap<i64, HashSet<usize>> = HashMap::new();
+        for r in &relations {
+            if let Some(&comp) = entity_comp.get(&r.object_id) {
+                entity_comps.entry(r.subject_id).or_default().insert(comp);
+            }
+            if let Some(&comp) = entity_comp.get(&r.subject_id) {
+                entity_comps.entry(r.object_id).or_default().insert(comp);
+            }
+        }
+        let mut bridges: Vec<(String, String, usize)> = Vec::new();
+        for (eid, comps) in &entity_comps {
+            if comps.len() >= 2 {
+                let name = self.entity_name(*eid)?;
+                let etype = self
+                    .brain
+                    .get_entity_by_id(*eid)?
+                    .map(|e| e.entity_type)
+                    .unwrap_or_default();
+                if !is_noise_name(&name) && !is_noise_type(&etype) {
+                    bridges.push((name, etype, comps.len()));
+                }
+            }
+        }
+        bridges.sort_by(|a, b| b.2.cmp(&a.2));
+        bridges.truncate(20);
+        Ok(bridges)
+    }
+
+    /// Decay confidence of old unconfirmed hypotheses (meta-learning cleanup).
+    pub fn decay_old_hypotheses(&self, max_age_days: i64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::days(max_age_days))
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let count = self.brain.with_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE hypotheses SET confidence = confidence * 0.8 WHERE status IN ('proposed', 'testing') AND discovered_at < ?1",
+                params![cutoff],
+            )?;
+            Ok(updated)
+        })?;
+        Ok(count)
     }
 
     /// Suggest topics to crawl based on knowledge gaps.
