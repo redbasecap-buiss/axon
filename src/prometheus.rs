@@ -104,6 +104,23 @@ fn is_generic_predicate(p: &str) -> bool {
     GENERIC_PREDICATES.contains(&p)
 }
 
+/// Verb-heavy words that signal a sentence fragment rather than a real entity name.
+const FRAGMENT_VERBS: &[&str] = &[
+    "would",
+    "could",
+    "should",
+    "became",
+    "become",
+    "produced",
+    "succeeded",
+    "incurred",
+    "controlled",
+    "founded",
+    "built",
+    "wrote",
+    "studied",
+];
+
 /// Check if an entity name looks like noise (stopword, too short, numeric, etc.)
 fn is_noise_name(name: &str) -> bool {
     let lower = name.to_lowercase();
@@ -127,6 +144,32 @@ fn is_noise_name(name: &str) -> bool {
         || lower_trimmed.starts_with("archived")
     {
         return true;
+    }
+    // Long multi-word names that look like sentence fragments (>6 words)
+    let word_count = lower_trimmed.split_whitespace().count();
+    if word_count > 6 {
+        return true;
+    }
+    // Names containing verbs typical of sentence fragments
+    if word_count > 3 {
+        let words: Vec<&str> = lower_trimmed.split_whitespace().collect();
+        let verb_count = words.iter().filter(|w| FRAGMENT_VERBS.contains(w)).count();
+        if verb_count >= 1 {
+            return true;
+        }
+    }
+    // Citation-like patterns: contains parentheses with years or publisher info
+    if (lower_trimmed.contains("(") && lower_trimmed.contains(")"))
+        || lower_trimmed.contains(" pp ")
+        || lower_trimmed.contains("pp.")
+    {
+        return true;
+    }
+    // Starts with lowercase (likely a sentence fragment, not a proper entity)
+    if let Some(first) = name.chars().next() {
+        if first.is_lowercase() && word_count > 2 {
+            return true;
+        }
     }
     false
 }
@@ -953,6 +996,55 @@ impl<'a> Prometheus<'a> {
         Ok(hypotheses)
     }
 
+    /// Analyze predicate diversity — identify over-reliance on generic predicates.
+    /// Returns (total_rels, generic_count, diverse_count, diversity_ratio).
+    pub fn predicate_diversity(&self) -> Result<(usize, usize, usize, f64)> {
+        let relations = self.brain.all_relations()?;
+        let total = relations.len();
+        let generic = relations
+            .iter()
+            .filter(|r| is_generic_predicate(&r.predicate))
+            .count();
+        let diverse = total - generic;
+        let ratio = if total > 0 {
+            diverse as f64 / total as f64
+        } else {
+            0.0
+        };
+        Ok((total, generic, diverse, ratio))
+    }
+
+    /// Generate hypotheses from analogy patterns (A:B :: C:? ).
+    pub fn generate_hypotheses_from_analogies(&self) -> Result<Vec<Hypothesis>> {
+        let analogies = self.find_analogies()?;
+        let mut hypotheses = Vec::new();
+        for (a, b, c, d, missing) in analogies.iter().take(20) {
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: c.clone(),
+                predicate: "analogous_to".to_string(),
+                object: format!("{} (via {}-{} analogy)", missing, a, b),
+                confidence: 0.35,
+                evidence_for: vec![format!(
+                    "Analogy: {} is to {} as {} is to {} — {}",
+                    a, b, c, d, missing
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!(
+                        "{} and {} share relation structure with {} and {}",
+                        a, b, c, d
+                    ),
+                    format!("Gap suggests: {}", missing),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "analogy".to_string(),
+            });
+        }
+        Ok(hypotheses)
+    }
+
     /// Find island entities: meaningful entities with zero relations (knowledge gaps).
     pub fn find_island_entities(&self) -> Result<Vec<(String, String)>> {
         let entities = self.brain.all_entities()?;
@@ -1285,18 +1377,44 @@ impl<'a> Prometheus<'a> {
             let _ = self.save_pattern(p);
         }
 
-        // 2. Gap detection & hypothesis generation (multiple strategies)
-        let hole_hyps = self.generate_hypotheses_from_holes()?;
-        all_hypotheses.extend(hole_hyps);
+        // 2. Gap detection & hypothesis generation (adaptive: skip low-weight strategies)
+        let hole_weight = self.get_pattern_weight("structural_hole")?;
+        if hole_weight >= 0.05 {
+            let hole_hyps = self.generate_hypotheses_from_holes()?;
+            all_hypotheses.extend(hole_hyps);
+        }
 
         let gap_hyps = self.generate_hypotheses_from_type_gaps()?;
         all_hypotheses.extend(gap_hyps);
 
-        let shared_hyps = self.generate_hypotheses_from_shared_objects()?;
-        all_hypotheses.extend(shared_hyps);
+        let shared_weight = self.get_pattern_weight("shared_object")?;
+        if shared_weight >= 0.05 {
+            let shared_hyps = self.generate_hypotheses_from_shared_objects()?;
+            all_hypotheses.extend(shared_hyps);
+        }
 
-        let source_hyps = self.generate_hypotheses_from_source_co_occurrence()?;
-        all_hypotheses.extend(source_hyps);
+        let source_weight = self.get_pattern_weight("source_co_occurrence")?;
+        if source_weight >= 0.05 {
+            let source_hyps = self.generate_hypotheses_from_source_co_occurrence()?;
+            all_hypotheses.extend(source_hyps);
+        } else {
+            // Strategy has proven unreliable — skip but note it
+            all_patterns.push(Pattern {
+                id: 0,
+                pattern_type: PatternType::CoOccurrence,
+                entities_involved: vec![],
+                frequency: 0,
+                last_seen: now_str(),
+                description: format!(
+                    "source_co_occurrence strategy skipped (weight {:.3} < 0.05)",
+                    source_weight
+                ),
+            });
+        }
+
+        // 2b. Analogy-based hypotheses
+        let analogy_hyps = self.generate_hypotheses_from_analogies()?;
+        all_hypotheses.extend(analogy_hyps);
 
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
@@ -1342,11 +1460,16 @@ impl<'a> Prometheus<'a> {
         // Prioritize gaps
         let gap_priorities = self.prioritize_gaps().unwrap_or_default();
 
+        // Predicate diversity analysis
+        let (total_rels, _generic_rels, diverse_rels, div_ratio) =
+            self.predicate_diversity().unwrap_or((0, 0, 0, 0.0));
+
         let summary = format!(
             "Discovered {} patterns, generated {} new hypotheses ({} confirmed, {} rejected), \
              auto-resolved {} existing ({}✓ {}✗), {} island entities, {} meaningful relations, \
              {} cross-domain gaps, {} knowledge frontiers, {} bridge entities, {} connectable islands, \
-             {} prioritized gaps, {} decayed, {} island clusters",
+             {} prioritized gaps, {} decayed, {} island clusters, \
+             predicate diversity: {}/{} ({:.0}% diverse)",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1363,6 +1486,9 @@ impl<'a> Prometheus<'a> {
             gap_priorities.len(),
             decayed,
             island_clusters.len(),
+            diverse_rels,
+            total_rels,
+            div_ratio * 100.0,
         );
 
         Ok(DiscoveryReport {

@@ -845,6 +845,93 @@ pub fn power_law_estimate(brain: &Brain) -> Result<(f64, f64), rusqlite::Error> 
     Ok((-slope, r2)) // Negate slope since power law has negative exponent
 }
 
+/// Entity similarity: Jaccard similarity based on shared predicates.
+/// Returns top similar pairs above threshold.
+pub fn entity_similarity(
+    brain: &Brain,
+    min_similarity: f64,
+    limit: usize,
+) -> Result<Vec<(i64, i64, f64)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    // Build predicate-set per entity (both as subject and object)
+    let mut entity_preds: HashMap<i64, HashSet<String>> = HashMap::new();
+    for r in &relations {
+        entity_preds
+            .entry(r.subject_id)
+            .or_default()
+            .insert(format!("out:{}", r.predicate));
+        entity_preds
+            .entry(r.object_id)
+            .or_default()
+            .insert(format!("in:{}", r.predicate));
+    }
+    // Only consider entities with >= 2 predicates
+    let candidates: Vec<(i64, &HashSet<String>)> = entity_preds
+        .iter()
+        .filter(|(_, preds)| preds.len() >= 2)
+        .map(|(&id, preds)| (id, preds))
+        .collect();
+
+    let mut results = Vec::new();
+    for i in 0..candidates.len() {
+        for j in (i + 1)..candidates.len() {
+            let (id_a, preds_a) = candidates[i];
+            let (id_b, preds_b) = candidates[j];
+            let intersection = preds_a.intersection(preds_b).count();
+            if intersection == 0 {
+                continue;
+            }
+            let union = preds_a.union(preds_b).count();
+            let jaccard = intersection as f64 / union as f64;
+            if jaccard >= min_similarity {
+                results.push((id_a, id_b, jaccard));
+            }
+        }
+    }
+    results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    Ok(results)
+}
+
+/// Graph summary: compact human-readable overview.
+pub fn graph_summary(brain: &Brain) -> Result<String, rusqlite::Error> {
+    let health = graph_health(brain)?;
+    let density = graph_density(brain)?;
+    let (exponent, r2) = power_law_estimate(brain)?;
+
+    let entities = health.get("entities").copied().unwrap_or(0.0) as usize;
+    let rels = health.get("relations").copied().unwrap_or(0.0) as usize;
+    let isolated = health.get("isolated_entities").copied().unwrap_or(0.0) as usize;
+    let components = health.get("components").copied().unwrap_or(0.0) as usize;
+    let largest_pct = health.get("largest_component_pct").copied().unwrap_or(0.0);
+    let avg_deg = health.get("avg_degree").copied().unwrap_or(0.0);
+
+    Ok(format!(
+        "Graph: {} entities, {} relations, density {:.6}\n\
+         Connected: {} ({:.1}% isolated), {} components (largest {:.1}%)\n\
+         Avg degree: {:.2}, Power law: α={:.2} (R²={:.2} {})\n",
+        entities,
+        rels,
+        density,
+        entities - isolated,
+        if entities > 0 {
+            100.0 * isolated as f64 / entities as f64
+        } else {
+            0.0
+        },
+        components,
+        largest_pct,
+        avg_deg,
+        exponent,
+        r2,
+        if r2 > 0.8 {
+            "scale-free"
+        } else {
+            "not scale-free"
+        }
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
