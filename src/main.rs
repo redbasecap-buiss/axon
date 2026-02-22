@@ -361,7 +361,7 @@ async fn main() -> anyhow::Result<()> {
                             "Hypotheses generated: {}",
                             report.hypotheses_generated.len()
                         );
-                        for h in &report.hypotheses_generated {
+                        for h in report.hypotheses_generated.iter().take(30) {
                             println!(
                                 "  [{:.2}] {} {} {} — {}",
                                 h.confidence,
@@ -370,6 +370,39 @@ async fn main() -> anyhow::Result<()> {
                                 h.object,
                                 h.status.as_str()
                             );
+                        }
+                        if report.hypotheses_generated.len() > 30 {
+                            println!("  ... and {} more", report.hypotheses_generated.len() - 30);
+                        }
+                        println!();
+                    }
+                    // Knowledge frontiers
+                    let frontiers = p.find_knowledge_frontiers().unwrap_or_default();
+                    if !frontiers.is_empty() {
+                        println!("Knowledge frontiers:");
+                        for (etype, count, avg, reason) in frontiers.iter().take(10) {
+                            println!(
+                                "  📡 {} ({} entities, {:.1} avg rels): {}",
+                                etype, count, avg, reason
+                            );
+                        }
+                        println!();
+                    }
+                    // Cross-domain gaps
+                    let cross_gaps = p.find_cross_domain_gaps().unwrap_or_default();
+                    if !cross_gaps.is_empty() {
+                        println!("Cross-domain gaps:");
+                        for (a, b, reason) in cross_gaps.iter().take(10) {
+                            println!("  🔗 [{}] ↔ [{}]: {}", a.join(", "), b.join(", "), reason);
+                        }
+                        println!();
+                    }
+                    // Crawl suggestions
+                    let suggestions = p.suggest_crawl_topics().unwrap_or_default();
+                    if !suggestions.is_empty() {
+                        println!("Suggested topics to crawl:");
+                        for (topic, reason) in suggestions.iter().take(10) {
+                            println!("  🌐 {}: {}", topic, reason);
                         }
                     }
                 }

@@ -18,6 +18,18 @@ use crate::db::Brain;
 /// Entity types to exclude from discovery (low signal).
 const NOISE_TYPES: &[&str] = &["phrase", "source", "url", "relative_date", "number_unit"];
 
+/// High-value entity types for focused discovery.
+const HIGH_VALUE_TYPES: &[&str] = &[
+    "person",
+    "organization",
+    "place",
+    "concept",
+    "technology",
+    "company",
+    "product",
+    "event",
+];
+
 fn is_noise_type(t: &str) -> bool {
     NOISE_TYPES.contains(&t)
 }
@@ -213,12 +225,11 @@ impl<'a> Prometheus<'a> {
     // Pattern Discovery
     // -----------------------------------------------------------------------
 
-    /// Find co-occurring entity pairs (entities that share many common neighbours).
-    /// Filters out noise entity types for cleaner results.
+    /// Find co-occurring entity pairs using Jaccard similarity.
+    /// Better than raw count for sparse graphs — normalizes by neighbourhood size.
     pub fn find_co_occurrences(&self, min_shared: usize) -> Result<Vec<Pattern>> {
         let relations = self.brain.all_relations()?;
         let meaningful = meaningful_ids(self.brain)?;
-        // Build neighbour sets per entity (meaningful only)
         let mut neighbours: HashMap<i64, HashSet<i64>> = HashMap::new();
         for r in &relations {
             if meaningful.contains(&r.subject_id) && meaningful.contains(&r.object_id) {
@@ -242,6 +253,12 @@ impl<'a> Prometheus<'a> {
                 let nb = &neighbours[&b];
                 let shared: usize = na.intersection(nb).count();
                 if shared >= min_shared {
+                    let union_size = na.union(nb).count();
+                    let jaccard = if union_size > 0 {
+                        shared as f64 / union_size as f64
+                    } else {
+                        0.0
+                    };
                     let a_name = self.entity_name(a)?;
                     let b_name = self.entity_name(b)?;
                     patterns.push(Pattern {
@@ -251,14 +268,92 @@ impl<'a> Prometheus<'a> {
                         frequency: shared as i64,
                         last_seen: now_str(),
                         description: format!(
-                            "{} and {} share {} common neighbours",
-                            a_name, b_name, shared
+                            "{} and {} share {} neighbours (Jaccard: {:.2})",
+                            a_name, b_name, shared, jaccard
                         ),
                     });
                 }
             }
         }
+        // Sort by frequency descending for better results
+        patterns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
         Ok(patterns)
+    }
+
+    /// Find entity clusters: groups of entities connected by the same predicate type.
+    /// Useful for discovering thematic clusters in sparse graphs.
+    pub fn find_entity_clusters(&self) -> Result<Vec<Pattern>> {
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        // Group entities by predicate they participate in
+        let mut pred_entities: HashMap<String, HashSet<i64>> = HashMap::new();
+        for r in &relations {
+            if meaningful.contains(&r.subject_id) {
+                pred_entities
+                    .entry(r.predicate.clone())
+                    .or_default()
+                    .insert(r.subject_id);
+            }
+            if meaningful.contains(&r.object_id) {
+                pred_entities
+                    .entry(r.predicate.clone())
+                    .or_default()
+                    .insert(r.object_id);
+            }
+        }
+        let mut patterns = Vec::new();
+        for (pred, entities) in &pred_entities {
+            if entities.len() >= 3 {
+                let names: Vec<String> = entities
+                    .iter()
+                    .take(5)
+                    .filter_map(|&id| self.entity_name(id).ok())
+                    .collect();
+                patterns.push(Pattern {
+                    id: 0,
+                    pattern_type: PatternType::CoOccurrence,
+                    entities_involved: names,
+                    frequency: entities.len() as i64,
+                    last_seen: now_str(),
+                    description: format!(
+                        "Predicate '{}' connects {} entities — thematic cluster",
+                        pred,
+                        entities.len()
+                    ),
+                });
+            }
+        }
+        patterns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        Ok(patterns)
+    }
+
+    /// Find knowledge frontiers: entity types that appear in many entities
+    /// but have disproportionately few relations (growth potential).
+    pub fn find_knowledge_frontiers(&self) -> Result<Vec<(String, usize, f64, String)>> {
+        let density = crate::graph::knowledge_density(self.brain)?;
+        let mut frontiers: Vec<(String, usize, f64, String)> = Vec::new();
+        for (etype, (count, avg_rels)) in &density {
+            if is_noise_type(etype) || *count < 2 {
+                continue;
+            }
+            // Low density = high frontier potential
+            if *avg_rels < 2.0 {
+                let reason = if *avg_rels < 0.5 {
+                    format!(
+                        "CRITICAL: {} '{}' entities, only {:.1} avg relations — near-zero connectivity",
+                        count, etype, avg_rels
+                    )
+                } else {
+                    format!(
+                        "{} '{}' entities with {:.1} avg relations — underexplored",
+                        count, etype, avg_rels
+                    )
+                };
+                frontiers.push((etype.clone(), *count, *avg_rels, reason));
+            }
+        }
+        frontiers.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(frontiers)
     }
 
     /// Find frequent subgraph patterns — recurring predicate patterns around entities.
@@ -956,6 +1051,9 @@ impl<'a> Prometheus<'a> {
         let co_occ = self.find_co_occurrences(co_threshold)?;
         all_patterns.extend(co_occ);
 
+        let clusters = self.find_entity_clusters()?;
+        all_patterns.extend(clusters);
+
         let subgraphs = self.find_frequent_subgraphs(subgraph_threshold)?;
         all_patterns.extend(subgraphs);
 
@@ -1002,14 +1100,20 @@ impl<'a> Prometheus<'a> {
             .filter(|h| h.status == HypothesisStatus::Rejected)
             .count();
 
+        // Cross-domain gap analysis
+        let cross_gaps = self.find_cross_domain_gaps().unwrap_or_default();
+        let frontiers = self.find_knowledge_frontiers().unwrap_or_default();
+
         let summary = format!(
-            "Discovered {} patterns, generated {} hypotheses ({} confirmed, {} rejected), {} island entities, {} meaningful relations",
+            "Discovered {} patterns, generated {} hypotheses ({} confirmed, {} rejected), {} island entities, {} meaningful relations, {} cross-domain gaps, {} knowledge frontiers",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
             rejected,
             islands.len(),
             meaningful_rels,
+            cross_gaps.len(),
+            frontiers.len(),
         );
 
         Ok(DiscoveryReport {
@@ -1055,7 +1159,11 @@ impl<'a> Prometheus<'a> {
             }
         }
 
-        // Find pairs of components sharing entity types
+        // Find pairs of components sharing high-value entity types
+        let skip_types: HashSet<&str> = ["unknown", "phrase", "source", "url"]
+            .iter()
+            .copied()
+            .collect();
         let mut gaps = Vec::new();
         for i in 0..component_types.len().min(20) {
             for j in (i + 1)..component_types.len().min(20) {
@@ -1063,7 +1171,7 @@ impl<'a> Prometheus<'a> {
                 let (names_j, types_j) = &component_types[j];
                 let shared: Vec<String> = types_i
                     .keys()
-                    .filter(|t| types_j.contains_key(*t))
+                    .filter(|t| types_j.contains_key(*t) && !skip_types.contains(t.as_str()))
                     .cloned()
                     .collect();
                 if !shared.is_empty() {
@@ -1085,10 +1193,10 @@ impl<'a> Prometheus<'a> {
     pub fn suggest_crawl_topics(&self) -> Result<Vec<(String, String)>> {
         let mut suggestions = Vec::new();
 
-        // 1. Entity types with low knowledge density
+        // 1. Entity types with low knowledge density (skip noise types)
         let density = crate::graph::knowledge_density(self.brain)?;
         for (etype, (count, avg)) in &density {
-            if *count >= 3 && *avg < 0.5 && etype != "phrase" && etype != "source" {
+            if *count >= 3 && *avg < 0.5 && !is_noise_type(etype) {
                 suggestions.push((
                     etype.clone(),
                     format!(
