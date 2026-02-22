@@ -145,9 +145,7 @@ async fn handle_topics(
     Ok(Json(TopicsResponse { topics }))
 }
 
-async fn handle_dashboard(
-    State(state): State<Arc<AppState>>,
-) -> Result<Html<String>, StatusCode> {
+async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Result<Html<String>, StatusCode> {
     let brain = state.brain()?;
     let s = brain
         .stats()
@@ -237,7 +235,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use tower::ServiceExt;
+    use tower::util::ServiceExt;
 
     fn test_router() -> Router {
         let dir = tempfile::tempdir().unwrap();
@@ -296,11 +294,7 @@ mod tests {
     async fn test_api_ask() {
         let app = test_router();
         let resp = app
-            .oneshot(
-                Request::get("/api/ask?q=Rust")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/api/ask?q=Rust").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -316,11 +310,7 @@ mod tests {
     async fn test_api_topics() {
         let app = test_router();
         let resp = app
-            .oneshot(
-                Request::get("/api/topics")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/api/topics").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
