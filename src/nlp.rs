@@ -391,6 +391,137 @@ const PLACE_INDICATORS: &[&str] = &[
     "temple",
 ];
 
+/// Words that indicate a concept/thing rather than a person.
+const CONCEPT_INDICATORS: &[&str] = &[
+    "operation",
+    "project",
+    "protocol",
+    "system",
+    "theory",
+    "model",
+    "algorithm",
+    "process",
+    "method",
+    "technique",
+    "architecture",
+    "framework",
+    "standard",
+    "specification",
+    "extension",
+    "instruction",
+    "interface",
+    "register",
+    "memory",
+    "processor",
+    "compiler",
+    "hardware",
+    "software",
+    "network",
+    "security",
+    "data",
+    "device",
+    "machine",
+    "engine",
+    "design",
+    "platform",
+    "application",
+    "performance",
+    "technology",
+    "revolution",
+    "expedition",
+    "movement",
+    "treaty",
+    "agreement",
+    "conference",
+    "summit",
+    "war",
+    "battle",
+    "crisis",
+    "economy",
+    "market",
+    "trade",
+    "policy",
+    "reform",
+    "law",
+    "act",
+    "code",
+    "plan",
+    "program",
+    "initiative",
+    "campaign",
+    "era",
+    "period",
+    "age",
+    "century",
+    "empire",
+    "kingdom",
+    "republic",
+    "dynasty",
+    "civilization",
+    "culture",
+    "language",
+    "religion",
+    "philosophy",
+    "science",
+    "mathematics",
+    "physics",
+    "chemistry",
+    "biology",
+    "medicine",
+    "engineering",
+    "computing",
+    "research",
+    "study",
+    "analysis",
+    "review",
+    "report",
+    "survey",
+    "index",
+    "ranking",
+    "overview",
+    "speech",
+    "building",
+    "palace",
+    "castle",
+    "tower",
+    "monument",
+    "memorial",
+    "museum",
+    "gallery",
+    "theatre",
+    "theater",
+    "cinema",
+    "stadium",
+    "arena",
+    "wine",
+    "journal",
+    "gazette",
+    "times",
+    "post",
+    "herald",
+    "tribune",
+    "observer",
+    "chronicle",
+    "telegraph",
+    "mail",
+    "press",
+    "media",
+    "news",
+    "award",
+    "prize",
+    "medal",
+    "trophy",
+    "coordinates",
+    "nano",
+    "pigs",
+    "court",
+    "settlements",
+    "rankings",
+    "education",
+    "europa",
+    "available",
+];
+
 /// Common organization suffixes for entity classification.
 const ORG_INDICATORS: &[&str] = &[
     "inc",
@@ -931,6 +1062,14 @@ fn classify_entity_type(name: &str) -> &'static str {
         }
     }
 
+    // Check for concept indicators (before person heuristic)
+    for w in &words {
+        let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
+        if CONCEPT_INDICATORS.contains(&clean) {
+            return "concept";
+        }
+    }
+
     // All-caps short acronyms are likely organizations (NASA, UNESCO, NATO)
     if name.len() >= 3
         && name.len() <= 6
@@ -940,15 +1079,31 @@ fn classify_entity_type(name: &str) -> &'static str {
     }
 
     // Two or three capitalized words with no indicators → likely person name
+    // But only if words look like actual names (no long compound words)
     if words.len() >= 2
         && words.len() <= 3
         && name
             .split_whitespace()
             .all(|w| w.chars().next().is_some_and(|c| c.is_uppercase()))
     {
-        // Heuristic: if all words are short-ish (< 15 chars each), likely a person
+        // Heuristic: person names have short words (< 15 chars each)
+        // and typically don't contain words ending in common suffixes
         if name.split_whitespace().all(|w| w.len() < 15) {
-            return "person";
+            let has_noun_suffix = words.iter().any(|w| {
+                let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
+                clean.ends_with("tion")
+                    || clean.ends_with("ment")
+                    || clean.ends_with("ness")
+                    || clean.ends_with("ity")
+                    || clean.ends_with("ism")
+                    || clean.ends_with("ing")
+                    || clean.ends_with("ics")
+                    || clean.ends_with("ogy")
+                    || clean.ends_with("phy")
+            });
+            if !has_noun_suffix {
+                return "person";
+            }
         }
     }
 

@@ -1464,12 +1464,21 @@ impl<'a> Prometheus<'a> {
         let (total_rels, _generic_rels, diverse_rels, div_ratio) =
             self.predicate_diversity().unwrap_or((0, 0, 0, 0.0));
 
+        // Fuzzy duplicate detection
+        let fuzzy_dupes = self.find_fuzzy_duplicates().unwrap_or_default();
+        let merge_candidates = fuzzy_dupes.iter().filter(|d| d.3 == "merge").count();
+
+        // Topic coverage
+        let topic_coverage = self.topic_coverage_analysis().unwrap_or_default();
+        let sparse_topics = topic_coverage.iter().filter(|t| t.3 < 0.01).count();
+
         let summary = format!(
             "Discovered {} patterns, generated {} new hypotheses ({} confirmed, {} rejected), \
              auto-resolved {} existing ({}✓ {}✗), {} island entities, {} meaningful relations, \
              {} cross-domain gaps, {} knowledge frontiers, {} bridge entities, {} connectable islands, \
              {} prioritized gaps, {} decayed, {} island clusters, \
-             predicate diversity: {}/{} ({:.0}% diverse)",
+             predicate diversity: {}/{} ({:.0}% diverse), \
+             {} fuzzy duplicates ({} auto-merge), {} sparse topic domains",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1489,6 +1498,9 @@ impl<'a> Prometheus<'a> {
             diverse_rels,
             total_rels,
             div_ratio * 100.0,
+            fuzzy_dupes.len(),
+            merge_candidates,
+            sparse_topics,
         );
 
         Ok(DiscoveryReport {
@@ -1984,6 +1996,252 @@ impl<'a> Prometheus<'a> {
         serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
     }
 
+    /// Find likely duplicate entities using word-overlap similarity.
+    /// Returns (entity_a, entity_b, similarity, suggested_action).
+    /// Much better than Levenshtein for multi-word entity names like
+    /// "Swiss Federal Institute" vs "Federal Institute of Switzerland".
+    pub fn find_fuzzy_duplicates(&self) -> Result<Vec<(String, String, f64, String)>> {
+        let entities = self.brain.all_entities()?;
+        let meaningful: Vec<&crate::db::Entity> = entities
+            .iter()
+            .filter(|e| {
+                !is_noise_type(&e.entity_type) && !is_noise_name(&e.name) && e.name.len() >= 3
+            })
+            .collect();
+
+        // Build word sets for each entity (lowercase, skip tiny words)
+        let word_sets: Vec<(i64, &str, &str, HashSet<String>)> = meaningful
+            .iter()
+            .map(|e| {
+                let words: HashSet<String> = e
+                    .name
+                    .to_lowercase()
+                    .split_whitespace()
+                    .filter(|w| w.len() >= 3)
+                    .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+                    .filter(|w| !w.is_empty())
+                    .collect();
+                (e.id, e.name.as_str(), e.entity_type.as_str(), words)
+            })
+            .collect();
+
+        let mut duplicates = Vec::new();
+
+        // Only compare entities of the same type, limit comparisons
+        let mut by_type: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (idx, (_, _, etype, _)) in word_sets.iter().enumerate() {
+            by_type.entry(etype).or_default().push(idx);
+        }
+
+        for (_etype, indices) in &by_type {
+            // Skip huge groups to avoid O(n²) explosion
+            if indices.len() > 2000 {
+                continue;
+            }
+            for (pos_i, &idx_a) in indices.iter().enumerate() {
+                let (_, name_a, _, words_a) = &word_sets[idx_a];
+                if words_a.is_empty() {
+                    continue;
+                }
+                for &idx_b in &indices[(pos_i + 1)..] {
+                    let (_, name_b, _, words_b) = &word_sets[idx_b];
+                    if words_b.is_empty() {
+                        continue;
+                    }
+
+                    let intersection = words_a.intersection(words_b).count();
+                    if intersection == 0 {
+                        continue;
+                    }
+                    let union = words_a.union(words_b).count();
+                    let jaccard = intersection as f64 / union as f64;
+
+                    // High overlap = likely duplicate
+                    if jaccard >= 0.5 && intersection >= 2 {
+                        let action = if jaccard >= 0.8 {
+                            "merge".to_string()
+                        } else {
+                            "review".to_string()
+                        };
+                        duplicates.push((name_a.to_string(), name_b.to_string(), jaccard, action));
+                    }
+
+                    // Also check containment (one name is subset of another)
+                    let contained = intersection as f64 / words_a.len().min(words_b.len()) as f64;
+                    if contained >= 0.9 && jaccard < 0.5 && words_a.len().min(words_b.len()) >= 2 {
+                        duplicates.push((
+                            name_a.to_string(),
+                            name_b.to_string(),
+                            contained * 0.7, // lower confidence for containment
+                            "review-containment".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        duplicates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        duplicates.truncate(100);
+        Ok(duplicates)
+    }
+
+    /// Analyze topic coverage: group entities by source URL domain and measure
+    /// how well each topic area is connected internally.
+    pub fn topic_coverage_analysis(&self) -> Result<Vec<(String, usize, usize, f64, String)>> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        // Build entity→source mapping from relations
+        let mut entity_sources: HashMap<i64, HashSet<String>> = HashMap::new();
+        for r in &relations {
+            if !r.source_url.is_empty() {
+                // Extract domain from URL
+                let domain = extract_domain(&r.source_url);
+                entity_sources
+                    .entry(r.subject_id)
+                    .or_default()
+                    .insert(domain.clone());
+                entity_sources
+                    .entry(r.object_id)
+                    .or_default()
+                    .insert(domain);
+            }
+        }
+
+        // Also check source_url on entities themselves (from facts)
+        let facts_sources: HashMap<i64, HashSet<String>> = {
+            let mut m: HashMap<i64, HashSet<String>> = HashMap::new();
+            for e in &entities {
+                let facts = self.brain.get_facts_for(e.id)?;
+                for f in &facts {
+                    if !f.source_url.is_empty() {
+                        let domain = extract_domain(&f.source_url);
+                        m.entry(e.id).or_default().insert(domain);
+                    }
+                }
+            }
+            m
+        };
+
+        // Merge
+        for (eid, sources) in facts_sources {
+            entity_sources.entry(eid).or_default().extend(sources);
+        }
+
+        // Group entities by domain
+        let mut domain_entities: HashMap<String, HashSet<i64>> = HashMap::new();
+        for (eid, domains) in &entity_sources {
+            for d in domains {
+                domain_entities.entry(d.clone()).or_default().insert(*eid);
+            }
+        }
+
+        // For each domain: count entities, count internal relations, compute density
+        let meaningful = meaningful_ids(self.brain)?;
+        let mut coverage: Vec<(String, usize, usize, f64, String)> = Vec::new();
+
+        for (domain, eids) in &domain_entities {
+            let meaningful_count = eids.iter().filter(|id| meaningful.contains(id)).count();
+            if meaningful_count < 2 {
+                continue;
+            }
+
+            // Count relations between entities in this domain
+            let mut internal_rels = 0usize;
+            for r in &relations {
+                if eids.contains(&r.subject_id) && eids.contains(&r.object_id) {
+                    internal_rels += 1;
+                }
+            }
+
+            let max_possible = meaningful_count * (meaningful_count - 1) / 2;
+            let density = if max_possible > 0 {
+                internal_rels as f64 / max_possible as f64
+            } else {
+                0.0
+            };
+
+            let assessment = if density < 0.01 {
+                "sparse — needs more crawling".to_string()
+            } else if density < 0.1 {
+                "moderate — some connections exist".to_string()
+            } else {
+                "well-connected".to_string()
+            };
+
+            coverage.push((
+                domain.clone(),
+                meaningful_count,
+                internal_rels,
+                density,
+                assessment,
+            ));
+        }
+
+        coverage.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by entity count
+        Ok(coverage)
+    }
+
+    /// Graph evolution metrics: compare current state against prior discovery runs.
+    /// Tracks growth rate, connectivity improvement, and hypothesis hit rate.
+    pub fn evolution_metrics(&self) -> Result<HashMap<String, f64>> {
+        let mut metrics: HashMap<String, f64> = HashMap::new();
+
+        // Hypothesis success rate by pattern type
+        let weights = self.get_pattern_weights()?;
+        for w in &weights {
+            metrics.insert(format!("hit_rate_{}", w.pattern_type), w.weight);
+        }
+
+        // Overall hypothesis stats
+        let all_hyps = self.list_hypotheses(None)?;
+        let total = all_hyps.len() as f64;
+        let confirmed = all_hyps
+            .iter()
+            .filter(|h| h.status == HypothesisStatus::Confirmed)
+            .count() as f64;
+        let rejected = all_hyps
+            .iter()
+            .filter(|h| h.status == HypothesisStatus::Rejected)
+            .count() as f64;
+
+        if total > 0.0 {
+            metrics.insert("hypothesis_confirmation_rate".into(), confirmed / total);
+            metrics.insert("hypothesis_rejection_rate".into(), rejected / total);
+        }
+
+        // Island ratio (lower is better)
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+        let meaningful = meaningful_ids(self.brain)?;
+        let meaningful_islands = meaningful
+            .iter()
+            .filter(|id| !connected.contains(id))
+            .count();
+        if !meaningful.is_empty() {
+            metrics.insert(
+                "island_ratio".into(),
+                meaningful_islands as f64 / meaningful.len() as f64,
+            );
+        }
+
+        // Predicate diversity
+        let (_, _, _, div_ratio) = self.predicate_diversity()?;
+        metrics.insert("predicate_diversity".into(), div_ratio);
+
+        // Entity count and relation count
+        metrics.insert("total_entities".into(), entities.len() as f64);
+        metrics.insert("total_relations".into(), relations.len() as f64);
+        metrics.insert("meaningful_entities".into(), meaningful.len() as f64);
+
+        Ok(metrics)
+    }
+
     pub fn report_markdown(&self, report: &DiscoveryReport) -> String {
         let mut md = String::new();
         md.push_str("# 🔬 PROMETHEUS Discovery Report\n\n");
@@ -2060,6 +2318,19 @@ fn parse_hypothesis_row(row: &rusqlite::Row) -> Hypothesis {
         discovered_at: row.get(9).unwrap_or_default(),
         pattern_source: row.get(10).unwrap_or_default(),
     }
+}
+
+/// Extract domain from a URL (best-effort, no external crate needed).
+fn extract_domain(url: &str) -> String {
+    let stripped = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    stripped
+        .split('/')
+        .next()
+        .unwrap_or(stripped)
+        .to_lowercase()
 }
 
 fn is_contradicting_predicate(a: &str, b: &str) -> bool {

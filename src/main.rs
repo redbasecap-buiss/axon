@@ -397,6 +397,31 @@ async fn main() -> anyhow::Result<()> {
                         }
                         println!();
                     }
+                    // Fuzzy duplicates
+                    let dupes = p.find_fuzzy_duplicates().unwrap_or_default();
+                    if !dupes.is_empty() {
+                        println!("Fuzzy duplicate candidates:");
+                        for (a, b, sim, action) in dupes.iter().take(15) {
+                            println!("  🔀 [{:.2}] '{}' ↔ '{}' ({})", sim, a, b, action);
+                        }
+                        if dupes.len() > 15 {
+                            println!("  ... and {} more", dupes.len() - 15);
+                        }
+                        println!();
+                    }
+                    // Topic coverage
+                    let topics = p.topic_coverage_analysis().unwrap_or_default();
+                    if !topics.is_empty() {
+                        println!("Topic coverage by source domain:");
+                        for (domain, entities, rels, density, assessment) in topics.iter().take(10)
+                        {
+                            println!(
+                                "  📊 {} — {} entities, {} internal rels, density {:.4}: {}",
+                                domain, entities, rels, density, assessment
+                            );
+                        }
+                        println!();
+                    }
                     // Crawl suggestions
                     let suggestions = p.suggest_crawl_topics().unwrap_or_default();
                     if !suggestions.is_empty() {
