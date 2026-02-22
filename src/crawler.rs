@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::db::Brain;
 use crate::nlp;
 use std::collections::hash_map::DefaultHasher;
@@ -34,6 +35,37 @@ pub async fn fetch_and_extract(url: &str) -> anyhow::Result<String> {
     let html = resp.text().await?;
 
     Ok(extract_text_from_html(&html))
+}
+
+/// Fetch a URL and return both the raw HTML and extracted text.
+pub async fn fetch_html_and_text(url: &str) -> anyhow::Result<(String, String)> {
+    let client = reqwest::Client::builder()
+        .user_agent("axon/0.1 (knowledge-engine; +https://github.com/redbasecap-buiss/axon)")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let parsed = Url::parse(url)?;
+    let robots_url = format!(
+        "{}://{}/robots.txt",
+        parsed.scheme(),
+        parsed.host_str().unwrap_or("")
+    );
+    if let Ok(resp) = client.get(&robots_url).send().await {
+        if resp.status().is_success() {
+            if let Ok(body) = resp.text().await {
+                let robot = texting_robots::Robot::new("axon", body.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                if !robot.allowed(url) {
+                    return Err(anyhow::anyhow!("Blocked by robots.txt: {url}"));
+                }
+            }
+        }
+    }
+
+    let resp = client.get(url).send().await?;
+    let html = resp.text().await?;
+    let text = extract_text_from_html(&html);
+    Ok((html, text))
 }
 
 /// Extract readable text from HTML.

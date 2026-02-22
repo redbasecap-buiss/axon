@@ -490,6 +490,84 @@ impl Brain {
         }
     }
 
+    pub fn all_entities(&self) -> Result<Vec<Entity>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, entity_type, confidence, first_seen, last_seen, access_count
+             FROM entities ORDER BY name ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Entity {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                entity_type: row.get(2)?,
+                confidence: row.get(3)?,
+                first_seen: parse_dt(&row.get::<_, String>(4)?),
+                last_seen: parse_dt(&row.get::<_, String>(5)?),
+                access_count: row.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn all_relations(&self) -> Result<Vec<Relation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, subject_id, predicate, object_id, confidence, source_url, learned_at
+             FROM relations ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Relation {
+                id: row.get(0)?,
+                subject_id: row.get(1)?,
+                predicate: row.get(2)?,
+                object_id: row.get(3)?,
+                confidence: row.get(4)?,
+                source_url: row.get(5)?,
+                learned_at: parse_dt(&row.get::<_, String>(6)?),
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_entity_by_id(&self, id: i64) -> Result<Option<Entity>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, entity_type, confidence, first_seen, last_seen, access_count
+             FROM entities WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(Entity {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                entity_type: row.get(2)?,
+                confidence: row.get(3)?,
+                first_seen: parse_dt(&row.get::<_, String>(4)?),
+                last_seen: parse_dt(&row.get::<_, String>(5)?),
+                access_count: row.get(6)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(e)) => Ok(Some(e)),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn merge_entities(&self, from_id: i64, into_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE relations SET subject_id = ?2 WHERE subject_id = ?1",
+            params![from_id, into_id],
+        )?;
+        self.conn.execute(
+            "UPDATE relations SET object_id = ?2 WHERE object_id = ?1",
+            params![from_id, into_id],
+        )?;
+        self.conn.execute(
+            "UPDATE facts SET entity_id = ?2 WHERE entity_id = ?1",
+            params![from_id, into_id],
+        )?;
+        self.conn
+            .execute("DELETE FROM entities WHERE id = ?1", params![from_id])?;
+        Ok(())
+    }
+
     pub fn search_facts(&self, query: &str) -> Result<Vec<(String, String, String, f64)>> {
         let pattern = format!("%{query}%");
         let mut stmt = self.conn.prepare(

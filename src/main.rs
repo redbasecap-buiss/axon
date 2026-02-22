@@ -1,7 +1,11 @@
+mod config;
 mod crawler;
 mod db;
 mod nlp;
+pub mod plugin;
 mod query;
+mod server;
+mod tui;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -60,6 +64,16 @@ enum Commands {
     },
     /// Show brain statistics
     Stats,
+    /// Browse the knowledge graph interactively in the terminal
+    Browse,
+    /// Generate default config at ~/.axon/config.toml
+    Init,
+    /// Launch HTTP API server
+    Serve {
+        /// Port to listen on
+        #[arg(long, default_value = "8080")]
+        port: u16,
+    },
     /// Run as daemon, continuously crawling and learning
     Daemon {
         /// Interval between crawl cycles (e.g. 30m, 1h)
@@ -90,7 +104,21 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let brain = db::Brain::open(&cli.db)?;
+
+    // Handle init before loading config (it creates the config file).
+    if matches!(cli.command, Commands::Init) {
+        let path = config::Config::write_default()?;
+        println!("✅ Default config written to {}", path.display());
+        return Ok(());
+    }
+
+    let cfg = config::Config::load()?;
+    let db_path = if cli.db == std::path::Path::new("axon.db") {
+        PathBuf::from(&cfg.brain_path)
+    } else {
+        cli.db.clone()
+    };
+    let brain = db::Brain::open(&db_path)?;
 
     match cli.command {
         Commands::Feed { url } => {
@@ -183,19 +211,32 @@ async fn main() -> anyhow::Result<()> {
             println!("  Sources:   {}", stats.source_count);
             println!("  DB size:   {}", stats.db_size);
         }
-        Commands::Daemon { interval, config } => {
-            let dur = parse_duration(&interval).map_err(|e| anyhow::anyhow!(e))?;
-            let max_pages = if let Some(cfg_path) = config {
-                let cfg_str = std::fs::read_to_string(cfg_path)?;
-                let cfg: toml::Value = toml::from_str(&cfg_str)?;
-                cfg.get("crawl")
-                    .and_then(|c| c.get("max_pages"))
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(10) as usize
+        Commands::Browse => {
+            tui::run(&db_path)?;
+        }
+        Commands::Init => unreachable!(),
+        Commands::Serve { port } => {
+            server::run_server(db_path, port).await?;
+        }
+        Commands::Daemon {
+            interval,
+            config: config_path,
+        } => {
+            let dcfg = if let Some(p) = config_path {
+                config::Config::load_from(&p)?
             } else {
-                10
+                cfg.clone()
             };
-            println!("🤖 Daemon mode: crawling every {interval}, max {max_pages} pages per cycle");
+            let dur = if interval != "30m" {
+                parse_duration(&interval).map_err(|e| anyhow::anyhow!(e))?
+            } else {
+                std::time::Duration::from_secs(dcfg.daemon.interval_secs)
+            };
+            let max_pages = dcfg.crawl.max_depth;
+            println!(
+                "🤖 Daemon mode: crawling every {}s, max {max_pages} depth",
+                dur.as_secs()
+            );
             loop {
                 println!(
                     "\n--- Crawl cycle at {} ---",
