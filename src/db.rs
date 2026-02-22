@@ -674,6 +674,7 @@ mod tests {
             )],
             keywords: vec!["programming".to_string(), "language".to_string()],
             source_url: "https://example.com".to_string(),
+            language: crate::nlp::Language::English,
         };
         let brain = test_brain();
         let (e, r, f) = brain.learn(&extracted).unwrap();

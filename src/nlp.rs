@@ -2,282 +2,24 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct Extracted {
-    pub entities: Vec<(String, String)>,          // (name, type)
-    pub relations: Vec<(String, String, String)>, // (subject, predicate, object)
+    pub entities: Vec<(String, String)>,
+    pub relations: Vec<(String, String, String)>,
     pub keywords: Vec<String>,
     pub source_url: String,
+    pub language: Language,
 }
 
-/// Process raw text and extract entities, relations, and keywords.
-pub fn process_text(text: &str, source_url: &str) -> Extracted {
-    let sentences = split_sentences(text);
-    let tokens = tokenize(text);
-
-    let entities = extract_entities(&sentences);
-    let relations = extract_relations(&sentences);
-    let keywords = extract_keywords(&tokens, 10);
-
-    let deduped_entities = deduplicate_entities(entities);
-
-    Extracted {
-        entities: deduped_entities,
-        relations,
-        keywords,
-        source_url: source_url.to_string(),
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    English,
+    German,
+    French,
+    Italian,
+    Spanish,
+    Unknown,
 }
 
-/// Split text into sentences.
-pub fn split_sentences(text: &str) -> Vec<String> {
-    let mut sentences = Vec::new();
-    let mut current = String::new();
-
-    for ch in text.chars() {
-        current.push(ch);
-        if matches!(ch, '.' | '!' | '?') {
-            let trimmed = current.trim().to_string();
-            if trimmed.len() > 3 {
-                sentences.push(trimmed);
-            }
-            current.clear();
-        }
-    }
-    let trimmed = current.trim().to_string();
-    if trimmed.len() > 3 {
-        sentences.push(trimmed);
-    }
-    sentences
-}
-
-/// Tokenize text into lowercase words.
-pub fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric() && c != '\'')
-        .filter(|w| w.len() > 1)
-        .map(|w| w.to_lowercase())
-        .collect()
-}
-
-/// Extract entities: capitalized phrases, numbers, dates, URLs.
-pub fn extract_entities(sentences: &[String]) -> Vec<(String, String)> {
-    let mut entities = Vec::new();
-    let stop_words: HashSet<&str> = STOP_WORDS.iter().copied().collect();
-
-    for sentence in sentences {
-        // Capitalized phrases (2+ words or single capitalized non-stop word)
-        let words: Vec<&str> = sentence.split_whitespace().collect();
-        let mut i = 0;
-        while i < words.len() {
-            let word = words[i].trim_matches(|c: char| !c.is_alphanumeric());
-            if !word.is_empty()
-                && word.chars().next().is_some_and(|c| c.is_uppercase())
-                && !stop_words.contains(word.to_lowercase().as_str())
-                && i > 0
-            // skip sentence-initial capitalization
-            {
-                let mut phrase = vec![word.to_string()];
-                let mut j = i + 1;
-                while j < words.len() {
-                    let next = words[j].trim_matches(|c: char| !c.is_alphanumeric());
-                    if !next.is_empty() && next.chars().next().is_some_and(|c| c.is_uppercase()) {
-                        phrase.push(next.to_string());
-                        j += 1;
-                    } else {
-                        break;
-                    }
-                }
-                let name = phrase.join(" ");
-                if name.len() > 1 {
-                    entities.push((name, "phrase".to_string()));
-                }
-                i = j;
-            } else {
-                i += 1;
-            }
-        }
-
-        // Numbers (years, quantities)
-        for word in &words {
-            let clean = word.trim_matches(|c: char| !c.is_numeric());
-            if clean.len() == 4 {
-                if let Ok(n) = clean.parse::<u32>() {
-                    if (1800..=2100).contains(&n) {
-                        entities.push((clean.to_string(), "year".to_string()));
-                    }
-                }
-            }
-        }
-
-        // URLs in text
-        for word in &words {
-            if word.starts_with("http://") || word.starts_with("https://") {
-                entities.push((word.to_string(), "url".to_string()));
-            }
-        }
-    }
-
-    entities
-}
-
-/// Extract subject-verb-object relations from sentences.
-pub fn extract_relations(sentences: &[String]) -> Vec<(String, String, String)> {
-    let relation_verbs: HashSet<&str> = [
-        "is",
-        "are",
-        "was",
-        "were",
-        "has",
-        "have",
-        "had",
-        "created",
-        "built",
-        "made",
-        "wrote",
-        "developed",
-        "founded",
-        "invented",
-        "discovered",
-        "launched",
-        "acquired",
-        "bought",
-        "sold",
-        "uses",
-        "using",
-        "contains",
-        "includes",
-        "supports",
-        "runs",
-        "produces",
-        "generates",
-        "provides",
-        "offers",
-    ]
-    .iter()
-    .copied()
-    .collect();
-
-    let mut relations = Vec::new();
-
-    for sentence in sentences {
-        let words: Vec<&str> = sentence.split_whitespace().collect();
-        if words.len() < 3 {
-            continue;
-        }
-
-        for i in 1..words.len() - 1 {
-            let verb = words[i]
-                .trim_matches(|c: char| !c.is_alphanumeric())
-                .to_lowercase();
-            if relation_verbs.contains(verb.as_str()) {
-                // Look backward for subject (capitalized phrase)
-                let mut subj_parts = Vec::new();
-                let mut j = i as isize - 1;
-                while j >= 0 {
-                    let w = words[j as usize].trim_matches(|c: char| !c.is_alphanumeric());
-                    if !w.is_empty() && w.chars().next().is_some_and(|c| c.is_uppercase()) {
-                        subj_parts.push(w);
-                        j -= 1;
-                    } else {
-                        break;
-                    }
-                }
-                subj_parts.reverse();
-
-                // Look forward for object (capitalized phrase)
-                let mut obj_parts = Vec::new();
-                let mut k = i + 1;
-                while k < words.len() {
-                    let w = words[k].trim_matches(|c: char| !c.is_alphanumeric());
-                    if !w.is_empty() && w.chars().next().is_some_and(|c| c.is_uppercase()) {
-                        obj_parts.push(w);
-                        k += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                if !subj_parts.is_empty() && !obj_parts.is_empty() {
-                    let subject = subj_parts.join(" ");
-                    let object = obj_parts.join(" ");
-                    if subject != object {
-                        relations.push((subject, verb.clone(), object));
-                    }
-                }
-            }
-        }
-    }
-
-    relations
-}
-
-/// Extract top keywords using TF-IDF-like scoring.
-pub fn extract_keywords(tokens: &[String], max: usize) -> Vec<String> {
-    let stop_words: HashSet<&str> = STOP_WORDS.iter().copied().collect();
-
-    let mut freq: HashMap<&str, usize> = HashMap::new();
-    for t in tokens {
-        if !stop_words.contains(t.as_str()) && t.len() > 2 {
-            *freq.entry(t.as_str()).or_insert(0) += 1;
-        }
-    }
-
-    let mut scored: Vec<(&&str, f64)> = freq
-        .iter()
-        .map(|(word, count)| {
-            // Simple TF score weighted by word length (proxy for specificity)
-            let tf = *count as f64 / tokens.len().max(1) as f64;
-            let len_bonus = (word.len() as f64 / 10.0).min(1.0);
-            (word, tf * (1.0 + len_bonus))
-        })
-        .collect();
-
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    scored
-        .into_iter()
-        .take(max)
-        .map(|(w, _)| w.to_string())
-        .collect()
-}
-
-/// Deduplicate entities using Levenshtein distance.
-pub fn deduplicate_entities(entities: Vec<(String, String)>) -> Vec<(String, String)> {
-    let mut result: Vec<(String, String)> = Vec::new();
-
-    for (name, etype) in entities {
-        let is_dup = result.iter().any(|(existing, existing_type)| {
-            existing_type == &etype
-                && levenshtein(&name.to_lowercase(), &existing.to_lowercase()) <= 2
-        });
-        if !is_dup {
-            result.push((name, etype));
-        }
-    }
-
-    result
-}
-
-/// Levenshtein distance between two strings.
-pub fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let (m, n) = (a.len(), b.len());
-
-    let mut prev: Vec<usize> = (0..=n).collect();
-    let mut curr = vec![0; n + 1];
-
-    for i in 1..=m {
-        curr[0] = i;
-        for j in 1..=n {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-
-    prev[n]
-}
-
-const STOP_WORDS: &[&str] = &[
+const STOP_WORDS_EN: &[&str] = &[
     "a",
     "an",
     "the",
@@ -363,7 +105,6 @@ const STOP_WORDS: &[&str] = &[
     "despite",
     "towards",
     "upon",
-    "concerning",
     "also",
     "however",
     "therefore",
@@ -401,14 +142,799 @@ const STOP_WORDS: &[&str] = &[
     "there",
 ];
 
+const STOP_WORDS_DE: &[&str] = &[
+    "den", "der", "die", "das", "ein", "eine", "einer", "eines", "einem", "einen", "und", "oder",
+    "aber", "in", "im", "an", "am", "auf", "aus", "bei", "mit", "nach", "seit", "von", "vor", "zu",
+    "zum", "zur", "ist", "sind", "war", "waren", "wird", "werden", "wurde", "wurden", "hat",
+    "haben", "hatte", "hatten", "sein", "gewesen", "kann", "muss", "soll", "sollen", "sollte",
+    "darf", "ich", "du", "er", "sie", "es", "wir", "ihr", "mein", "dein", "unser", "euer", "nicht",
+    "kein", "keine", "keinem", "keinen", "keiner", "sich", "als", "auch", "noch", "schon", "so",
+    "wie", "was", "wer", "wo", "wenn", "weil", "dass", "ob", "denn", "doch", "nur", "sehr", "dann",
+    "da", "hier", "dort", "dieser", "diese", "dieses", "jeder", "jede", "jedes", "alle", "man",
+    "mehr", "viel", "einige", "andere",
+];
+
+const STOP_WORDS_FR: &[&str] = &[
+    "le", "la", "les", "un", "une", "des", "de", "du", "au", "aux", "et", "ou", "mais", "en",
+    "dans", "sur", "sous", "avec", "pour", "par", "sans", "vers", "chez", "entre", "est", "sont",
+    "il", "elle", "ils", "elles", "je", "tu", "nous", "vous", "on", "ce", "cette", "ces", "mon",
+    "ton", "son", "notre", "votre", "leur", "leurs", "ne", "pas", "plus", "si", "que", "qui",
+    "quoi", "dont", "aussi", "tout", "tous", "toute", "toutes", "ici",
+];
+
+const STOP_WORDS_IT: &[&str] = &[
+    "il", "lo", "la", "le", "li", "gli", "un", "uno", "una", "di", "del", "della", "dei", "delle",
+    "da", "dal", "dalla", "in", "nel", "nella", "a", "al", "alla", "con", "su", "sul", "sulla",
+    "per", "tra", "fra", "e", "o", "ma", "non", "che", "sono", "era", "erano", "ha", "hanno", "io",
+    "tu", "lui", "lei", "noi", "voi", "loro", "mi", "ti", "ci", "si", "questo", "questa", "questi",
+    "queste", "quello", "quella", "come", "dove", "quando", "anche", "tutto", "tutti",
+];
+
+const STOP_WORDS_ES: &[&str] = &[
+    "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "al", "en", "con", "por",
+    "para", "sin", "sobre", "entre", "y", "o", "pero", "que", "es", "son", "era", "eran", "fue",
+    "fueron", "ha", "han", "ser", "estar", "tiene", "tienen", "yo", "no", "como", "este", "esta",
+    "estos", "estas", "ese", "esa", "todo", "todos", "toda", "todas", "otro", "otra", "otros",
+    "donde", "cuando",
+];
+
+const ABBREVIATIONS: &[&str] = &[
+    "dr", "mr", "mrs", "ms", "prof", "jr", "sr", "inc", "ltd", "co", "corp", "vs", "etc", "al",
+    "approx", "dept", "est", "vol", "fig", "ref", "st", "ave", "blvd",
+];
+
+const GERMAN_MONTHS: &[(&str, u32)] = &[
+    ("januar", 1),
+    ("februar", 2),
+    ("märz", 3),
+    ("april", 4),
+    ("mai", 5),
+    ("juni", 6),
+    ("juli", 7),
+    ("august", 8),
+    ("september", 9),
+    ("oktober", 10),
+    ("november", 11),
+    ("dezember", 12),
+];
+
+const FRENCH_MONTHS: &[(&str, u32)] = &[
+    ("janvier", 1),
+    ("février", 2),
+    ("mars", 3),
+    ("avril", 4),
+    ("mai", 5),
+    ("juin", 6),
+    ("juillet", 7),
+    ("août", 8),
+    ("septembre", 9),
+    ("octobre", 10),
+    ("novembre", 11),
+    ("décembre", 12),
+];
+
+const ITALIAN_MONTHS: &[(&str, u32)] = &[
+    ("gennaio", 1),
+    ("febbraio", 2),
+    ("marzo", 3),
+    ("aprile", 4),
+    ("maggio", 5),
+    ("giugno", 6),
+    ("luglio", 7),
+    ("agosto", 8),
+    ("settembre", 9),
+    ("ottobre", 10),
+    ("novembre", 11),
+    ("dicembre", 12),
+];
+
+pub fn detect_language(text: &str) -> Language {
+    let tokens: HashSet<String> = text
+        .split(|c: char| !c.is_alphanumeric() && c != '\'' && !"äöüßéèêàùñìò".contains(c))
+        .filter(|w| w.len() > 1)
+        .map(|w| w.to_lowercase())
+        .collect();
+    let count = |list: &[&str]| -> usize { list.iter().filter(|w| tokens.contains(**w)).count() };
+    let scores = [
+        (Language::English, count(STOP_WORDS_EN)),
+        (Language::German, count(STOP_WORDS_DE)),
+        (Language::French, count(STOP_WORDS_FR)),
+        (Language::Italian, count(STOP_WORDS_IT)),
+        (Language::Spanish, count(STOP_WORDS_ES)),
+    ];
+    scores
+        .iter()
+        .max_by_key(|(_, s)| *s)
+        .filter(|(_, s)| *s >= 2)
+        .map(|(l, _)| *l)
+        .unwrap_or(Language::Unknown)
+}
+
+pub fn split_sentences(text: &str) -> Vec<String> {
+    let abbrevs: HashSet<&str> = ABBREVIATIONS.iter().copied().collect();
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        let ch = chars[i];
+        current.push(ch);
+        if matches!(ch, '.' | '!' | '?') {
+            if ch == '.' {
+                let before: String = current
+                    .trim_end_matches('.')
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_alphabetic())
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                if abbrevs.contains(before.to_lowercase().as_str()) {
+                    i += 1;
+                    continue;
+                }
+                if before.len() <= 1 {
+                    i += 1;
+                    continue;
+                }
+                if i + 1 < len && chars[i + 1].is_ascii_digit() {
+                    i += 1;
+                    continue;
+                }
+            }
+            let trimmed = current.trim().to_string();
+            if trimmed.len() > 3 {
+                sentences.push(trimmed);
+            }
+            current.clear();
+        }
+        i += 1;
+    }
+    let trimmed = current.trim().to_string();
+    if trimmed.len() > 3 {
+        sentences.push(trimmed);
+    }
+    sentences
+}
+
+pub fn tokenize(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '\'' && !"äöüßéèêà".contains(c))
+        .filter(|w| w.len() > 1)
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+pub fn extract_entities(sentences: &[String]) -> Vec<(String, String)> {
+    let mut entities = Vec::new();
+    let stop_en: HashSet<&str> = STOP_WORDS_EN.iter().copied().collect();
+    let stop_de: HashSet<&str> = STOP_WORDS_DE.iter().copied().collect();
+    for sentence in sentences {
+        extract_capitalized(sentence, &stop_en, &stop_de, &mut entities);
+        extract_dates(sentence, &mut entities);
+        extract_numbers_units(sentence, &mut entities);
+        extract_emails(sentence, &mut entities);
+        extract_urls(sentence, &mut entities);
+        extract_years(sentence, &mut entities);
+    }
+    entities
+}
+
+fn extract_capitalized(
+    sentence: &str,
+    stop_en: &HashSet<&str>,
+    stop_de: &HashSet<&str>,
+    entities: &mut Vec<(String, String)>,
+) {
+    let words: Vec<&str> = sentence.split_whitespace().collect();
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i].trim_matches(|c: char| !c.is_alphanumeric());
+        if !word.is_empty()
+            && word.chars().next().is_some_and(|c| c.is_uppercase())
+            && !stop_en.contains(word.to_lowercase().as_str())
+            && !stop_de.contains(word.to_lowercase().as_str())
+            && i > 0
+        {
+            let mut phrase = vec![word.to_string()];
+            let mut j = i + 1;
+            while j < words.len() {
+                let next = words[j].trim_matches(|c: char| !c.is_alphanumeric());
+                if !next.is_empty() && next.chars().next().is_some_and(|c| c.is_uppercase()) {
+                    phrase.push(next.to_string());
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            let name = phrase.join(" ");
+            if name.len() > 1 {
+                if name.len() > 12 && !name.contains(' ') {
+                    entities.push((name, "compound_noun".to_string()));
+                } else {
+                    entities.push((name, "phrase".to_string()));
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn extract_years(sentence: &str, entities: &mut Vec<(String, String)>) {
+    for word in sentence.split_whitespace() {
+        let clean = word.trim_matches(|c: char| !c.is_numeric());
+        if clean.len() == 4 {
+            if let Ok(n) = clean.parse::<u32>() {
+                if (1800..=2100).contains(&n) {
+                    entities.push((clean.to_string(), "year".to_string()));
+                }
+            }
+        }
+    }
+}
+
+fn extract_dates(sentence: &str, entities: &mut Vec<(String, String)>) {
+    let text = sentence;
+    let lower = text.to_lowercase();
+
+    // ISO: 2024-01-15
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 9 < bytes.len() {
+        if bytes[i].is_ascii_digit()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3].is_ascii_digit()
+            && bytes[i + 4] == b'-'
+            && bytes[i + 5].is_ascii_digit()
+            && bytes[i + 6].is_ascii_digit()
+            && bytes[i + 7] == b'-'
+            && bytes[i + 8].is_ascii_digit()
+            && bytes[i + 9].is_ascii_digit()
+        {
+            entities.push((text[i..i + 10].to_string(), "date".to_string()));
+            i += 10;
+        } else {
+            i += 1;
+        }
+    }
+
+    // US: MM/DD/YYYY
+    for cap in find_date_patterns(text, true) {
+        entities.push((cap, "date".to_string()));
+    }
+    // EU: DD.MM.YYYY
+    for cap in find_date_patterns(text, false) {
+        entities.push((cap, "date".to_string()));
+    }
+
+    // German month dates
+    for (month_name, _) in GERMAN_MONTHS {
+        if let Some(pos) = lower.find(month_name) {
+            let before = text[..pos].trim_end();
+            if let Some(day_start) = before.rfind(|c: char| !c.is_ascii_digit() && c != '.') {
+                let day_part = before[day_start + 1..].trim_matches('.');
+                if let Ok(d) = day_part.trim().parse::<u32>() {
+                    if (1..=31).contains(&d) {
+                        let after = &text[pos + month_name.len()..];
+                        let year_str: String = after
+                            .trim()
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect();
+                        if year_str.len() == 4 {
+                            let orig_month = &text[pos..pos + month_name.len()];
+                            entities.push((
+                                format!("{}. {} {}", d, orig_month, year_str),
+                                "date".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // French month dates
+    for (month_name, _) in FRENCH_MONTHS {
+        if let Some(pos) = lower.find(month_name) {
+            let before = text[..pos].trim_end();
+            if let Some(day_str) = before.split_whitespace().last() {
+                if let Ok(d) = day_str.parse::<u32>() {
+                    if (1..=31).contains(&d) {
+                        let after = &text[pos + month_name.len()..];
+                        let year_str: String = after
+                            .trim()
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect();
+                        if year_str.len() == 4 {
+                            let orig_month = &text[pos..pos + month_name.len()];
+                            entities.push((
+                                format!("{} {} {}", d, orig_month, year_str),
+                                "date".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Italian month dates
+    for (month_name, _) in ITALIAN_MONTHS {
+        if let Some(pos) = lower.find(month_name) {
+            let before = text[..pos].trim_end();
+            if let Some(day_str) = before.split_whitespace().last() {
+                if let Ok(d) = day_str.parse::<u32>() {
+                    if (1..=31).contains(&d) {
+                        let after = &text[pos + month_name.len()..];
+                        let year_str: String = after
+                            .trim()
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect();
+                        if year_str.len() == 4 {
+                            let orig_month = &text[pos..pos + month_name.len()];
+                            entities.push((
+                                format!("{} {} {}", d, orig_month, year_str),
+                                "date".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Relative dates (EN)
+    for rel in &[
+        "yesterday",
+        "today",
+        "tomorrow",
+        "last week",
+        "next week",
+        "last month",
+        "next month",
+        "last year",
+        "next year",
+    ] {
+        if lower.contains(rel) {
+            entities.push((rel.to_string(), "relative_date".to_string()));
+        }
+    }
+    // Relative dates (DE)
+    for rel in &["gestern", "heute", "morgen", "letzte woche", "vorgestern"] {
+        if lower.contains(rel) {
+            entities.push((rel.to_string(), "relative_date".to_string()));
+        }
+    }
+}
+
+fn find_date_patterns(text: &str, us_format: bool) -> Vec<String> {
+    let mut results = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            let p1: String = chars[i..]
+                .iter()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            i += p1.len();
+            if i < len
+                && (chars[i] == '/'
+                    || (us_format && chars[i] == '-')
+                    || (!us_format && chars[i] == '.'))
+            {
+                let sep = chars[i];
+                i += 1;
+                let p2: String = chars[i..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                i += p2.len();
+                if i < len && chars[i] == sep {
+                    i += 1;
+                    let p3: String = chars[i..]
+                        .iter()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    i += p3.len();
+                    if p3.len() == 4 {
+                        if let (Ok(a), Ok(b), Ok(y)) =
+                            (p1.parse::<u32>(), p2.parse::<u32>(), p3.parse::<u32>())
+                        {
+                            let valid = if us_format {
+                                (1..=12).contains(&a) && (1..=31).contains(&b)
+                            } else {
+                                (1..=31).contains(&a) && (1..=12).contains(&b)
+                            };
+                            if valid && (1800..=2100).contains(&y) {
+                                let end = start + p1.len() + 1 + p2.len() + 1 + p3.len();
+                                let s: String = chars[start..end].iter().collect();
+                                results.push(s);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    results
+}
+
+fn extract_numbers_units(sentence: &str, entities: &mut Vec<(String, String)>) {
+    let units: HashSet<&str> = [
+        "gb", "mb", "tb", "kb", "ghz", "mhz", "khz", "hz", "kg", "mg", "g", "lb", "oz", "km", "mi",
+        "m", "cm", "mm", "ft", "l", "ml", "gal", "w", "kw", "mw", "v", "mv",
+    ]
+    .iter()
+    .copied()
+    .collect();
+    let words: Vec<&str> = sentence.split_whitespace().collect();
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i].trim_matches(|c: char| c == ',' || c == ';');
+        // Percentage
+        if let Some(num) = word.strip_suffix('%') {
+            if parse_num(num).is_some() {
+                entities.push((word.to_string(), "number_unit".to_string()));
+                i += 1;
+                continue;
+            }
+        }
+        // Currency prefix: $, €, £
+        if word.starts_with('$') || word.starts_with('€') || word.starts_with('£') {
+            let skip = word.char_indices().nth(1).map(|(i, _)| i).unwrap_or(1);
+            let num = &word[skip..];
+            if parse_num(num).is_some() {
+                let mut full = word.to_string();
+                if i + 1 < words.len() {
+                    let nxt = words[i + 1]
+                        .trim_matches(|c: char| !c.is_alphabetic())
+                        .to_lowercase();
+                    if matches!(
+                        nxt.as_str(),
+                        "million"
+                            | "billion"
+                            | "trillion"
+                            | "thousand"
+                            | "millionen"
+                            | "milliarden"
+                    ) {
+                        full = format!(
+                            "{} {}",
+                            word,
+                            words[i + 1].trim_matches(|c: char| c == ',' || c == ';')
+                        );
+                        i += 1;
+                    }
+                }
+                entities.push((full, "currency".to_string()));
+                i += 1;
+                continue;
+            }
+        }
+        // Currency code prefix: CHF, EUR, USD, GBP
+        let upper = word.to_uppercase();
+        if matches!(upper.as_str(), "CHF" | "EUR" | "USD" | "GBP") && i + 1 < words.len() {
+            let next = words[i + 1].trim_matches(|c: char| c == ',' || c == ';');
+            let cleaned = next.replace(['\'', '\u{2019}'], "");
+            if parse_num(&cleaned).is_some() {
+                entities.push((format!("{} {}", word, next), "currency".to_string()));
+                i += 2;
+                continue;
+            }
+        }
+        // Number + unit
+        if parse_num(word).is_some() && i + 1 < words.len() {
+            let next = words[i + 1]
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
+            if units.contains(next.as_str()) {
+                entities.push((
+                    format!(
+                        "{} {}",
+                        word,
+                        words[i + 1].trim_matches(|c: char| c == ',' || c == ';')
+                    ),
+                    "number_unit".to_string(),
+                ));
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn parse_num(s: &str) -> Option<f64> {
+    s.replace(['\'', '\u{2019}', ','], "").parse::<f64>().ok()
+}
+
+fn extract_emails(sentence: &str, entities: &mut Vec<(String, String)>) {
+    for word in sentence.split_whitespace() {
+        let w = word.trim_matches(|c: char| {
+            !c.is_alphanumeric() && c != '@' && c != '.' && c != '_' && c != '-' && c != '+'
+        });
+        if let Some(at) = w.find('@') {
+            let local = &w[..at];
+            let domain = &w[at + 1..];
+            if !local.is_empty() && domain.contains('.') && domain.len() > 3 {
+                entities.push((w.to_string(), "email".to_string()));
+            }
+        }
+    }
+}
+
+fn extract_urls(sentence: &str, entities: &mut Vec<(String, String)>) {
+    for word in sentence.split_whitespace() {
+        let w = word.trim_end_matches([',', '.', ')', ']', ';']);
+        if w.starts_with("http://") || w.starts_with("https://") {
+            entities.push((w.to_string(), "url".to_string()));
+        }
+    }
+}
+
+pub fn extract_relations(sentences: &[String]) -> Vec<(String, String, String)> {
+    let relation_verbs: HashSet<&str> = [
+        "is",
+        "are",
+        "was",
+        "were",
+        "has",
+        "have",
+        "had",
+        "created",
+        "built",
+        "made",
+        "wrote",
+        "developed",
+        "founded",
+        "invented",
+        "discovered",
+        "launched",
+        "acquired",
+        "bought",
+        "sold",
+        "uses",
+        "using",
+        "contains",
+        "includes",
+        "supports",
+        "runs",
+        "produces",
+        "generates",
+        "provides",
+        "offers",
+    ]
+    .iter()
+    .copied()
+    .collect();
+    let mut relations = Vec::new();
+    for sentence in sentences {
+        let words: Vec<&str> = sentence.split_whitespace().collect();
+        if words.len() < 3 {
+            continue;
+        }
+
+        // Passive voice: "X was developed by Y"
+        for i in 0..words.len().saturating_sub(3) {
+            let w1 = words[i]
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
+            let w2 = words[i + 1]
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
+            if matches!(w1.as_str(), "was" | "were" | "is" | "are")
+                && (w2.ends_with("ed") || w2.ends_with("en"))
+            {
+                if let Some(by_pos) = words[i + 2..].iter().position(|w| {
+                    w.trim_matches(|c: char| !c.is_alphanumeric())
+                        .to_lowercase()
+                        == "by"
+                }) {
+                    let by_idx = i + 2 + by_pos;
+                    let mut subj = Vec::new();
+                    let mut j = i as isize - 1;
+                    while j >= 0 {
+                        let w = words[j as usize].trim_matches(|c: char| !c.is_alphanumeric());
+                        if !w.is_empty() && w.chars().next().is_some_and(|c| c.is_uppercase()) {
+                            subj.push(w);
+                            j -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    subj.reverse();
+                    let mut obj = Vec::new();
+                    let mut k = by_idx + 1;
+                    while k < words.len() {
+                        let w = words[k].trim_matches(|c: char| !c.is_alphanumeric());
+                        if !w.is_empty() && w.chars().next().is_some_and(|c| c.is_uppercase()) {
+                            obj.push(w);
+                            k += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if !subj.is_empty() && !obj.is_empty() {
+                        let subject = subj.join(" ");
+                        let object = obj.join(" ");
+                        if subject != object {
+                            relations.push((object, w2.clone(), subject));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Appositions: "Berlin, the capital of Germany,"
+        for i in 1..words.len().saturating_sub(3) {
+            let w = words[i].trim_matches(|c: char| !c.is_alphanumeric());
+            if !w.is_empty()
+                && w.chars().next().is_some_and(|c| c.is_uppercase())
+                && words[i].ends_with(',')
+            {
+                let next = words[i + 1]
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase();
+                if matches!(
+                    next.as_str(),
+                    "the" | "a" | "an" | "die" | "der" | "das" | "le" | "la"
+                ) {
+                    let mut appo = Vec::new();
+                    let mut k = i + 2;
+                    while k < words.len() {
+                        let part = words[k].trim_end_matches([',', '.']);
+                        appo.push(part);
+                        if words[k].ends_with(',') || words[k].ends_with('.') {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if !appo.is_empty() {
+                        relations.push((w.to_string(), "is".to_string(), appo.join(" ")));
+                    }
+                }
+            }
+        }
+
+        // Standard SVO
+        for i in 1..words.len() - 1 {
+            let verb = words[i]
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
+            if relation_verbs.contains(verb.as_str()) {
+                let mut subj = Vec::new();
+                let mut j = i as isize - 1;
+                while j >= 0 {
+                    let w = words[j as usize].trim_matches(|c: char| !c.is_alphanumeric());
+                    if !w.is_empty() && w.chars().next().is_some_and(|c| c.is_uppercase()) {
+                        subj.push(w);
+                        j -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                subj.reverse();
+                let mut obj = Vec::new();
+                let mut k = i + 1;
+                while k < words.len() {
+                    let w = words[k].trim_matches(|c: char| !c.is_alphanumeric());
+                    if !w.is_empty() && w.chars().next().is_some_and(|c| c.is_uppercase()) {
+                        obj.push(w);
+                        k += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if !subj.is_empty() && !obj.is_empty() {
+                    let subject = subj.join(" ");
+                    let object = obj.join(" ");
+                    if subject != object {
+                        relations.push((subject, verb.clone(), object));
+                    }
+                }
+            }
+        }
+    }
+    relations
+}
+
+pub fn extract_keywords(tokens: &[String], max: usize) -> Vec<String> {
+    let all_stops: HashSet<&str> = STOP_WORDS_EN
+        .iter()
+        .chain(STOP_WORDS_DE.iter())
+        .chain(STOP_WORDS_FR.iter())
+        .chain(STOP_WORDS_IT.iter())
+        .chain(STOP_WORDS_ES.iter())
+        .copied()
+        .collect();
+    let mut freq: HashMap<&str, usize> = HashMap::new();
+    for t in tokens {
+        if !all_stops.contains(t.as_str()) && t.len() > 2 {
+            *freq.entry(t.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mut scored: Vec<(&&str, f64)> = freq
+        .iter()
+        .map(|(word, count)| {
+            let tf = *count as f64 / tokens.len().max(1) as f64;
+            let len_bonus = (word.len() as f64 / 10.0).min(1.0);
+            (word, tf * (1.0 + len_bonus))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+        .into_iter()
+        .take(max)
+        .map(|(w, _)| w.to_string())
+        .collect()
+}
+
+pub fn deduplicate_entities(entities: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut result: Vec<(String, String)> = Vec::new();
+    for (name, etype) in entities {
+        let is_dup = result.iter().any(|(existing, et)| {
+            et == &etype && levenshtein(&name.to_lowercase(), &existing.to_lowercase()) <= 2
+        });
+        if !is_dup {
+            result.push((name, etype));
+        }
+    }
+    result
+}
+
+pub fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+pub fn process_text(text: &str, source_url: &str) -> Extracted {
+    let language = detect_language(text);
+    let sentences = split_sentences(text);
+    let tokens = tokenize(text);
+    let entities = extract_entities(&sentences);
+    let relations = extract_relations(&sentences);
+    let keywords = extract_keywords(&tokens, 10);
+    let deduped_entities = deduplicate_entities(entities);
+    Extracted {
+        entities: deduped_entities,
+        relations,
+        keywords,
+        source_url: source_url.to_string(),
+        language,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_split_sentences() {
-        let text = "Hello world. This is a test! How are you?";
-        let sentences = split_sentences(text);
+        let sentences = split_sentences("Hello world. This is a test! How are you?");
         assert_eq!(sentences.len(), 3);
     }
 
@@ -421,7 +947,7 @@ mod tests {
 
     #[test]
     fn test_extract_entities_capitalized() {
-        let sentences = vec!["The company Google was founded in California.".to_string()];
+        let sentences = vec!["The company Google was founded in California.".into()];
         let entities = extract_entities(&sentences);
         let names: Vec<&str> = entities.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"Google"));
@@ -430,23 +956,21 @@ mod tests {
 
     #[test]
     fn test_extract_entities_years() {
-        let sentences = vec!["Rust was released in 2015 by Mozilla.".to_string()];
-        let entities = extract_entities(&sentences);
-        let has_year = entities.iter().any(|(_, t)| t == "year");
-        assert!(has_year);
+        let sentences = vec!["Rust was released in 2015 by Mozilla.".into()];
+        assert!(extract_entities(&sentences)
+            .iter()
+            .any(|(_, t)| t == "year"));
     }
 
     #[test]
     fn test_extract_entities_urls() {
-        let sentences = vec!["Visit https://rust-lang.org for more info.".to_string()];
-        let entities = extract_entities(&sentences);
-        let has_url = entities.iter().any(|(_, t)| t == "url");
-        assert!(has_url);
+        let sentences = vec!["Visit https://rust-lang.org for more info.".into()];
+        assert!(extract_entities(&sentences).iter().any(|(_, t)| t == "url"));
     }
 
     #[test]
     fn test_extract_relations() {
-        let sentences = vec!["Google created Android for mobile devices.".to_string()];
+        let sentences = vec!["Google created Android for mobile devices.".into()];
         let relations = extract_relations(&sentences);
         assert!(!relations.is_empty());
         assert_eq!(relations[0].0, "Google");
@@ -457,9 +981,9 @@ mod tests {
     #[test]
     fn test_extract_keywords() {
         let tokens = tokenize("Rust is a systems programming language focused on safety and performance and concurrency");
-        let keywords = extract_keywords(&tokens, 5);
-        assert!(!keywords.is_empty());
-        assert!(keywords.len() <= 5);
+        let kw = extract_keywords(&tokens, 5);
+        assert!(!kw.is_empty());
+        assert!(kw.len() <= 5);
     }
 
     #[test]
@@ -481,42 +1005,347 @@ mod tests {
     #[test]
     fn test_deduplicate_entities() {
         let entities = vec![
-            ("Google".to_string(), "phrase".to_string()),
-            ("Gogle".to_string(), "phrase".to_string()), // typo
-            ("Mozilla".to_string(), "phrase".to_string()),
+            ("Google".into(), "phrase".into()),
+            ("Gogle".into(), "phrase".into()),
+            ("Mozilla".into(), "phrase".into()),
         ];
-        let deduped = deduplicate_entities(entities);
-        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduplicate_entities(entities).len(), 2);
     }
 
     #[test]
     fn test_process_text() {
-        let text =
-            "Google was founded by Larry Page and Sergey Brin in 1998. Google created Android.";
-        let extracted = process_text(text, "https://example.com");
-        assert!(!extracted.entities.is_empty());
-        assert_eq!(extracted.source_url, "https://example.com");
+        let e = process_text(
+            "Google was founded by Larry Page and Sergey Brin in 1998. Google created Android.",
+            "https://example.com",
+        );
+        assert!(!e.entities.is_empty());
+        assert_eq!(e.source_url, "https://example.com");
     }
 
     #[test]
     fn test_stop_words_filtered() {
-        let tokens = tokenize("the quick brown fox jumps over the lazy dog");
-        let keywords = extract_keywords(&tokens, 10);
-        assert!(!keywords.contains(&"the".to_string()));
+        let kw = extract_keywords(&tokenize("the quick brown fox jumps over the lazy dog"), 10);
+        assert!(!kw.contains(&"the".to_string()));
     }
 
     #[test]
     fn test_empty_text() {
-        let extracted = process_text("", "https://example.com");
-        assert!(extracted.entities.is_empty());
-        assert!(extracted.relations.is_empty());
+        let e = process_text("", "https://example.com");
+        assert!(e.entities.is_empty());
+        assert!(e.relations.is_empty());
     }
 
     #[test]
     fn test_multi_word_entity() {
-        let sentences = vec!["The project was led by New York University researchers.".to_string()];
-        let entities = extract_entities(&sentences);
-        let names: Vec<&str> = entities.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(names.iter().any(|n| n.contains("New York University")));
+        let entities =
+            extract_entities(&["The project was led by New York University researchers.".into()]);
+        assert!(entities
+            .iter()
+            .any(|(n, _)| n.contains("New York University")));
+    }
+
+    // ===== NEW TESTS =====
+
+    #[test]
+    fn test_detect_english() {
+        assert_eq!(
+            detect_language(
+                "The quick brown fox jumps over the lazy dog and is very happy about it."
+            ),
+            Language::English
+        );
+    }
+
+    #[test]
+    fn test_detect_german() {
+        assert_eq!(
+            detect_language("Der schnelle braune Fuchs springt und ist sehr hier dort auch nicht."),
+            Language::German
+        );
+    }
+
+    #[test]
+    fn test_detect_french() {
+        assert_eq!(
+            detect_language(
+                "Le renard brun rapide saute dans le jardin avec les enfants pour nous."
+            ),
+            Language::French
+        );
+    }
+
+    #[test]
+    fn test_detect_italian() {
+        assert_eq!(
+            detect_language("Il rapido volpe marrone salta con la porta nella casa della noi."),
+            Language::Italian
+        );
+    }
+
+    #[test]
+    fn test_detect_spanish() {
+        assert_eq!(detect_language("El zorro marrón salta sobre el perro perezoso en la casa con los niños para todos."), Language::Spanish);
+    }
+
+    #[test]
+    fn test_german_date_format() {
+        let entities = extract_entities(&["Das Treffen findet am 15. Januar 2024 statt.".into()]);
+        assert!(
+            entities
+                .iter()
+                .any(|(n, t)| t == "date" && n.contains("Januar") && n.contains("2024")),
+            "entities: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_german_compound_noun() {
+        let entities =
+            extract_entities(
+                &["Die Softwareentwicklung ist in der Bundesrepublik wichtig.".into()],
+            );
+        assert!(
+            entities
+                .iter()
+                .any(|(n, t)| t == "compound_noun" && n.contains("Softwareentwicklung")),
+            "entities: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_french_date() {
+        let entities = extract_entities(&["La date est le 5 février 2024 pour nous.".into()]);
+        assert!(
+            entities
+                .iter()
+                .any(|(n, t)| t == "date" && n.contains("février")),
+            "entities: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_italian_date() {
+        let entities = extract_entities(&["La data del 10 gennaio 2024 per Roma.".into()]);
+        assert!(
+            entities
+                .iter()
+                .any(|(n, t)| t == "date" && n.contains("gennaio")),
+            "entities: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_iso_date() {
+        let entities =
+            extract_entities(&["The release date is 2024-01-15 for the new version.".into()]);
+        assert!(entities
+            .iter()
+            .any(|(n, t)| t == "date" && n == "2024-01-15"));
+    }
+
+    #[test]
+    fn test_us_date_format() {
+        let entities = extract_entities(&["The event is on 01/15/2024 in the city.".into()]);
+        assert!(
+            entities
+                .iter()
+                .any(|(n, t)| t == "date" && n.contains("01/15/2024")),
+            "entities: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_eu_date_format() {
+        let entities = extract_entities(&["Das Datum ist 15.01.2024 und das ist wichtig.".into()]);
+        assert!(
+            entities
+                .iter()
+                .any(|(n, t)| t == "date" && n.contains("15.01.2024")),
+            "entities: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_relative_date_english() {
+        let entities =
+            extract_entities(&["I saw it yesterday and will check next week again.".into()]);
+        let rel: Vec<&str> = entities
+            .iter()
+            .filter(|(_, t)| t == "relative_date")
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert!(rel.contains(&"yesterday"));
+        assert!(rel.contains(&"next week"));
+    }
+
+    #[test]
+    fn test_relative_date_german() {
+        let entities =
+            extract_entities(&["Ich habe es gestern gesehen und vorgestern besprochen.".into()]);
+        let rel: Vec<&str> = entities
+            .iter()
+            .filter(|(_, t)| t == "relative_date")
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert!(rel.contains(&"gestern"));
+    }
+
+    #[test]
+    fn test_number_unit_gb() {
+        let entities = extract_entities(&["The disk has 750 GB of storage available.".into()]);
+        assert!(entities
+            .iter()
+            .any(|(n, t)| t == "number_unit" && n.contains("750") && n.contains("GB")));
+    }
+
+    #[test]
+    fn test_number_unit_ghz() {
+        let entities = extract_entities(&["The processor runs at 3.5 GHz for performance.".into()]);
+        assert!(
+            entities
+                .iter()
+                .any(|(n, t)| t == "number_unit" && n.contains("3.5") && n.contains("GHz")),
+            "entities: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_percentage() {
+        let entities =
+            extract_entities(&["Performance improved by 42% compared to before.".into()]);
+        assert!(entities
+            .iter()
+            .any(|(n, t)| t == "number_unit" && n.contains("42%")));
+    }
+
+    #[test]
+    fn test_currency_dollar() {
+        let entities = extract_entities(&["The acquisition cost $1.2 million in total.".into()]);
+        assert!(entities.iter().any(|(_, t)| t == "currency"));
+    }
+
+    #[test]
+    fn test_currency_euro() {
+        let entities = extract_entities(&["Das kostet nur etwa €500 pro Monat.".into()]);
+        assert!(entities
+            .iter()
+            .any(|(n, t)| t == "currency" && n.contains("€500")));
+    }
+
+    #[test]
+    fn test_currency_chf() {
+        let entities = extract_entities(&["Der Preis ist CHF 1'200 pro Jahr.".into()]);
+        assert!(
+            entities
+                .iter()
+                .any(|(n, t)| t == "currency" && n.contains("CHF")),
+            "entities: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_email_extraction() {
+        let entities = extract_entities(&["Contact us at info@example.com for details.".into()]);
+        assert!(entities
+            .iter()
+            .any(|(n, t)| t == "email" && n == "info@example.com"));
+    }
+
+    #[test]
+    fn test_url_extraction() {
+        let entities = extract_entities(&["Visit https://www.rust-lang.org for docs.".into()]);
+        assert!(entities
+            .iter()
+            .any(|(n, t)| t == "url" && n.contains("rust-lang.org")));
+    }
+
+    #[test]
+    fn test_sentence_boundary_abbreviations() {
+        let sentences = split_sentences("Dr. Smith went to the store. He bought milk.");
+        assert_eq!(sentences.len(), 2);
+        assert!(sentences[0].contains("Dr."));
+        assert!(sentences[0].contains("store"));
+    }
+
+    #[test]
+    fn test_sentence_boundary_mr() {
+        let sentences =
+            split_sentences("Mr. Jones and Mrs. Smith attended the meeting. It was productive.");
+        assert_eq!(sentences.len(), 2);
+    }
+
+    #[test]
+    fn test_passive_voice_relation() {
+        let relations = extract_relations(&[
+            "The framework Android was developed by Google in California.".into(),
+        ]);
+        assert!(
+            relations
+                .iter()
+                .any(|(s, v, o)| s.contains("Google") && v == "developed" && o.contains("Android")),
+            "relations: {:?}",
+            relations
+        );
+    }
+
+    #[test]
+    fn test_apposition_relation() {
+        let relations =
+            extract_relations(&["The city of Berlin, the capital of Germany, is vibrant.".into()]);
+        assert!(
+            relations
+                .iter()
+                .any(|(s, v, _)| s.contains("Berlin") && v == "is"),
+            "relations: {:?}",
+            relations
+        );
+    }
+
+    #[test]
+    fn test_process_text_language_detection() {
+        let e = process_text(
+            "Der schnelle braune Fuchs springt und ist sehr hier dort auch nicht mehr.",
+            "https://example.de",
+        );
+        assert_eq!(e.language, Language::German);
+    }
+
+    #[test]
+    fn test_german_stopwords_filtered() {
+        let kw = extract_keywords(
+            &tokenize("der schnelle braune Fuchs springt über den faulen Hund"),
+            10,
+        );
+        assert!(!kw.contains(&"der".to_string()));
+        assert!(!kw.contains(&"den".to_string()));
+    }
+
+    #[test]
+    fn test_mixed_entities() {
+        let entities = extract_entities(&[
+            "Contact John at john@example.com about the 750 GB server costing $500 by 2024-03-15."
+                .into(),
+        ]);
+        let types: HashSet<&str> = entities.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(types.contains("email"), "Missing email in {:?}", entities);
+        assert!(
+            types.contains("number_unit"),
+            "Missing number_unit in {:?}",
+            entities
+        );
+        assert!(
+            types.contains("currency"),
+            "Missing currency in {:?}",
+            entities
+        );
+        assert!(types.contains("date"), "Missing date in {:?}", entities);
     }
 }

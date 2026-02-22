@@ -170,6 +170,7 @@ mod tests {
             )],
             keywords: vec!["programming".to_string(), "systems".to_string()],
             source_url: "https://rust-lang.org".to_string(),
+            language: crate::nlp::Language::English,
         };
         brain.learn(&extracted).unwrap();
         brain
