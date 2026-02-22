@@ -1,6 +1,8 @@
 mod config;
 mod crawler;
 mod db;
+#[allow(dead_code)]
+mod embeddings;
 mod export;
 mod graph;
 mod nlp;
@@ -64,6 +66,15 @@ enum Commands {
         #[arg(long, default_value = "30")]
         min_age_days: i64,
     },
+    /// Find semantically similar entities
+    Similar {
+        entity: String,
+        /// Number of results
+        #[arg(long, default_value = "10")]
+        k: usize,
+    },
+    /// Auto-cluster entities by similarity
+    Cluster,
     /// Show brain statistics
     Stats,
     /// Browse the knowledge graph interactively in the terminal
@@ -209,6 +220,28 @@ async fn main() -> anyhow::Result<()> {
                 println!("📊 Top topics:\n");
                 for t in topics {
                     println!("  {t}");
+                }
+            }
+        }
+        Commands::Similar { entity, k } => {
+            let results = embeddings::find_similar(&brain, &entity, k)?;
+            if results.is_empty() {
+                println!("🤷 No similar entities found for \"{entity}\".");
+            } else {
+                println!("🔮 Similar to \"{entity}\":\n");
+                for (name, score) in results {
+                    println!("  {score:.3}  {name}");
+                }
+            }
+        }
+        Commands::Cluster => {
+            let clusters = embeddings::cluster_entities(&brain)?;
+            if clusters.is_empty() {
+                println!("🤷 No entities to cluster.");
+            } else {
+                println!("🧬 Entity clusters:\n");
+                for (id, members) in clusters {
+                    println!("  Cluster {id}: {}", members.join(", "));
                 }
             }
         }
