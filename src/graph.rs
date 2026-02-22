@@ -336,6 +336,190 @@ fn bfs_path(
     Ok(None)
 }
 
+/// Betweenness centrality — approximate via sampled BFS from up to `sample` nodes.
+pub fn betweenness_centrality(
+    brain: &Brain,
+    sample: usize,
+) -> Result<HashMap<i64, f64>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let ids: Vec<i64> = adj.keys().copied().collect();
+    let n = ids.len();
+    if n == 0 {
+        return Ok(HashMap::new());
+    }
+    let mut centrality: HashMap<i64, f64> = ids.iter().map(|&id| (id, 0.0)).collect();
+
+    // Sample source nodes (deterministic: evenly spaced)
+    let step = if n <= sample { 1 } else { n / sample };
+    let sources: Vec<i64> = ids.iter().step_by(step).copied().take(sample).collect();
+
+    for &s in &sources {
+        // Brandes-style single-source shortest paths
+        let mut stack = Vec::new();
+        let mut pred: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut sigma: HashMap<i64, f64> = ids.iter().map(|&id| (id, 0.0)).collect();
+        let mut dist: HashMap<i64, i64> = ids.iter().map(|&id| (id, -1)).collect();
+        let mut delta: HashMap<i64, f64> = ids.iter().map(|&id| (id, 0.0)).collect();
+
+        *sigma.get_mut(&s).unwrap() = 1.0;
+        *dist.get_mut(&s).unwrap() = 0;
+        let mut queue = VecDeque::new();
+        queue.push_back(s);
+
+        while let Some(v) = queue.pop_front() {
+            stack.push(v);
+            let d_v = dist[&v];
+            if let Some(neighbors) = adj.get(&v) {
+                for &w in neighbors {
+                    if dist[&w] < 0 {
+                        *dist.get_mut(&w).unwrap() = d_v + 1;
+                        queue.push_back(w);
+                    }
+                    if dist[&w] == d_v + 1 {
+                        *sigma.get_mut(&w).unwrap() += sigma[&v];
+                        pred.entry(w).or_default().push(v);
+                    }
+                }
+            }
+        }
+
+        while let Some(w) = stack.pop() {
+            if let Some(preds) = pred.get(&w) {
+                for &v in preds {
+                    let d = sigma[&v] / sigma[&w] * (1.0 + delta[&w]);
+                    *delta.get_mut(&v).unwrap() += d;
+                }
+            }
+            if w != s {
+                *centrality.get_mut(&w).unwrap() += delta[&w];
+            }
+        }
+    }
+
+    // Normalize
+    let scale = if sources.len() < n {
+        n as f64 / sources.len() as f64
+    } else {
+        1.0
+    };
+    for v in centrality.values_mut() {
+        *v *= scale;
+    }
+    Ok(centrality)
+}
+
+/// Find bridge edges — edges whose removal disconnects components.
+pub fn find_bridges(brain: &Brain) -> Result<Vec<(i64, i64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let ids: Vec<i64> = adj.keys().copied().collect();
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut disc: HashMap<i64, i64> = HashMap::new();
+    let mut low: HashMap<i64, i64> = HashMap::new();
+    let mut bridges = Vec::new();
+    let mut timer: i64 = 0;
+
+    fn dfs_bridge(
+        u: i64,
+        parent: i64,
+        adj: &HashMap<i64, Vec<i64>>,
+        disc: &mut HashMap<i64, i64>,
+        low: &mut HashMap<i64, i64>,
+        timer: &mut i64,
+        bridges: &mut Vec<(i64, i64)>,
+    ) {
+        disc.insert(u, *timer);
+        low.insert(u, *timer);
+        *timer += 1;
+        if let Some(neighbors) = adj.get(&u) {
+            for &v in neighbors {
+                if !disc.contains_key(&v) {
+                    dfs_bridge(v, u, adj, disc, low, timer, bridges);
+                    let lv = low[&v];
+                    let lu = low[&u];
+                    if lv < lu {
+                        low.insert(u, lv);
+                    }
+                    if low[&v] > disc[&u] {
+                        bridges.push((u, v));
+                    }
+                } else if v != parent {
+                    let dv = disc[&v];
+                    let lu = low[&u];
+                    if dv < lu {
+                        low.insert(u, dv);
+                    }
+                }
+            }
+        }
+    }
+
+    for &id in &ids {
+        if !disc.contains_key(&id) {
+            dfs_bridge(id, -1, &adj, &mut disc, &mut low, &mut timer, &mut bridges);
+        }
+    }
+    Ok(bridges)
+}
+
+/// Knowledge density: average relations per entity, grouped by entity_type.
+pub fn knowledge_density(brain: &Brain) -> Result<HashMap<String, (usize, f64)>, rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let relations = brain.all_relations()?;
+    let mut rel_count: HashMap<i64, usize> = HashMap::new();
+    for r in &relations {
+        *rel_count.entry(r.subject_id).or_insert(0) += 1;
+        *rel_count.entry(r.object_id).or_insert(0) += 1;
+    }
+    let mut type_stats: HashMap<String, (usize, usize)> = HashMap::new(); // (entity_count, total_rels)
+    for e in &entities {
+        let entry = type_stats.entry(e.entity_type.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += rel_count.get(&e.id).copied().unwrap_or(0);
+    }
+    Ok(type_stats
+        .into_iter()
+        .map(|(t, (count, rels))| {
+            let density = if count > 0 {
+                rels as f64 / count as f64
+            } else {
+                0.0
+            };
+            (t, (count, density))
+        })
+        .collect())
+}
+
+/// Find connected components and their sizes.
+pub fn connected_components(brain: &Brain) -> Result<Vec<Vec<i64>>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let mut visited = HashSet::new();
+    let mut components = Vec::new();
+    for &start in adj.keys() {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(start);
+        visited.insert(start);
+        while let Some(node) = queue.pop_front() {
+            component.push(node);
+            if let Some(neighbors) = adj.get(&node) {
+                for &n in neighbors {
+                    if visited.insert(n) {
+                        queue.push_back(n);
+                    }
+                }
+            }
+        }
+        components.push(component);
+    }
+    components.sort_by(|a, b| b.len().cmp(&a.len()));
+    Ok(components)
+}
+
 pub fn format_path(brain: &Brain, path: &[i64]) -> Result<String, rusqlite::Error> {
     let mut names = Vec::new();
     for &id in path {

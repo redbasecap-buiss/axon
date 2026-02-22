@@ -854,7 +854,8 @@ impl<'a> Prometheus<'a> {
         let anomalies = self.find_anomalies()?;
         all_patterns.extend(anomalies);
 
-        // Save patterns
+        // Deduplicate and save patterns
+        self.dedup_patterns(&mut all_patterns);
         for p in &all_patterns {
             let _ = self.save_pattern(p);
         }
@@ -895,6 +896,142 @@ impl<'a> Prometheus<'a> {
             gaps_detected,
             summary,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-domain gap detection
+    // -----------------------------------------------------------------------
+
+    /// Find disconnected clusters that likely should be connected based on entity types.
+    pub fn find_cross_domain_gaps(&self) -> Result<Vec<(Vec<String>, Vec<String>, String)>> {
+        let components = crate::graph::connected_components(self.brain)?;
+        if components.len() < 2 {
+            return Ok(vec![]);
+        }
+        let entities = self.brain.all_entities()?;
+        let id_to_entity: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+
+        // For each component, collect entity types (excluding noise types)
+        let noise_types: HashSet<&str> = ["phrase", "source", "url"].iter().copied().collect();
+        let mut component_types: Vec<(Vec<String>, HashMap<String, usize>)> = Vec::new();
+        for comp in &components {
+            let mut types: HashMap<String, usize> = HashMap::new();
+            let mut names: Vec<String> = Vec::new();
+            for &id in comp {
+                if let Some(e) = id_to_entity.get(&id) {
+                    if !noise_types.contains(e.entity_type.as_str()) {
+                        *types.entry(e.entity_type.clone()).or_insert(0) += 1;
+                        if names.len() < 5 {
+                            names.push(e.name.clone());
+                        }
+                    }
+                }
+            }
+            if !types.is_empty() {
+                component_types.push((names, types));
+            }
+        }
+
+        // Find pairs of components sharing entity types
+        let mut gaps = Vec::new();
+        for i in 0..component_types.len().min(20) {
+            for j in (i + 1)..component_types.len().min(20) {
+                let (names_i, types_i) = &component_types[i];
+                let (names_j, types_j) = &component_types[j];
+                let shared: Vec<String> = types_i
+                    .keys()
+                    .filter(|t| types_j.contains_key(*t))
+                    .cloned()
+                    .collect();
+                if !shared.is_empty() {
+                    gaps.push((
+                        names_i.clone(),
+                        names_j.clone(),
+                        format!(
+                            "Clusters share types [{}] but are disconnected",
+                            shared.join(", ")
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(gaps)
+    }
+
+    /// Suggest topics to crawl based on knowledge gaps.
+    pub fn suggest_crawl_topics(&self) -> Result<Vec<(String, String)>> {
+        let mut suggestions = Vec::new();
+
+        // 1. Entity types with low knowledge density
+        let density = crate::graph::knowledge_density(self.brain)?;
+        for (etype, (count, avg)) in &density {
+            if *count >= 3 && *avg < 0.5 && etype != "phrase" && etype != "source" {
+                suggestions.push((
+                    etype.clone(),
+                    format!(
+                        "Type '{}' has {} entities but only {:.1} avg relations — needs enrichment",
+                        etype, count, avg
+                    ),
+                ));
+            }
+        }
+
+        // 2. Entities involved in hypotheses with object "?"
+        let hyps = self.list_hypotheses(Some(HypothesisStatus::Proposed))?;
+        for h in hyps.iter().take(10) {
+            if h.object == "?" {
+                suggestions.push((
+                    h.subject.clone(),
+                    format!(
+                        "Hypothesis: '{}' likely has '{}' but value unknown",
+                        h.subject, h.predicate
+                    ),
+                ));
+            }
+        }
+
+        // 3. High-centrality entities with few facts
+        let pr = crate::graph::pagerank(self.brain, 0.85, 20)?;
+        let mut ranked: Vec<(i64, f64)> = pr.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (id, score) in ranked.iter().take(20) {
+            if let Some(e) = self.brain.get_entity_by_id(*id)? {
+                if e.entity_type == "phrase" || e.entity_type == "source" {
+                    continue;
+                }
+                let facts = self.brain.get_facts_for(*id)?;
+                let rels = self.brain.get_relations_for(*id)?;
+                if facts.len() + rels.len() < 3 {
+                    suggestions.push((
+                        e.name.clone(),
+                        format!(
+                            "High-rank entity ({:.4}) '{}' has only {} facts+relations",
+                            score,
+                            e.name,
+                            facts.len() + rels.len()
+                        ),
+                    ));
+                }
+            }
+        }
+
+        Ok(suggestions)
+    }
+
+    /// Deduplicate patterns: merge identical descriptions, increment frequency.
+    fn dedup_patterns(&self, patterns: &mut Vec<Pattern>) {
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut deduped: Vec<Pattern> = Vec::new();
+        for p in patterns.drain(..) {
+            if let Some(&idx) = seen.get(&p.description) {
+                deduped[idx].frequency += p.frequency;
+            } else {
+                seen.insert(p.description.clone(), deduped.len());
+                deduped.push(p);
+            }
+        }
+        *patterns = deduped;
     }
 
     // -----------------------------------------------------------------------
