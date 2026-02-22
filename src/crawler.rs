@@ -68,28 +68,126 @@ pub async fn fetch_html_and_text(url: &str) -> anyhow::Result<(String, String)> 
     Ok((html, text))
 }
 
-/// Extract readable text from HTML.
+/// Classes and IDs that indicate non-content (navigation, chrome, etc.)
+const NOISE_CLASSES: &[&str] = &[
+    "nav",
+    "navbar",
+    "sidebar",
+    "footer",
+    "header",
+    "menu",
+    "toc",
+    "catlinks",
+    "mw-navigation",
+    "mw-panel",
+    "mw-footer",
+    "siteSub",
+    "contentSub",
+    "mw-jump-link",
+    "mw-editsection",
+    "navbox",
+    "noprint",
+    "printfooter",
+    "mw-indicators",
+    "mw-head",
+    "mw-page-container-inner",
+    "vector-header",
+    "vector-column-start",
+    "vector-sticky-header",
+    "mw-footer-container",
+    "portlet",
+    "portal",
+];
+
+/// Tags to always skip regardless of class.
+const SKIP_TAGS: &[&str] = &["script", "style", "noscript", "nav", "footer", "header"];
+
+/// Content tags we want to keep text from.
+const CONTENT_TAGS: &[&str] = &[
+    "p",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "li",
+    "td",
+    "th",
+    "blockquote",
+    "caption",
+    "figcaption",
+    "dt",
+    "dd",
+    "span",
+    "a",
+    "em",
+    "strong",
+    "b",
+    "i",
+    "sup",
+    "sub",
+    "code",
+];
+
+/// Check if an element matches noise patterns.
+fn is_noise_element(el: &scraper::node::Element) -> bool {
+    let tag = el.name();
+    if SKIP_TAGS.contains(&tag) {
+        return true;
+    }
+    for class in el.attr("class").unwrap_or("").split_whitespace() {
+        if NOISE_CLASSES.iter().any(|nc| class.contains(nc)) {
+            return true;
+        }
+    }
+    if let Some(id) = el.attr("id") {
+        if NOISE_CLASSES.iter().any(|nc| id.contains(nc)) {
+            return true;
+        }
+    }
+    if el.attr("role").is_some_and(|r| r == "navigation") {
+        return true;
+    }
+    false
+}
+
+/// Extract readable text from HTML, filtering out navigation/chrome noise.
+/// Uses CSS selectors to first remove noise, then extract from content tags.
 pub fn extract_text_from_html(html: &str) -> String {
     let document = scraper::Html::parse_document(html);
 
-    // Remove script and style elements
-    let skip_tags: std::collections::HashSet<&str> =
-        ["script", "style", "noscript", "nav", "footer", "header"]
-            .iter()
-            .copied()
-            .collect();
+    let content_tags: std::collections::HashSet<&str> = CONTENT_TAGS.iter().copied().collect();
 
     let mut text = String::new();
     for node in document.tree.nodes() {
         if let scraper::node::Node::Text(t) = node.value() {
-            // Check if parent is a skipped tag
-            if let Some(parent) = node.parent() {
-                if let Some(el) = parent.value().as_element() {
-                    if skip_tags.contains(el.name()) {
-                        continue;
+            // Check parent is a content tag
+            let in_content = node.parent().is_some_and(|p| {
+                p.value()
+                    .as_element()
+                    .is_some_and(|el| content_tags.contains(el.name()))
+            });
+            if !in_content {
+                continue;
+            }
+
+            // Walk ancestors to check for noise
+            let mut in_noise = false;
+            let mut ancestor = node.parent();
+            while let Some(anc) = ancestor {
+                if let Some(el) = anc.value().as_element() {
+                    if is_noise_element(el) {
+                        in_noise = true;
+                        break;
                     }
                 }
+                ancestor = anc.parent();
             }
+            if in_noise {
+                continue;
+            }
+
             let s = t.text.trim();
             if !s.is_empty() {
                 text.push_str(s);
@@ -201,6 +299,108 @@ mod tests {
         assert!(text.contains("test paragraph"));
         assert!(!text.contains("var x"));
         assert!(!text.contains("color: red"));
+    }
+
+    #[test]
+    fn test_extract_text_strips_nav_by_class() {
+        let html = r#"
+        <html><body>
+            <div class="mw-navigation"><a>Jump to navigation</a></div>
+            <div class="sidebar"><span>Menu items</span></div>
+            <p>Real content here.</p>
+        </body></html>"#;
+        let text = extract_text_from_html(html);
+        assert!(text.contains("Real content"), "text: {text}");
+        assert!(!text.contains("Jump to navigation"), "text: {text}");
+        assert!(!text.contains("Menu items"), "text: {text}");
+    }
+
+    #[test]
+    fn test_extract_text_strips_nav_by_id() {
+        let html = r#"
+        <html><body>
+            <div id="mw-panel"><span>Sidebar stuff</span></div>
+            <div id="catlinks"><span>Categories</span></div>
+            <div id="mw-footer"><span>Footer stuff</span></div>
+            <p>Article content is here.</p>
+        </body></html>"#;
+        let text = extract_text_from_html(html);
+        assert!(text.contains("Article content"), "text: {text}");
+        assert!(!text.contains("Sidebar stuff"), "text: {text}");
+        assert!(!text.contains("Categories"), "text: {text}");
+        assert!(!text.contains("Footer stuff"), "text: {text}");
+    }
+
+    #[test]
+    fn test_extract_text_strips_footer_tag() {
+        let html = r#"
+        <html><body>
+            <h2>Section Title</h2>
+            <p>Good content.</p>
+            <footer><p>Copyright Wikimedia Foundation</p></footer>
+        </body></html>"#;
+        let text = extract_text_from_html(html);
+        assert!(text.contains("Good content"), "text: {text}");
+        assert!(!text.contains("Wikimedia"), "text: {text}");
+    }
+
+    #[test]
+    fn test_extract_text_keeps_content_tags() {
+        let html = r#"
+        <html><body>
+            <h1>Title</h1>
+            <h2>Subtitle</h2>
+            <p>Paragraph text.</p>
+            <ul><li>List item</li></ul>
+            <blockquote>A famous quote.</blockquote>
+            <table><tr><td>Cell data</td></tr></table>
+        </body></html>"#;
+        let text = extract_text_from_html(html);
+        assert!(text.contains("Title"), "text: {text}");
+        assert!(text.contains("Paragraph text"), "text: {text}");
+        assert!(text.contains("List item"), "text: {text}");
+        assert!(text.contains("famous quote"), "text: {text}");
+        assert!(text.contains("Cell data"), "text: {text}");
+    }
+
+    #[test]
+    fn test_extract_text_strips_role_navigation() {
+        let html = r#"
+        <html><body>
+            <div role="navigation"><a>Upload file</a></div>
+            <p>Main article text.</p>
+        </body></html>"#;
+        let text = extract_text_from_html(html);
+        assert!(text.contains("Main article"), "text: {text}");
+        assert!(!text.contains("Upload file"), "text: {text}");
+    }
+
+    #[test]
+    fn test_extract_text_wikipedia_realistic() {
+        let html = r#"
+        <html><body>
+            <div id="mw-navigation">
+                <div class="portlet"><span>Main page</span></div>
+                <div class="portlet"><span>Random article</span></div>
+                <div class="portlet"><span>Upload</span></div>
+                <div class="portlet"><a>Community portal</a></div>
+            </div>
+            <div id="content">
+                <h1>Albert Einstein</h1>
+                <p>Albert Einstein was a German-born theoretical physicist.</p>
+                <p>He developed the theory of relativity.</p>
+            </div>
+            <div id="catlinks"><span>Categories: Physicists</span></div>
+            <div id="mw-footer"><span>Wikimedia Foundation</span></div>
+        </body></html>"#;
+        let text = extract_text_from_html(html);
+        assert!(text.contains("Albert Einstein"), "text: {text}");
+        assert!(text.contains("theoretical physicist"), "text: {text}");
+        assert!(!text.contains("Main page"), "text: {text}");
+        assert!(!text.contains("Random article"), "text: {text}");
+        assert!(!text.contains("Upload"), "text: {text}");
+        assert!(!text.contains("Community portal"), "text: {text}");
+        assert!(!text.contains("Wikimedia Foundation"), "text: {text}");
     }
 
     #[test]

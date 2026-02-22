@@ -179,6 +179,70 @@ const STOP_WORDS_ES: &[&str] = &[
     "donde", "cuando",
 ];
 
+/// Blacklist of web/Wikipedia chrome that should never be entities.
+const ENTITY_BLACKLIST: &[&str] = &[
+    "wikipedia",
+    "wikimedia",
+    "wikimedia foundation",
+    "jump",
+    "navigation",
+    "main page",
+    "main",
+    "contents",
+    "random",
+    "upload",
+    "community",
+    "special",
+    "recent",
+    "recent changes",
+    "help learn",
+    "help",
+    "contact",
+    "community portal",
+    "current events",
+    "random article",
+    "about wikipedia",
+    "donate",
+    "what links here",
+    "related changes",
+    "permanent link",
+    "page information",
+    "cite this page",
+    "create account",
+    "log in",
+    "talk",
+    "contributions",
+    "read",
+    "view source",
+    "view history",
+    "edit",
+    "search",
+    "printable version",
+    "download",
+    "tools",
+    "languages",
+    "sidebar",
+    "toggle",
+    "menu",
+    "jump to content",
+    "jump to navigation",
+    "jump to search",
+    "personal tools",
+    "namespaces",
+    "variants",
+    "views",
+    "more",
+    "general",
+    "statistics",
+    "cookie statement",
+    "mobile view",
+    "developers",
+    "privacy policy",
+    "terms of use",
+    "desktop",
+    "powered by mediawiki",
+];
+
 const ABBREVIATIONS: &[&str] = &[
     "dr", "mr", "mrs", "ms", "prof", "jr", "sr", "inc", "ltd", "co", "corp", "vs", "etc", "al",
     "approx", "dept", "est", "vol", "fig", "ref", "st", "ave", "blvd",
@@ -307,6 +371,48 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Check if an entity passes minimum quality filters.
+fn is_valid_entity(name: &str, etype: &str) -> bool {
+    let trimmed = name.trim();
+
+    // Length bounds
+    if trimmed.len() < 3 || trimmed.len() > 100 {
+        return false;
+    }
+
+    // Structured types (dates, urls, emails, currency, number_unit) skip text-based filters
+    if matches!(
+        etype,
+        "date" | "relative_date" | "url" | "email" | "currency" | "number_unit" | "year"
+    ) {
+        return true;
+    }
+
+    // Blacklist check (case-insensitive)
+    let lower = trimmed.to_lowercase();
+    if ENTITY_BLACKLIST.contains(&lower.as_str()) {
+        return false;
+    }
+
+    // All-uppercase check: reject unless it's a short acronym (≤6 chars)
+    if trimmed
+        .chars()
+        .all(|c| c.is_uppercase() || !c.is_alphabetic())
+    {
+        let alpha_len = trimmed.chars().filter(|c| c.is_alphabetic()).count();
+        if alpha_len > 6 {
+            return false;
+        }
+    }
+
+    // Don't start with numbers unless it looks like a measurement/date
+    if trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    true
+}
+
 pub fn extract_entities(sentences: &[String]) -> Vec<(String, String)> {
     let mut entities = Vec::new();
     let stop_en: HashSet<&str> = STOP_WORDS_EN.iter().copied().collect();
@@ -319,6 +425,8 @@ pub fn extract_entities(sentences: &[String]) -> Vec<(String, String)> {
         extract_urls(sentence, &mut entities);
         extract_years(sentence, &mut entities);
     }
+    // Apply quality filter
+    entities.retain(|(name, etype)| is_valid_entity(name, etype));
     entities
 }
 
@@ -340,7 +448,8 @@ fn extract_capitalized(
         {
             let mut phrase = vec![word.to_string()];
             let mut j = i + 1;
-            while j < words.len() {
+            // Max 4 words per entity phrase to avoid capturing paragraphs
+            while j < words.len() && phrase.len() < 4 {
                 let next = words[j].trim_matches(|c: char| !c.is_alphanumeric());
                 if !next.is_empty() && next.chars().next().is_some_and(|c| c.is_uppercase()) {
                     phrase.push(next.to_string());
@@ -412,26 +521,65 @@ fn extract_dates(sentence: &str, entities: &mut Vec<(String, String)>) {
         entities.push((cap, "date".to_string()));
     }
 
+    // Helper: safely extract localized month dates using char-aware slicing.
+    // We search in the lowercased text, then map byte positions back to the
+    // original using char_indices() to avoid panicking on multi-byte chars
+    // like en-dash '–'.
+    let chars_orig: Vec<(usize, char)> = text.char_indices().collect();
+    let chars_lower: Vec<(usize, char)> = lower.char_indices().collect();
+
+    // Build a byte-offset mapping from lower -> original (same char index)
+    // Both have the same number of chars, so we can zip them.
+    // We need: given a byte offset in `lower`, find the corresponding byte offset in `text`.
+    let byte_map: HashMap<usize, usize> = chars_lower
+        .iter()
+        .zip(chars_orig.iter())
+        .map(|((lb, _), (ob, _))| (*lb, *ob))
+        .collect();
+
+    fn safe_slice(src: &str, byte_start: usize, byte_end: usize) -> Option<&str> {
+        if byte_start <= byte_end
+            && byte_end <= src.len()
+            && src.is_char_boundary(byte_start)
+            && src.is_char_boundary(byte_end)
+        {
+            Some(&src[byte_start..byte_end])
+        } else {
+            None
+        }
+    }
+
     // German month dates
     for (month_name, _) in GERMAN_MONTHS {
-        if let Some(pos) = lower.find(month_name) {
-            let before = text[..pos].trim_end();
-            if let Some(day_start) = before.rfind(|c: char| !c.is_ascii_digit() && c != '.') {
-                let day_part = before[day_start + 1..].trim_matches('.');
-                if let Ok(d) = day_part.trim().parse::<u32>() {
-                    if (1..=31).contains(&d) {
-                        let after = &text[pos + month_name.len()..];
-                        let year_str: String = after
-                            .trim()
-                            .chars()
-                            .take_while(|c| c.is_ascii_digit())
-                            .collect();
-                        if year_str.len() == 4 {
-                            let orig_month = &text[pos..pos + month_name.len()];
-                            entities.push((
-                                format!("{}. {} {}", d, orig_month, year_str),
-                                "date".to_string(),
-                            ));
+        if let Some(lower_pos) = lower.find(month_name) {
+            let orig_pos = byte_map.get(&lower_pos).copied().unwrap_or(lower_pos);
+            let month_end_lower = lower_pos + month_name.len();
+            let orig_end = byte_map
+                .get(&month_end_lower)
+                .copied()
+                .unwrap_or(orig_pos + month_name.len());
+            if let Some(before) = safe_slice(text, 0, orig_pos) {
+                let before = before.trim_end();
+                if let Some(day_start) = before.rfind(|c: char| !c.is_ascii_digit() && c != '.') {
+                    let day_part = &before[day_start + 1..];
+                    let day_part = day_part.trim_matches('.');
+                    if let Ok(d) = day_part.trim().parse::<u32>() {
+                        if (1..=31).contains(&d) {
+                            if let Some(after) = safe_slice(text, orig_end, text.len()) {
+                                let year_str: String = after
+                                    .trim()
+                                    .chars()
+                                    .take_while(|c| c.is_ascii_digit())
+                                    .collect();
+                                if year_str.len() == 4 {
+                                    let orig_month =
+                                        safe_slice(text, orig_pos, orig_end).unwrap_or(month_name);
+                                    entities.push((
+                                        format!("{}. {} {}", d, orig_month, year_str),
+                                        "date".to_string(),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -441,23 +589,33 @@ fn extract_dates(sentence: &str, entities: &mut Vec<(String, String)>) {
 
     // French month dates
     for (month_name, _) in FRENCH_MONTHS {
-        if let Some(pos) = lower.find(month_name) {
-            let before = text[..pos].trim_end();
-            if let Some(day_str) = before.split_whitespace().last() {
-                if let Ok(d) = day_str.parse::<u32>() {
-                    if (1..=31).contains(&d) {
-                        let after = &text[pos + month_name.len()..];
-                        let year_str: String = after
-                            .trim()
-                            .chars()
-                            .take_while(|c| c.is_ascii_digit())
-                            .collect();
-                        if year_str.len() == 4 {
-                            let orig_month = &text[pos..pos + month_name.len()];
-                            entities.push((
-                                format!("{} {} {}", d, orig_month, year_str),
-                                "date".to_string(),
-                            ));
+        if let Some(lower_pos) = lower.find(month_name) {
+            let orig_pos = byte_map.get(&lower_pos).copied().unwrap_or(lower_pos);
+            let month_end_lower = lower_pos + month_name.len();
+            let orig_end = byte_map
+                .get(&month_end_lower)
+                .copied()
+                .unwrap_or(orig_pos + month_name.len());
+            if let Some(before) = safe_slice(text, 0, orig_pos) {
+                let before = before.trim_end();
+                if let Some(day_str) = before.split_whitespace().last() {
+                    if let Ok(d) = day_str.parse::<u32>() {
+                        if (1..=31).contains(&d) {
+                            if let Some(after) = safe_slice(text, orig_end, text.len()) {
+                                let year_str: String = after
+                                    .trim()
+                                    .chars()
+                                    .take_while(|c| c.is_ascii_digit())
+                                    .collect();
+                                if year_str.len() == 4 {
+                                    let orig_month =
+                                        safe_slice(text, orig_pos, orig_end).unwrap_or(month_name);
+                                    entities.push((
+                                        format!("{} {} {}", d, orig_month, year_str),
+                                        "date".to_string(),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -467,23 +625,33 @@ fn extract_dates(sentence: &str, entities: &mut Vec<(String, String)>) {
 
     // Italian month dates
     for (month_name, _) in ITALIAN_MONTHS {
-        if let Some(pos) = lower.find(month_name) {
-            let before = text[..pos].trim_end();
-            if let Some(day_str) = before.split_whitespace().last() {
-                if let Ok(d) = day_str.parse::<u32>() {
-                    if (1..=31).contains(&d) {
-                        let after = &text[pos + month_name.len()..];
-                        let year_str: String = after
-                            .trim()
-                            .chars()
-                            .take_while(|c| c.is_ascii_digit())
-                            .collect();
-                        if year_str.len() == 4 {
-                            let orig_month = &text[pos..pos + month_name.len()];
-                            entities.push((
-                                format!("{} {} {}", d, orig_month, year_str),
-                                "date".to_string(),
-                            ));
+        if let Some(lower_pos) = lower.find(month_name) {
+            let orig_pos = byte_map.get(&lower_pos).copied().unwrap_or(lower_pos);
+            let month_end_lower = lower_pos + month_name.len();
+            let orig_end = byte_map
+                .get(&month_end_lower)
+                .copied()
+                .unwrap_or(orig_pos + month_name.len());
+            if let Some(before) = safe_slice(text, 0, orig_pos) {
+                let before = before.trim_end();
+                if let Some(day_str) = before.split_whitespace().last() {
+                    if let Ok(d) = day_str.parse::<u32>() {
+                        if (1..=31).contains(&d) {
+                            if let Some(after) = safe_slice(text, orig_end, text.len()) {
+                                let year_str: String = after
+                                    .trim()
+                                    .chars()
+                                    .take_while(|c| c.is_ascii_digit())
+                                    .collect();
+                                if year_str.len() == 4 {
+                                    let orig_month =
+                                        safe_slice(text, orig_pos, orig_end).unwrap_or(month_name);
+                                    entities.push((
+                                        format!("{} {} {}", d, orig_month, year_str),
+                                        "date".to_string(),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -1348,5 +1516,205 @@ mod tests {
             entities
         );
         assert!(types.contains("date"), "Missing date in {:?}", entities);
+    }
+
+    // ===== NLP NOISE FILTER TESTS =====
+
+    #[test]
+    fn test_blacklist_filters_wikipedia_chrome() {
+        let sentences =
+            vec!["The page shows Wikipedia and Navigation links to Random articles.".into()];
+        let entities = extract_entities(&sentences);
+        let names: Vec<String> = entities.iter().map(|(n, _)| n.to_lowercase()).collect();
+        assert!(
+            !names.contains(&"wikipedia".to_string()),
+            "entities: {:?}",
+            entities
+        );
+        assert!(
+            !names.contains(&"navigation".to_string()),
+            "entities: {:?}",
+            entities
+        );
+        assert!(
+            !names.contains(&"random".to_string()),
+            "entities: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_blacklist_filters_wikimedia() {
+        let sentences = vec!["Powered by Wikimedia Foundation and Community Portal links.".into()];
+        let entities = extract_entities(&sentences);
+        let names: Vec<String> = entities.iter().map(|(n, _)| n.to_lowercase()).collect();
+        assert!(
+            !names.iter().any(|n| n.contains("wikimedia")),
+            "entities: {:?}",
+            entities
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("community")),
+            "entities: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_blacklist_filters_upload_special() {
+        let sentences = vec!["Click Upload or Special pages to find Help Learn more.".into()];
+        let entities = extract_entities(&sentences);
+        let names: Vec<String> = entities.iter().map(|(n, _)| n.to_lowercase()).collect();
+        assert!(
+            !names.contains(&"upload".to_string()),
+            "entities: {:?}",
+            entities
+        );
+        assert!(
+            !names.contains(&"special".to_string()),
+            "entities: {:?}",
+            entities
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("help")),
+            "entities: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_entity_min_length() {
+        // Entities shorter than 3 chars should be filtered
+        let sentences = vec!["The AI is good at NLP research tasks.".into()];
+        let entities = extract_entities(&sentences);
+        let names: Vec<&str> = entities.iter().map(|(n, _)| n.as_str()).collect();
+        // "AI" is only 2 chars, should be filtered
+        assert!(!names.contains(&"AI"), "entities: {:?}", entities);
+        // "NLP" is 3 chars, should be kept
+        assert!(names.contains(&"NLP"), "entities: {:?}", entities);
+    }
+
+    #[test]
+    fn test_entity_max_length() {
+        // Entities over 100 chars should be filtered
+        let long_name = "A".repeat(101);
+        assert!(!is_valid_entity(&long_name, "phrase"));
+        assert!(is_valid_entity("Normal Entity", "phrase"));
+    }
+
+    #[test]
+    fn test_entity_all_uppercase_rejected() {
+        // All-uppercase entities > 6 alpha chars should be rejected
+        assert!(!is_valid_entity("NAVIGATION PANEL", "phrase"));
+        assert!(!is_valid_entity("WIKIMEDIA", "phrase"));
+        // Short acronyms are OK
+        assert!(is_valid_entity("NASA", "phrase"));
+        assert!(is_valid_entity("UNESCO", "phrase"));
+    }
+
+    #[test]
+    fn test_entity_starting_with_number_rejected() {
+        assert!(!is_valid_entity("123Company", "phrase"));
+        assert!(!is_valid_entity("42nd Street", "phrase"));
+        // But dates/measurements starting with numbers are fine
+        assert!(is_valid_entity("2024-01-15", "date"));
+        assert!(is_valid_entity("500 GB", "number_unit"));
+    }
+
+    #[test]
+    fn test_phrase_max_4_words() {
+        // A long sequence of capitalized words should be capped at 4
+        let sentences = vec![
+            "We visited The Very Long Name Organization Department Division yesterday.".into(),
+        ];
+        let entities = extract_entities(&sentences);
+        for (name, etype) in &entities {
+            if etype == "phrase" || etype == "compound_noun" {
+                let word_count = name.split_whitespace().count();
+                assert!(
+                    word_count <= 4,
+                    "Entity '{}' has {} words, max 4",
+                    name,
+                    word_count
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_unicode_en_dash_no_panic() {
+        // This should NOT panic on en-dash '–' or other multi-byte chars
+        let text = "The event – held on 5 février 2024 – was in Paris.";
+        let sentences = split_sentences(text);
+        let entities = extract_entities(&sentences);
+        // Should not panic, and should extract the date
+        assert!(
+            entities
+                .iter()
+                .any(|(n, t)| t == "date" && n.contains("février")),
+            "entities: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_unicode_em_dash_no_panic() {
+        let text = "Einstein—born 14 März 1879—changed physics forever.";
+        let sentences = split_sentences(text);
+        let _entities = extract_entities(&sentences);
+        // Just verify no panic
+    }
+
+    #[test]
+    fn test_unicode_mixed_no_panic() {
+        // Text with various multi-byte characters
+        let text = "Zürich's café – founded in März 2020 – serves crème brûlée.";
+        let sentences = split_sentences(text);
+        let _entities = extract_entities(&sentences);
+        // No panic = success
+    }
+
+    #[test]
+    fn test_real_entity_not_filtered() {
+        // Real knowledge entities should pass all filters
+        let sentences = vec![
+            "Albert Einstein developed the theory of relativity at Princeton University.".into(),
+        ];
+        let entities = extract_entities(&sentences);
+        let names: Vec<&str> = entities.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.iter().any(|n| n.contains("Einstein")),
+            "entities: {:?}",
+            entities
+        );
+        assert!(
+            names.iter().any(|n| n.contains("Princeton")),
+            "entities: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_process_text_filters_noise() {
+        let e = process_text(
+            "Wikipedia is a free encyclopedia. Navigation links help users. Albert Einstein was a physicist.",
+            "https://en.wikipedia.org/wiki/Test",
+        );
+        let names: Vec<String> = e.entities.iter().map(|(n, _)| n.to_lowercase()).collect();
+        assert!(
+            !names.contains(&"wikipedia".to_string()),
+            "entities: {:?}",
+            e.entities
+        );
+        assert!(
+            !names.contains(&"navigation".to_string()),
+            "entities: {:?}",
+            e.entities
+        );
+        assert!(
+            names.iter().any(|n| n.contains("einstein")),
+            "entities: {:?}",
+            e.entities
+        );
     }
 }
