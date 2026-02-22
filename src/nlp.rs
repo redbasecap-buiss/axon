@@ -556,6 +556,154 @@ pub fn tokenize(text: &str) -> Vec<String> {
 }
 
 /// Check if an entity passes minimum quality filters.
+/// Single-word terms too generic to be useful entities.
+const GENERIC_SINGLE_WORDS: &[&str] = &[
+    "output",
+    "input",
+    "overview",
+    "subscribe",
+    "download",
+    "upload",
+    "search",
+    "login",
+    "logout",
+    "submit",
+    "cancel",
+    "delete",
+    "update",
+    "create",
+    "select",
+    "click",
+    "default",
+    "example",
+    "test",
+    "demo",
+    "sample",
+    "note",
+    "notes",
+    "summary",
+    "introduction",
+    "conclusion",
+    "appendix",
+    "table",
+    "figure",
+    "chapter",
+    "section",
+    "part",
+    "volume",
+    "issue",
+    "item",
+    "list",
+    "array",
+    "object",
+    "string",
+    "integer",
+    "float",
+    "boolean",
+    "function",
+    "class",
+    "method",
+    "variable",
+    "parameter",
+    "argument",
+    "return",
+    "import",
+    "export",
+    "module",
+    "package",
+    "library",
+    "framework",
+    "august",
+    "march",
+    "may",
+    "imperial",
+    "modern",
+    "various",
+    "early",
+    "late",
+    "first",
+    "second",
+    "third",
+    "new",
+    "old",
+    "great",
+    "large",
+    "small",
+    "high",
+    "low",
+    "long",
+    "short",
+    "major",
+    "minor",
+    "general",
+    "special",
+    "national",
+    "international",
+    "western",
+    "eastern",
+    "northern",
+    "southern",
+    "central",
+    "united",
+    "free",
+    "open",
+    "public",
+    "private",
+    "former",
+    "current",
+    "original",
+    "standard",
+    "common",
+    "popular",
+    "traditional",
+    "classical",
+    "main",
+    "many",
+    "several",
+    "certain",
+    "according",
+    "following",
+    "including",
+    "related",
+    "based",
+    "known",
+    "called",
+    "named",
+    "used",
+    "given",
+    "made",
+    "found",
+    "however",
+    "although",
+    "despite",
+    "during",
+    "between",
+    "within",
+    "without",
+    "after",
+    "before",
+    "since",
+    "until",
+    "above",
+    "below",
+    "under",
+    "over",
+    "through",
+    "among",
+    "against",
+    "towards",
+    "along",
+];
+
+/// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
+const TRAILING_JUNK: &[&str] = &[
+    "in", "the", "a", "of", "and", "or", "at", "to", "for", "by", "from", "with", "on", "is",
+    "are", "was", "were", "its", "his", "her", "their", "an", "as", "but", "not", "out", "since",
+    "has", "had", "have", "been", "be", "will", "would", "could", "should", "may", "might", "into",
+    "than", "then", "also", "that", "this", "these", "those", "which", "who", "whom", "when",
+    "where", "how", "why", "what", "both", "such", "some", "all", "each", "every",
+];
+
 fn is_valid_entity(name: &str, etype: &str) -> bool {
     let trimmed = name.trim();
 
@@ -576,6 +724,25 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     let lower = trimmed.to_lowercase();
     if ENTITY_BLACKLIST.contains(&lower.as_str()) {
         return false;
+    }
+
+    // Reject single generic words
+    if !lower.contains(' ') && GENERIC_SINGLE_WORDS.contains(&lower.as_str()) {
+        return false;
+    }
+
+    // Reject entities ending with trailing junk words
+    if let Some(last_word) = lower.split_whitespace().last() {
+        if lower.contains(' ') && TRAILING_JUNK.contains(&last_word) {
+            return false;
+        }
+    }
+
+    // Reject entities starting with trailing junk (leftover fragments)
+    if let Some(first_word) = lower.split_whitespace().next() {
+        if lower.contains(' ') && TRAILING_JUNK.contains(&first_word) {
+            return false;
+        }
     }
 
     // All-uppercase check: reject unless it's a short acronym (≤6 chars)
