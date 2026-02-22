@@ -7,6 +7,7 @@ mod export;
 mod graph;
 mod nlp;
 pub mod plugin;
+pub mod prometheus;
 mod query;
 mod server;
 mod tui;
@@ -94,6 +95,23 @@ enum Commands {
     },
     /// Deduplicate near-duplicate entities
     Dedup,
+    /// Run PROMETHEUS discovery pipeline — find patterns and generate hypotheses
+    Discover {
+        /// Output format: text, json, markdown
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// List current hypotheses
+    Hypotheses {
+        /// Filter by status: proposed, testing, confirmed, rejected
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Explain a hypothesis — show full reasoning chain
+    Explain {
+        /// Hypothesis ID
+        hypothesis_id: i64,
+    },
     /// Generate default config at ~/.axon/config.toml
     Init,
     /// Launch HTTP API server
@@ -315,6 +333,74 @@ async fn main() -> anyhow::Result<()> {
                 for (keep, removed) in &merged {
                     println!("  \"{removed}\" → \"{keep}\"");
                 }
+            }
+        }
+        Commands::Discover { format } => {
+            let p = prometheus::Prometheus::new(&brain)?;
+            let report = p.discover()?;
+            match format.as_str() {
+                "json" => println!("{}", p.report_json(&report)),
+                "markdown" | "md" => println!("{}", p.report_markdown(&report)),
+                _ => {
+                    println!("🔬 PROMETHEUS Discovery Report\n");
+                    println!("{}\n", report.summary);
+                    if !report.patterns_found.is_empty() {
+                        println!("Patterns found: {}", report.patterns_found.len());
+                        for pat in &report.patterns_found {
+                            println!(
+                                "  [{:>15}] (freq: {:>3}) {}",
+                                pat.pattern_type.as_str(),
+                                pat.frequency,
+                                pat.description
+                            );
+                        }
+                        println!();
+                    }
+                    if !report.hypotheses_generated.is_empty() {
+                        println!(
+                            "Hypotheses generated: {}",
+                            report.hypotheses_generated.len()
+                        );
+                        for h in &report.hypotheses_generated {
+                            println!(
+                                "  [{:.2}] {} {} {} — {}",
+                                h.confidence,
+                                h.subject,
+                                h.predicate,
+                                h.object,
+                                h.status.as_str()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Commands::Hypotheses { status } => {
+            let p = prometheus::Prometheus::new(&brain)?;
+            let filter = status.map(|s| prometheus::HypothesisStatus::from_str(&s));
+            let hyps = p.list_hypotheses(filter)?;
+            if hyps.is_empty() {
+                println!("🤷 No hypotheses yet. Run `axon discover` first!");
+            } else {
+                println!("📋 Hypotheses ({}):\n", hyps.len());
+                for h in &hyps {
+                    println!(
+                        "  #{:<4} [{:.2}] {} {} {} — {}",
+                        h.id,
+                        h.confidence,
+                        h.subject,
+                        h.predicate,
+                        h.object,
+                        h.status.as_str()
+                    );
+                }
+            }
+        }
+        Commands::Explain { hypothesis_id } => {
+            let p = prometheus::Prometheus::new(&brain)?;
+            match p.explain(hypothesis_id)? {
+                Some(explanation) => println!("{}", explanation),
+                None => println!("🤷 Hypothesis #{} not found.", hypothesis_id),
             }
         }
         Commands::Init => unreachable!(),

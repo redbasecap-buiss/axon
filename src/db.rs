@@ -568,6 +568,14 @@ impl Brain {
         Ok(())
     }
 
+    /// Provide access to the underlying connection for extensions.
+    pub fn with_conn<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        f(&self.conn)
+    }
+
     pub fn search_facts(&self, query: &str) -> Result<Vec<(String, String, String, f64)>> {
         let pattern = format!("%{query}%");
         let mut stmt = self.conn.prepare(

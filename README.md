@@ -118,6 +118,43 @@ Pure Rust, minimal footprint:
 - `tokio` — Async runtime
 - `texting_robots` — robots.txt parsing
 
+## 🔬 PROMETHEUS — Automated Scientific Discovery
+
+PROMETHEUS is axon's discovery engine. It finds patterns in the knowledge graph, detects gaps, generates hypotheses, and validates them — automated scientific reasoning over your data.
+
+### What it does
+
+1. **Pattern Discovery** — Frequent subgraph mining, co-occurrence analysis, temporal sequence detection, statistical anomaly finding
+2. **Gap Detection** — Structural holes (missing links between connected entities), type-based gaps (entities missing expected relations), analogy detection
+3. **Hypothesis Engine** — Generates testable hypotheses from discovered gaps, scores confidence, checks for contradictions, builds full reasoning chains
+4. **Validation** — Cross-references hypotheses against existing knowledge, updates confidence based on evidence
+5. **Meta-learning** — Tracks which discovery patterns lead to confirmed hypotheses, adjusts pattern weights over time
+
+### Commands
+
+```bash
+# Run full discovery pipeline
+axon discover
+axon discover --format json
+axon discover --format markdown
+
+# List hypotheses
+axon hypotheses
+axon hypotheses --status proposed
+
+# Explain a hypothesis (full reasoning chain)
+axon explain 42
+```
+
+### Data model
+
+- **Hypothesis**: subject-predicate-object triple with confidence, evidence for/against, reasoning chain, status (proposed → testing → confirmed/rejected)
+- **Pattern**: recurring structural motif with type, frequency, involved entities
+- **Discovery**: confirmed hypothesis with evidence sources
+- **Pattern weights**: meta-learning — tracks confirmation/rejection rates per pattern type
+
+All stored in SQLite alongside the existing brain tables.
+
 ## License
 
 MIT
