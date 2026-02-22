@@ -1298,7 +1298,12 @@ impl<'a> Prometheus<'a> {
 
         let gaps_detected = all_hypotheses.len() + islands.len();
 
-        // 4. Score and validate (cap to avoid huge runs)
+        // 4. Deduplicate hypotheses against existing DB, then score and validate
+        all_hypotheses.retain(|h| {
+            !self
+                .hypothesis_exists(&h.subject, &h.predicate, &h.object)
+                .unwrap_or(true)
+        });
         for h in all_hypotheses.iter_mut().take(200) {
             self.score_hypothesis(h)?;
             self.validate_hypothesis(h)?;
@@ -1318,12 +1323,13 @@ impl<'a> Prometheus<'a> {
         let cross_gaps = self.find_cross_domain_gaps().unwrap_or_default();
         let frontiers = self.find_knowledge_frontiers().unwrap_or_default();
         let bridges = self.find_bridge_entities().unwrap_or_default();
+        let island_clusters = self.cluster_islands_for_crawl().unwrap_or_default();
 
         // Decay old hypotheses (meta-learning)
         let decayed = self.decay_old_hypotheses(7).unwrap_or(0);
 
         let summary = format!(
-            "Discovered {} patterns, generated {} hypotheses ({} confirmed, {} rejected), {} island entities, {} meaningful relations, {} cross-domain gaps, {} knowledge frontiers, {} bridge entities, {} old hypotheses decayed",
+            "Discovered {} patterns, generated {} hypotheses ({} confirmed, {} rejected), {} island entities, {} meaningful relations, {} cross-domain gaps, {} knowledge frontiers, {} bridge entities, {} old hypotheses decayed, {} island clusters",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1334,6 +1340,7 @@ impl<'a> Prometheus<'a> {
             frontiers.len(),
             bridges.len(),
             decayed,
+            island_clusters.len(),
         );
 
         Ok(DiscoveryReport {
@@ -1526,6 +1533,53 @@ impl<'a> Prometheus<'a> {
         }
 
         Ok(suggestions)
+    }
+
+    /// Cluster island entities by type and name similarity to suggest batch crawl targets.
+    pub fn cluster_islands_for_crawl(&self) -> Result<Vec<(String, Vec<String>)>> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+        // Group islands by type
+        let mut type_islands: HashMap<String, Vec<String>> = HashMap::new();
+        for e in &entities {
+            if !connected.contains(&e.id)
+                && !is_noise_type(&e.entity_type)
+                && !is_noise_name(&e.name)
+            {
+                type_islands
+                    .entry(e.entity_type.clone())
+                    .or_default()
+                    .push(e.name.clone());
+            }
+        }
+        let mut clusters: Vec<(String, Vec<String>)> = type_islands
+            .into_iter()
+            .filter(|(_, names)| names.len() >= 2)
+            .map(|(t, mut names)| {
+                names.sort();
+                names.truncate(20);
+                (t, names)
+            })
+            .collect();
+        clusters.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        Ok(clusters)
+    }
+
+    /// Check if a hypothesis already exists (dedup across runs).
+    fn hypothesis_exists(&self, subject: &str, predicate: &str, object: &str) -> Result<bool> {
+        self.brain.with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM hypotheses WHERE subject = ?1 AND predicate = ?2 AND object = ?3",
+                params![subject, predicate, object],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
     }
 
     /// Deduplicate patterns: merge identical descriptions, increment frequency.

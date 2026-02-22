@@ -693,6 +693,83 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "against",
     "towards",
     "along",
+    "different",
+    "important",
+    "possible",
+    "available",
+    "necessary",
+    "particular",
+    "significant",
+    "similar",
+    "specific",
+    "various",
+    "recent",
+    "previous",
+    "additional",
+    "potential",
+    "certain",
+    "particular",
+    "primary",
+    "secondary",
+    "final",
+    "initial",
+    "entire",
+    "basic",
+    "typical",
+    "separate",
+    "individual",
+    "alternative",
+    "corresponding",
+    "equivalent",
+    "respective",
+    "subsequent",
+    "remaining",
+    "existing",
+    "proposed",
+    "suggested",
+    "described",
+    "considered",
+    "required",
+    "expected",
+    "observed",
+    "obtained",
+    "produced",
+    "presented",
+    "compared",
+    "associated",
+    "combined",
+    "applied",
+    "performed",
+    "developed",
+    "designed",
+    "implemented",
+    "established",
+    "introduced",
+    "published",
+    "reported",
+    "discussed",
+    "explained",
+    "defined",
+    "determined",
+    "provided",
+    "represented",
+    "illustrated",
+    "demonstrated",
+    "mentioned",
+    "achieved",
+    "maintained",
+    "supported",
+    "selected",
+    "identified",
+    "evaluated",
+    "estimated",
+    "measured",
+    "calculated",
+    "generated",
+    "contributed",
+    "contributed",
+    "commemorated",
+    "interpreted",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -878,7 +955,7 @@ fn extract_capitalized(
             let name = phrase.join(" ");
             if name.len() > 1 {
                 let etype = if name.len() > 12 && !name.contains(' ') {
-                    "compound_noun"
+                    "concept"
                 } else {
                     classify_entity_type(&name)
                 };
@@ -1699,7 +1776,7 @@ mod tests {
         assert!(
             entities
                 .iter()
-                .any(|(n, t)| t == "compound_noun" && n.contains("Softwareentwicklung")),
+                .any(|(n, t)| t == "concept" && n.contains("Softwareentwicklung")),
             "entities: {:?}",
             entities
         );
@@ -2051,7 +2128,13 @@ mod tests {
         ];
         let entities = extract_entities(&sentences);
         for (name, etype) in &entities {
-            if etype == "phrase" || etype == "compound_noun" {
+            if etype != "date"
+                && etype != "url"
+                && etype != "email"
+                && etype != "currency"
+                && etype != "number_unit"
+                && etype != "year"
+            {
                 let word_count = name.split_whitespace().count();
                 assert!(
                     word_count <= 4,

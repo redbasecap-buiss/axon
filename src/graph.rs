@@ -607,6 +607,154 @@ pub fn clustering_coefficients(brain: &Brain) -> Result<HashMap<i64, f64>, rusql
     Ok(coeffs)
 }
 
+/// Weighted PageRank: uses relation confidence as edge weight.
+/// Falls back to uniform weights for edges without confidence.
+pub fn weighted_pagerank(
+    brain: &Brain,
+    damping: f64,
+    iterations: usize,
+) -> Result<HashMap<i64, f64>, rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let relations = brain.all_relations()?;
+    let n = entities.len();
+    if n == 0 {
+        return Ok(HashMap::new());
+    }
+    let ids: Vec<i64> = entities.iter().map(|e| e.id).collect();
+    let id_set: HashSet<i64> = ids.iter().copied().collect();
+
+    // Build weighted adjacency: source → [(target, weight)]
+    let mut out_links: HashMap<i64, Vec<(i64, f64)>> = HashMap::new();
+    for r in &relations {
+        if id_set.contains(&r.subject_id) && id_set.contains(&r.object_id) {
+            out_links
+                .entry(r.subject_id)
+                .or_default()
+                .push((r.object_id, r.confidence.max(0.01)));
+        }
+    }
+
+    let mut scores: HashMap<i64, f64> = ids.iter().map(|&id| (id, 1.0 / n as f64)).collect();
+    for _ in 0..iterations {
+        let mut new_scores: HashMap<i64, f64> = ids
+            .iter()
+            .map(|&id| (id, (1.0 - damping) / n as f64))
+            .collect();
+        for &id in &ids {
+            if let Some(edges) = out_links.get(&id) {
+                let total_weight: f64 = edges.iter().map(|(_, w)| w).sum();
+                if total_weight > 0.0 {
+                    for &(target, weight) in edges {
+                        let share = scores[&id] * weight / total_weight;
+                        *new_scores.entry(target).or_insert(0.0) += damping * share;
+                    }
+                }
+            } else {
+                // Dangling node: distribute evenly
+                let share = scores[&id] / n as f64;
+                for &other in &ids {
+                    *new_scores.entry(other).or_insert(0.0) += damping * share;
+                }
+            }
+        }
+        scores = new_scores;
+    }
+    Ok(scores)
+}
+
+/// Louvain community detection — modularity-based, better quality than label propagation.
+pub fn louvain_communities(brain: &Brain) -> Result<HashMap<i64, usize>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let mut adj: HashMap<i64, HashMap<i64, f64>> = HashMap::new();
+    let mut total_weight = 0.0_f64;
+
+    for r in &relations {
+        let w = r.confidence.max(0.01);
+        *adj.entry(r.subject_id)
+            .or_default()
+            .entry(r.object_id)
+            .or_insert(0.0) += w;
+        *adj.entry(r.object_id)
+            .or_default()
+            .entry(r.subject_id)
+            .or_insert(0.0) += w;
+        total_weight += 2.0 * w; // undirected
+    }
+
+    if total_weight == 0.0 {
+        return Ok(HashMap::new());
+    }
+
+    let nodes: Vec<i64> = adj.keys().copied().collect();
+    let mut community: HashMap<i64, usize> = HashMap::new();
+    for (i, &n) in nodes.iter().enumerate() {
+        community.insert(n, i);
+    }
+
+    // Weighted degree
+    let mut k: HashMap<i64, f64> = HashMap::new();
+    for (&node, neighbors) in &adj {
+        k.insert(node, neighbors.values().sum());
+    }
+
+    // Iterative modularity optimization
+    let m2 = total_weight; // 2m
+    for _ in 0..20 {
+        let mut moved = false;
+        for &node in &nodes {
+            let node_comm = community[&node];
+            let ki = k[&node];
+
+            // Sum of weights to each neighboring community
+            let mut comm_weights: HashMap<usize, f64> = HashMap::new();
+            if let Some(neighbors) = adj.get(&node) {
+                for (&nb, &w) in neighbors {
+                    let c = community[&nb];
+                    *comm_weights.entry(c).or_insert(0.0) += w;
+                }
+            }
+
+            // Sum of k for each community
+            let mut sigma_tot: HashMap<usize, f64> = HashMap::new();
+            for (&n, &c) in &community {
+                *sigma_tot.entry(c).or_insert(0.0) += k.get(&n).copied().unwrap_or(0.0);
+            }
+
+            // Find best community
+            let mut best_comm = node_comm;
+            let mut best_delta = 0.0_f64;
+
+            // Remove node from its community for calculation
+            let sigma_in_old = comm_weights.get(&node_comm).copied().unwrap_or(0.0);
+            let sigma_tot_old = sigma_tot.get(&node_comm).copied().unwrap_or(0.0) - ki;
+
+            for (&c, &w_in) in &comm_weights {
+                if c == node_comm {
+                    continue;
+                }
+                let sigma_tot_c = sigma_tot.get(&c).copied().unwrap_or(0.0);
+                // Delta Q = [w_in_new/m - sigma_tot_new*ki/m²] - [w_in_old/m - sigma_tot_old*ki/m²]
+                let delta =
+                    (w_in - sigma_in_old) / m2 - ki * (sigma_tot_c - sigma_tot_old) / (m2 * m2);
+                if delta > best_delta {
+                    best_delta = delta;
+                    best_comm = c;
+                }
+            }
+
+            if best_comm != node_comm {
+                community.insert(node, best_comm);
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+
+    Ok(community)
+}
+
 /// Global clustering coefficient (average of local coefficients).
 pub fn global_clustering(brain: &Brain) -> Result<f64, rusqlite::Error> {
     let coeffs = clustering_coefficients(brain)?;
