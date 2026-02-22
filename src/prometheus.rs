@@ -46,6 +46,11 @@ const HIGH_VALUE_TYPES: &[&str] = &[
     "event",
 ];
 
+/// Minimum confidence threshold for meaningful hypothesis confirmation.
+const CONFIRMATION_THRESHOLD: f64 = 0.7;
+/// Auto-reject threshold.
+const REJECTION_THRESHOLD: f64 = 0.15;
+
 /// Stopword entity names that sneak through NLP extraction.
 const NOISE_NAMES: &[&str] = &[
     "however",
@@ -1328,17 +1333,34 @@ impl<'a> Prometheus<'a> {
         // Decay old hypotheses (meta-learning)
         let decayed = self.decay_old_hypotheses(7).unwrap_or(0);
 
+        // Auto-resolve existing testing hypotheses
+        let (auto_confirmed, auto_rejected) = self.auto_resolve_hypotheses().unwrap_or((0, 0));
+
+        // Find connectable islands
+        let connectable = self.find_connectable_islands().unwrap_or_default();
+
+        // Prioritize gaps
+        let gap_priorities = self.prioritize_gaps().unwrap_or_default();
+
         let summary = format!(
-            "Discovered {} patterns, generated {} hypotheses ({} confirmed, {} rejected), {} island entities, {} meaningful relations, {} cross-domain gaps, {} knowledge frontiers, {} bridge entities, {} old hypotheses decayed, {} island clusters",
+            "Discovered {} patterns, generated {} new hypotheses ({} confirmed, {} rejected), \
+             auto-resolved {} existing ({}✓ {}✗), {} island entities, {} meaningful relations, \
+             {} cross-domain gaps, {} knowledge frontiers, {} bridge entities, {} connectable islands, \
+             {} prioritized gaps, {} decayed, {} island clusters",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
             rejected,
+            auto_confirmed + auto_rejected,
+            auto_confirmed,
+            auto_rejected,
             islands.len(),
             meaningful_rels,
             cross_gaps.len(),
             frontiers.len(),
             bridges.len(),
+            connectable.len(),
+            gap_priorities.len(),
             decayed,
             island_clusters.len(),
         );
@@ -1568,6 +1590,190 @@ impl<'a> Prometheus<'a> {
             .collect();
         clusters.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
         Ok(clusters)
+    }
+
+    /// Find islands that could plausibly connect to existing hub entities.
+    /// Uses name substring matching and type affinity to suggest links.
+    pub fn find_connectable_islands(&self) -> Result<Vec<(String, String, String, f64)>> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        // Build connected set and degree map
+        let mut connected: HashSet<i64> = HashSet::new();
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Collect hubs (connected entities with degree >= 2)
+        let hubs: Vec<&crate::db::Entity> = entities
+            .iter()
+            .filter(|e| {
+                connected.contains(&e.id)
+                    && degree.get(&e.id).copied().unwrap_or(0) >= 2
+                    && !is_noise_type(&e.entity_type)
+                    && !is_noise_name(&e.name)
+            })
+            .collect();
+
+        // Collect high-value islands
+        let islands: Vec<&crate::db::Entity> = entities
+            .iter()
+            .filter(|e| {
+                !connected.contains(&e.id)
+                    && HIGH_VALUE_TYPES.contains(&e.entity_type.as_str())
+                    && !is_noise_name(&e.name)
+                    && e.name.len() >= 3
+            })
+            .collect();
+
+        let mut suggestions = Vec::new();
+
+        // For each island, check if any hub name contains it or vice versa
+        for island in islands.iter().take(500) {
+            let island_lower = island.name.to_lowercase();
+            let island_words: HashSet<&str> = island_lower.split_whitespace().collect();
+            if island_words.is_empty() {
+                continue;
+            }
+
+            for hub in &hubs {
+                let hub_lower = hub.name.to_lowercase();
+                let hub_words: HashSet<&str> = hub_lower.split_whitespace().collect();
+
+                // Check word overlap (at least one significant shared word)
+                let shared: Vec<&&str> = island_words
+                    .intersection(&hub_words)
+                    .filter(|w| w.len() >= 4)
+                    .collect();
+
+                if !shared.is_empty() {
+                    let overlap_ratio =
+                        shared.len() as f64 / island_words.len().max(hub_words.len()) as f64;
+                    let confidence = 0.3 + overlap_ratio * 0.4;
+                    let reason = format!(
+                        "Island '{}' ({}) shares words [{}] with hub '{}' ({})",
+                        island.name,
+                        island.entity_type,
+                        shared.iter().map(|s| **s).collect::<Vec<_>>().join(", "),
+                        hub.name,
+                        hub.entity_type
+                    );
+                    suggestions.push((island.name.clone(), hub.name.clone(), reason, confidence));
+                }
+            }
+        }
+
+        // Sort by confidence descending
+        suggestions.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        suggestions.truncate(50);
+        Ok(suggestions)
+    }
+
+    /// Compute a priority score for each knowledge gap to guide crawling.
+    /// Higher score = more important to fill.
+    pub fn prioritize_gaps(&self) -> Result<Vec<(String, String, f64)>> {
+        let mut gap_scores: Vec<(String, String, f64)> = Vec::new();
+
+        // 1. Islands of high-value types get base priority
+        let islands = self.find_island_entities()?;
+        let mut type_counts: HashMap<String, usize> = HashMap::new();
+        for (_, etype) in &islands {
+            *type_counts.entry(etype.clone()).or_insert(0) += 1;
+        }
+
+        // Types with many islands are systematic gaps
+        for (etype, count) in &type_counts {
+            if *count >= 5 && HIGH_VALUE_TYPES.contains(&etype.as_str()) {
+                let score = (*count as f64).ln() * 2.0;
+                gap_scores.push((
+                    etype.clone(),
+                    format!(
+                        "{} disconnected '{}' entities — systematic gap",
+                        count, etype
+                    ),
+                    score,
+                ));
+            }
+        }
+
+        // 2. Hypotheses with object "?" (unknown targets)
+        let hyps = self.list_hypotheses(Some(HypothesisStatus::Proposed))?;
+        let unknown_count = hyps.iter().filter(|h| h.object == "?").count();
+        if unknown_count > 0 {
+            gap_scores.push((
+                "unknown_relations".to_string(),
+                format!("{} hypotheses have unknown objects", unknown_count),
+                (unknown_count as f64).ln() * 1.5,
+            ));
+        }
+
+        // 3. Cross-domain gaps (disconnected clusters)
+        let cross_gaps = self.find_cross_domain_gaps()?;
+        if !cross_gaps.is_empty() {
+            gap_scores.push((
+                "cross_domain".to_string(),
+                format!(
+                    "{} disconnected cluster pairs sharing entity types",
+                    cross_gaps.len()
+                ),
+                (cross_gaps.len() as f64).ln() * 3.0,
+            ));
+        }
+
+        gap_scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(gap_scores)
+    }
+
+    /// Auto-confirm or reject hypotheses based on graph evidence.
+    /// More aggressive than validate_hypothesis — checks transitive paths.
+    pub fn auto_resolve_hypotheses(&self) -> Result<(usize, usize)> {
+        let mut hyps = self.list_hypotheses(Some(HypothesisStatus::Testing))?;
+        let mut confirmed = 0usize;
+        let mut rejected = 0usize;
+
+        for h in hyps.iter_mut() {
+            // Check if a path exists between subject and object (evidence of relation)
+            if h.object != "?" {
+                let path = crate::graph::shortest_path(self.brain, &h.subject, &h.object)?;
+                if let Some(p) = &path {
+                    if p.len() <= 3 {
+                        // Close in graph — likely related
+                        let new_conf = (h.confidence + 0.2).min(1.0);
+                        if new_conf >= CONFIRMATION_THRESHOLD {
+                            self.update_hypothesis_status(h.id, HypothesisStatus::Confirmed)?;
+                            self.record_outcome(&h.pattern_source, true)?;
+                            confirmed += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                // Check if entities even exist with relations
+                let subj = self.brain.get_entity_by_name(&h.subject)?;
+                let obj = self.brain.get_entity_by_name(&h.object)?;
+                match (subj, obj) {
+                    (None, _) | (_, None) => {
+                        // Entity deleted or never existed — reject
+                        self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                        self.record_outcome(&h.pattern_source, false)?;
+                        rejected += 1;
+                    }
+                    _ => {
+                        // Check for contradictions
+                        if self.check_contradiction(h)? {
+                            self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                            self.record_outcome(&h.pattern_source, false)?;
+                            rejected += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok((confirmed, rejected))
     }
 
     /// Check if a hypothesis already exists (dedup across runs).

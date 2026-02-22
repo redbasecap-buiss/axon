@@ -779,6 +779,72 @@ pub fn find_hubs(brain: &Brain, limit: usize) -> Result<Vec<(i64, usize)>, rusql
     Ok(ranked)
 }
 
+/// Degree distribution: returns (degree → count) histogram.
+pub fn degree_distribution(brain: &Brain) -> Result<Vec<(usize, usize)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let mut degree: HashMap<i64, usize> = HashMap::new();
+    for r in &relations {
+        *degree.entry(r.subject_id).or_insert(0) += 1;
+        *degree.entry(r.object_id).or_insert(0) += 1;
+    }
+    let mut dist: HashMap<usize, usize> = HashMap::new();
+    for &d in degree.values() {
+        *dist.entry(d).or_insert(0) += 1;
+    }
+    let mut result: Vec<(usize, usize)> = dist.into_iter().collect();
+    result.sort_by_key(|&(d, _)| d);
+    Ok(result)
+}
+
+/// Graph density: ratio of actual edges to possible edges.
+pub fn graph_density(brain: &Brain) -> Result<f64, rusqlite::Error> {
+    let n = brain.all_entities()?.len() as f64;
+    let m = brain.all_relations()?.len() as f64;
+    if n <= 1.0 {
+        return Ok(0.0);
+    }
+    Ok(2.0 * m / (n * (n - 1.0)))
+}
+
+/// Power-law exponent estimate via log-log regression on degree distribution.
+/// Returns (exponent, r_squared) — r² > 0.8 suggests scale-free network.
+pub fn power_law_estimate(brain: &Brain) -> Result<(f64, f64), rusqlite::Error> {
+    let dist = degree_distribution(brain)?;
+    let points: Vec<(f64, f64)> = dist
+        .iter()
+        .filter(|&&(d, c)| d > 0 && c > 0)
+        .map(|&(d, c)| ((d as f64).ln(), (c as f64).ln()))
+        .collect();
+    if points.len() < 3 {
+        return Ok((0.0, 0.0));
+    }
+    // Simple linear regression on log-log
+    let n = points.len() as f64;
+    let sum_x: f64 = points.iter().map(|(x, _)| x).sum();
+    let sum_y: f64 = points.iter().map(|(_, y)| y).sum();
+    let sum_xy: f64 = points.iter().map(|(x, y)| x * y).sum();
+    let sum_x2: f64 = points.iter().map(|(x, _)| x * x).sum();
+    let denom = n * sum_x2 - sum_x * sum_x;
+    if denom.abs() < 1e-10 {
+        return Ok((0.0, 0.0));
+    }
+    let slope = (n * sum_xy - sum_x * sum_y) / denom;
+    let intercept = (sum_y - slope * sum_x) / n;
+    // R²
+    let mean_y = sum_y / n;
+    let ss_tot: f64 = points.iter().map(|(_, y)| (y - mean_y).powi(2)).sum();
+    let ss_res: f64 = points
+        .iter()
+        .map(|(x, y)| (y - (slope * x + intercept)).powi(2))
+        .sum();
+    let r2 = if ss_tot > 0.0 {
+        1.0 - ss_res / ss_tot
+    } else {
+        0.0
+    };
+    Ok((-slope, r2)) // Negate slope since power law has negative exponent
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

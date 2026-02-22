@@ -838,6 +838,29 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject entities containing Wikipedia reference fragments
+    if lower.contains("archived")
+        || lower.contains("isbn")
+        || lower.contains(" pdf ")
+        || lower.starts_with("pdf ")
+        || lower.ends_with(" pdf")
+        || lower.contains("citeseer")
+        || lower.contains("weatherbase")
+        || lower.contains("retrieved")
+    {
+        return false;
+    }
+
+    // Reject entities that look like sentence fragments (contain common verbs/prepositions sequences)
+    if lower.contains("noted ") || lower.contains("known ") || lower.contains("called ") {
+        if lower.starts_with("noted ")
+            || lower.starts_with("known ")
+            || lower.starts_with("called ")
+        {
+            return false;
+        }
+    }
+
     true
 }
 
