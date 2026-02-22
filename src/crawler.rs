@@ -137,12 +137,12 @@ fn is_noise_element(el: &scraper::node::Element) -> bool {
         return true;
     }
     for class in el.attr("class").unwrap_or("").split_whitespace() {
-        if NOISE_CLASSES.iter().any(|nc| class == *nc) {
+        if NOISE_CLASSES.contains(&class) {
             return true;
         }
     }
     if let Some(id) = el.attr("id") {
-        if NOISE_CLASSES.iter().any(|nc| id == *nc) {
+        if NOISE_CLASSES.contains(&id) {
             return true;
         }
     }

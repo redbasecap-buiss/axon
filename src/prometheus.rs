@@ -12,6 +12,27 @@ use std::collections::{HashMap, HashSet};
 use crate::db::Brain;
 
 // ---------------------------------------------------------------------------
+// Noise filtering
+// ---------------------------------------------------------------------------
+
+/// Entity types to exclude from discovery (low signal).
+const NOISE_TYPES: &[&str] = &["phrase", "source", "url", "relative_date", "number_unit"];
+
+fn is_noise_type(t: &str) -> bool {
+    NOISE_TYPES.contains(&t)
+}
+
+/// Filter entity IDs to only meaningful ones.
+fn meaningful_ids(brain: &Brain) -> Result<HashSet<i64>> {
+    let entities = brain.all_entities()?;
+    Ok(entities
+        .iter()
+        .filter(|e| !is_noise_type(&e.entity_type))
+        .map(|e| e.id)
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
 
@@ -184,7 +205,7 @@ pub struct Prometheus<'a> {
 
 impl<'a> Prometheus<'a> {
     pub fn new(brain: &'a Brain) -> Result<Self> {
-        brain.with_conn(|conn| init_prometheus_schema(conn))?;
+        brain.with_conn(init_prometheus_schema)?;
         Ok(Self { brain })
     }
 
@@ -193,19 +214,23 @@ impl<'a> Prometheus<'a> {
     // -----------------------------------------------------------------------
 
     /// Find co-occurring entity pairs (entities that share many common neighbours).
+    /// Filters out noise entity types for cleaner results.
     pub fn find_co_occurrences(&self, min_shared: usize) -> Result<Vec<Pattern>> {
         let relations = self.brain.all_relations()?;
-        // Build neighbour sets per entity
+        let meaningful = meaningful_ids(self.brain)?;
+        // Build neighbour sets per entity (meaningful only)
         let mut neighbours: HashMap<i64, HashSet<i64>> = HashMap::new();
         for r in &relations {
-            neighbours
-                .entry(r.subject_id)
-                .or_default()
-                .insert(r.object_id);
-            neighbours
-                .entry(r.object_id)
-                .or_default()
-                .insert(r.subject_id);
+            if meaningful.contains(&r.subject_id) && meaningful.contains(&r.object_id) {
+                neighbours
+                    .entry(r.subject_id)
+                    .or_default()
+                    .insert(r.object_id);
+                neighbours
+                    .entry(r.object_id)
+                    .or_default()
+                    .insert(r.subject_id);
+            }
         }
         let ids: Vec<i64> = neighbours.keys().copied().collect();
         let mut patterns = Vec::new();
@@ -369,7 +394,7 @@ impl<'a> Prometheus<'a> {
                 if *count >= threshold {
                     // Find entities missing this predicate
                     for eid in eids {
-                        let has = entity_preds.get(eid).map_or(false, |s| s.contains(pred));
+                        let has = entity_preds.get(eid).is_some_and(|s| s.contains(pred));
                         if !has {
                             let name = self.entity_name(*eid)?;
                             patterns.push(Pattern {
@@ -396,12 +421,17 @@ impl<'a> Prometheus<'a> {
     // -----------------------------------------------------------------------
 
     /// Find structural holes: A→B, A→C, B→D, C→D but B↛C.
+    /// Filters to meaningful entity types only.
     pub fn find_structural_holes(&self) -> Result<Vec<(String, String)>> {
         let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
         let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
         for r in &relations {
-            adj.entry(r.subject_id).or_default().insert(r.object_id);
-            adj.entry(r.object_id).or_default().insert(r.subject_id);
+            // Include edge if at least one endpoint is meaningful
+            if meaningful.contains(&r.subject_id) || meaningful.contains(&r.object_id) {
+                adj.entry(r.subject_id).or_default().insert(r.object_id);
+                adj.entry(r.object_id).or_default().insert(r.subject_id);
+            }
         }
         let mut holes = Vec::new();
         let mut seen: HashSet<(i64, i64)> = HashSet::new();
@@ -411,7 +441,7 @@ impl<'a> Prometheus<'a> {
                 for j in (i + 1)..a_list.len() {
                     let b = a_list[i];
                     let c = a_list[j];
-                    let b_connected_c = adj.get(&b).map_or(false, |s| s.contains(&c));
+                    let b_connected_c = adj.get(&b).is_some_and(|s| s.contains(&c));
                     if !b_connected_c {
                         // Check if B and C share another neighbour besides A
                         let b_nb = adj.get(&b).cloned().unwrap_or_default();
@@ -560,6 +590,77 @@ impl<'a> Prometheus<'a> {
             hypotheses.push(h);
         }
         Ok(hypotheses)
+    }
+
+    /// Generate hypotheses from shared-object patterns: if A→pred→X and B→pred→X,
+    /// maybe A and B are related.
+    pub fn generate_hypotheses_from_shared_objects(&self) -> Result<Vec<Hypothesis>> {
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        // Group by (predicate, object_id) → list of subject_ids
+        // Only require subjects to be meaningful (objects can be any type)
+        let mut groups: HashMap<(String, i64), Vec<i64>> = HashMap::new();
+        for r in &relations {
+            if meaningful.contains(&r.subject_id) {
+                groups
+                    .entry((r.predicate.clone(), r.object_id))
+                    .or_default()
+                    .push(r.subject_id);
+            }
+        }
+        let mut hypotheses = Vec::new();
+        for ((pred, obj_id), subjects) in &groups {
+            if subjects.len() < 2 || subjects.len() > 10 {
+                continue;
+            }
+            let obj_name = self.entity_name(*obj_id)?;
+            // For each pair of subjects, propose a relationship
+            for i in 0..subjects.len().min(5) {
+                for j in (i + 1)..subjects.len().min(5) {
+                    let a = self.entity_name(subjects[i])?;
+                    let b = self.entity_name(subjects[j])?;
+                    hypotheses.push(Hypothesis {
+                        id: 0,
+                        subject: a.clone(),
+                        predicate: "related_to".to_string(),
+                        object: b.clone(),
+                        confidence: 0.45,
+                        evidence_for: vec![format!(
+                            "Both {} and {} share '{}' relationship to '{}'",
+                            a, b, pred, obj_name
+                        )],
+                        evidence_against: vec![],
+                        reasoning_chain: vec![
+                            format!("{} {} {}", a, pred, obj_name),
+                            format!("{} {} {}", b, pred, obj_name),
+                            format!("Shared object suggests {} and {} may be related", a, b),
+                        ],
+                        status: HypothesisStatus::Proposed,
+                        discovered_at: now_str(),
+                        pattern_source: "shared_object".to_string(),
+                    });
+                }
+            }
+        }
+        Ok(hypotheses)
+    }
+
+    /// Find island entities: meaningful entities with zero relations (knowledge gaps).
+    pub fn find_island_entities(&self) -> Result<Vec<(String, String)>> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+        let mut islands = Vec::new();
+        for e in &entities {
+            if !is_noise_type(&e.entity_type) && !connected.contains(&e.id) {
+                islands.push((e.name.clone(), e.entity_type.clone()));
+            }
+        }
+        Ok(islands)
     }
 
     /// Check if a hypothesis contradicts known facts.
@@ -737,14 +838,14 @@ impl<'a> Prometheus<'a> {
         for s in &subj {
             let rels = self.brain.get_relations_for(s.id)?;
             for (sname, pred, oname, conf) in &rels {
-                if pred == &h.predicate || predicates_similar(pred, &h.predicate) {
-                    if h.object == "?" || oname == &h.object || sname == &h.object {
-                        h.evidence_for.push(format!(
-                            "Found relation: {} {} {} (confidence: {:.2})",
-                            sname, pred, oname, conf
-                        ));
-                        h.confidence = (h.confidence + 0.2).min(1.0);
-                    }
+                if (pred == &h.predicate || predicates_similar(pred, &h.predicate))
+                    && (h.object == "?" || oname == &h.object || sname == &h.object)
+                {
+                    h.evidence_for.push(format!(
+                        "Found relation: {} {} {} (confidence: {:.2})",
+                        sname, pred, oname, conf
+                    ));
+                    h.confidence = (h.confidence + 0.2).min(1.0);
                 }
             }
         }
@@ -841,11 +942,21 @@ impl<'a> Prometheus<'a> {
         let mut all_patterns = Vec::new();
         let mut all_hypotheses = Vec::new();
 
-        // 1. Pattern discovery
-        let co_occ = self.find_co_occurrences(2)?;
+        // 1. Pattern discovery (adaptive thresholds based on graph density)
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let meaningful_rels: usize = relations
+            .iter()
+            .filter(|r| meaningful.contains(&r.subject_id) || meaningful.contains(&r.object_id))
+            .count();
+        // Sparse graphs need lower thresholds
+        let co_threshold = if meaningful_rels < 50 { 1 } else { 2 };
+        let subgraph_threshold = if meaningful_rels < 100 { 1 } else { 2 };
+
+        let co_occ = self.find_co_occurrences(co_threshold)?;
         all_patterns.extend(co_occ);
 
-        let subgraphs = self.find_frequent_subgraphs(2)?;
+        let subgraphs = self.find_frequent_subgraphs(subgraph_threshold)?;
         all_patterns.extend(subgraphs);
 
         let temporal = self.find_temporal_patterns(2)?;
@@ -860,34 +971,45 @@ impl<'a> Prometheus<'a> {
             let _ = self.save_pattern(p);
         }
 
-        // 2. Gap detection & hypothesis generation
+        // 2. Gap detection & hypothesis generation (multiple strategies)
         let hole_hyps = self.generate_hypotheses_from_holes()?;
         all_hypotheses.extend(hole_hyps);
 
         let gap_hyps = self.generate_hypotheses_from_type_gaps()?;
         all_hypotheses.extend(gap_hyps);
 
-        let gaps_detected = all_hypotheses.len();
+        let shared_hyps = self.generate_hypotheses_from_shared_objects()?;
+        all_hypotheses.extend(shared_hyps);
 
-        // 3. Score and validate
-        for h in &mut all_hypotheses {
+        // 3. Island entities as gaps
+        let islands = self.find_island_entities()?;
+
+        let gaps_detected = all_hypotheses.len() + islands.len();
+
+        // 4. Score and validate (cap to avoid huge runs)
+        for h in all_hypotheses.iter_mut().take(200) {
             self.score_hypothesis(h)?;
             self.validate_hypothesis(h)?;
             let _ = self.save_hypothesis(h);
         }
 
+        let confirmed = all_hypotheses
+            .iter()
+            .filter(|h| h.status == HypothesisStatus::Confirmed)
+            .count();
+        let rejected = all_hypotheses
+            .iter()
+            .filter(|h| h.status == HypothesisStatus::Rejected)
+            .count();
+
         let summary = format!(
-            "Discovered {} patterns, generated {} hypotheses ({} confirmed, {} rejected)",
+            "Discovered {} patterns, generated {} hypotheses ({} confirmed, {} rejected), {} island entities, {} meaningful relations",
             all_patterns.len(),
             all_hypotheses.len(),
-            all_hypotheses
-                .iter()
-                .filter(|h| h.status == HypothesisStatus::Confirmed)
-                .count(),
-            all_hypotheses
-                .iter()
-                .filter(|h| h.status == HypothesisStatus::Rejected)
-                .count(),
+            confirmed,
+            rejected,
+            islands.len(),
+            meaningful_rels,
         );
 
         Ok(DiscoveryReport {

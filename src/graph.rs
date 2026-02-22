@@ -532,6 +532,66 @@ pub fn format_path(brain: &Brain, path: &[i64]) -> Result<String, rusqlite::Erro
     Ok(names.join(" → "))
 }
 
+/// Graph health summary: component count, largest component %, avg degree, isolated nodes.
+pub fn graph_health(brain: &Brain) -> Result<HashMap<String, f64>, rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let relations = brain.all_relations()?;
+    let n = entities.len();
+    let mut stats: HashMap<String, f64> = HashMap::new();
+    stats.insert("entities".into(), n as f64);
+    stats.insert("relations".into(), relations.len() as f64);
+
+    // Degree distribution
+    let mut degree: HashMap<i64, usize> = HashMap::new();
+    for r in &relations {
+        *degree.entry(r.subject_id).or_insert(0) += 1;
+        *degree.entry(r.object_id).or_insert(0) += 1;
+    }
+    let connected = degree.len();
+    let isolated = n.saturating_sub(connected);
+    stats.insert("isolated_entities".into(), isolated as f64);
+
+    let avg_degree = if connected > 0 {
+        degree.values().sum::<usize>() as f64 / connected as f64
+    } else {
+        0.0
+    };
+    stats.insert("avg_degree".into(), avg_degree);
+
+    // Max degree (hub)
+    let max_deg = degree.values().copied().max().unwrap_or(0);
+    stats.insert("max_degree".into(), max_deg as f64);
+
+    // Components
+    let components = connected_components(brain)?;
+    stats.insert("components".into(), components.len() as f64);
+    if let Some(largest) = components.first() {
+        stats.insert("largest_component".into(), largest.len() as f64);
+        if n > 0 {
+            stats.insert(
+                "largest_component_pct".into(),
+                100.0 * largest.len() as f64 / n as f64,
+            );
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Find hub entities (highest degree) — returns (entity_id, degree) sorted descending.
+pub fn find_hubs(brain: &Brain, limit: usize) -> Result<Vec<(i64, usize)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let mut degree: HashMap<i64, usize> = HashMap::new();
+    for r in &relations {
+        *degree.entry(r.subject_id).or_insert(0) += 1;
+        *degree.entry(r.object_id).or_insert(0) += 1;
+    }
+    let mut ranked: Vec<(i64, usize)> = degree.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.truncate(limit);
+    Ok(ranked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
