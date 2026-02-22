@@ -90,7 +90,7 @@ const NOISE_CLASSES: &[&str] = &[
     "printfooter",
     "mw-indicators",
     "mw-head",
-    "mw-page-container-inner",
+    // "mw-page-container-inner",  // removed: this is a layout wrapper, not noise
     "vector-header",
     "vector-column-start",
     "vector-sticky-header",
@@ -137,12 +137,12 @@ fn is_noise_element(el: &scraper::node::Element) -> bool {
         return true;
     }
     for class in el.attr("class").unwrap_or("").split_whitespace() {
-        if NOISE_CLASSES.iter().any(|nc| class.contains(nc)) {
+        if NOISE_CLASSES.iter().any(|nc| class == *nc) {
             return true;
         }
     }
     if let Some(id) = el.attr("id") {
-        if NOISE_CLASSES.iter().any(|nc| id.contains(nc)) {
+        if NOISE_CLASSES.iter().any(|nc| id == *nc) {
             return true;
         }
     }

@@ -561,7 +561,11 @@ fn extract_dates(sentence: &str, entities: &mut Vec<(String, String)>) {
             if let Some(before) = safe_slice(text, 0, orig_pos) {
                 let before = before.trim_end();
                 if let Some(day_start) = before.rfind(|c: char| !c.is_ascii_digit() && c != '.') {
-                    let day_part = &before[day_start + 1..];
+                    let mut next_boundary = day_start + 1;
+                    while next_boundary < before.len() && !before.is_char_boundary(next_boundary) {
+                        next_boundary += 1;
+                    }
+                    let day_part = &before[next_boundary..];
                     let day_part = day_part.trim_matches('.');
                     if let Ok(d) = day_part.trim().parse::<u32>() {
                         if (1..=31).contains(&d) {
