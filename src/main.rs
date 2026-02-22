@@ -1,6 +1,8 @@
 mod config;
 mod crawler;
 mod db;
+mod export;
+mod graph;
 mod nlp;
 pub mod plugin;
 mod query;
@@ -66,6 +68,21 @@ enum Commands {
     Stats,
     /// Browse the knowledge graph interactively in the terminal
     Browse,
+    /// Find shortest path between two entities
+    Path { from: String, to: String },
+    /// Show top entities by PageRank
+    Rank {
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Export the knowledge graph
+    Export {
+        /// Output format: json, mermaid, dot, csv
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+    /// Deduplicate near-duplicate entities
+    Dedup,
     /// Generate default config at ~/.axon/config.toml
     Init,
     /// Launch HTTP API server
@@ -213,6 +230,59 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Browse => {
             tui::run(&db_path)?;
+        }
+        Commands::Path { from, to } => match graph::shortest_path(&brain, &from, &to)? {
+            Some(path) => {
+                let formatted = graph::format_path(&brain, &path)?;
+                println!("🔗 Path ({} hops): {formatted}", path.len() - 1);
+            }
+            None => println!("🤷 No path found between \"{from}\" and \"{to}\"."),
+        },
+        Commands::Rank { limit } => {
+            let scores = graph::pagerank(&brain, 0.85, 30)?;
+            let mut ranked: Vec<_> = scores.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            ranked.truncate(limit);
+            if ranked.is_empty() {
+                println!("🤷 No entities to rank.");
+            } else {
+                println!("📊 Top entities by PageRank:\n");
+                for (i, (id, score)) in ranked.iter().enumerate() {
+                    let name = brain
+                        .get_entity_by_id(*id)?
+                        .map(|e| e.name)
+                        .unwrap_or_else(|| format!("#{id}"));
+                    println!("  {}. {name} ({score:.4})", i + 1);
+                }
+            }
+        }
+        Commands::Export { format } => {
+            let output = match format.as_str() {
+                "json" => export::to_json(&brain)?,
+                "mermaid" => export::to_mermaid(&brain)?,
+                "dot" => export::to_dot(&brain)?,
+                "csv" => export::to_csv(&brain)?,
+                "json-ld" => export::to_json_ld(&brain)?,
+                "graphml" => export::to_graphml(&brain)?,
+                _ => {
+                    eprintln!(
+                        "Unknown format: {format}. Use: json, mermaid, dot, csv, json-ld, graphml"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            println!("{output}");
+        }
+        Commands::Dedup => {
+            let merged = graph::merge_near_duplicates(&brain)?;
+            if merged.is_empty() {
+                println!("✅ No near-duplicates found.");
+            } else {
+                println!("🔗 Merged {} duplicate pairs:\n", merged.len());
+                for (keep, removed) in &merged {
+                    println!("  \"{removed}\" → \"{keep}\"");
+                }
+            }
         }
         Commands::Init => unreachable!(),
         Commands::Serve { port } => {

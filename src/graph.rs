@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::db::Brain;
@@ -35,7 +36,15 @@ pub fn all_paths(
     let mut path = vec![from_id];
     let mut visited = HashSet::new();
     visited.insert(from_id);
-    dfs_all_paths(&adj, from_id, to_id, max_depth, &mut visited, &mut path, &mut results);
+    dfs_all_paths(
+        &adj,
+        from_id,
+        to_id,
+        max_depth,
+        &mut visited,
+        &mut path,
+        &mut results,
+    );
     Ok(results)
 }
 
@@ -76,7 +85,9 @@ pub fn detect_communities(brain: &Brain) -> Result<HashMap<i64, Vec<i64>>, rusql
         let mut changed = false;
         for e in &entities {
             if let Some(neighbors) = adj.get(&e.id) {
-                if neighbors.is_empty() { continue; }
+                if neighbors.is_empty() {
+                    continue;
+                }
                 let mut freq: HashMap<i64, usize> = HashMap::new();
                 for &n in neighbors {
                     if let Some(&lbl) = labels.get(&n) {
@@ -91,7 +102,9 @@ pub fn detect_communities(brain: &Brain) -> Result<HashMap<i64, Vec<i64>>, rusql
                 }
             }
         }
-        if !changed { break; }
+        if !changed {
+            break;
+        }
     }
     let mut communities: HashMap<i64, Vec<i64>> = HashMap::new();
     for (eid, lbl) in &labels {
@@ -108,7 +121,9 @@ pub fn pagerank(
     let entities = brain.all_entities()?;
     let relations = brain.all_relations()?;
     let n = entities.len();
-    if n == 0 { return Ok(HashMap::new()); }
+    if n == 0 {
+        return Ok(HashMap::new());
+    }
     let ids: Vec<i64> = entities.iter().map(|e| e.id).collect();
     let id_set: HashSet<i64> = ids.iter().copied().collect();
     let mut out_links: HashMap<i64, Vec<i64>> = HashMap::new();
@@ -119,7 +134,10 @@ pub fn pagerank(
     }
     let mut scores: HashMap<i64, f64> = ids.iter().map(|&id| (id, 1.0 / n as f64)).collect();
     for _ in 0..iterations {
-        let mut new_scores: HashMap<i64, f64> = ids.iter().map(|&id| (id, (1.0 - damping) / n as f64)).collect();
+        let mut new_scores: HashMap<i64, f64> = ids
+            .iter()
+            .map(|&id| (id, (1.0 - damping) / n as f64))
+            .collect();
         for &id in &ids {
             let out = out_links.get(&id);
             let out_count = out.map_or(0, |v| v.len());
@@ -143,25 +161,51 @@ pub fn pagerank(
 pub fn infer_transitive(brain: &Brain) -> Result<Vec<(String, String, String)>, rusqlite::Error> {
     let relations = brain.all_relations()?;
     let transitive_preds: HashSet<&str> = [
-        "is", "contains", "part_of", "located_in", "member_of", "subclass_of",
-        "belongs_to", "created_by", "owned_by",
-    ].iter().copied().collect();
+        "is",
+        "contains",
+        "part_of",
+        "located_in",
+        "member_of",
+        "subclass_of",
+        "belongs_to",
+        "created_by",
+        "owned_by",
+    ]
+    .iter()
+    .copied()
+    .collect();
     let mut by_pred: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
     for r in &relations {
-        by_pred.entry(r.predicate.clone()).or_default().push((r.subject_id, r.object_id));
+        by_pred
+            .entry(r.predicate.clone())
+            .or_default()
+            .push((r.subject_id, r.object_id));
     }
     let mut inferred = Vec::new();
-    let existing: HashSet<(i64, String, i64)> = relations.iter().map(|r| (r.subject_id, r.predicate.clone(), r.object_id)).collect();
+    let existing: HashSet<(i64, String, i64)> = relations
+        .iter()
+        .map(|r| (r.subject_id, r.predicate.clone(), r.object_id))
+        .collect();
     for (pred, edges) in &by_pred {
-        if !transitive_preds.contains(pred.as_str()) { continue; }
+        if !transitive_preds.contains(pred.as_str()) {
+            continue;
+        }
         let mut fwd: HashMap<i64, Vec<i64>> = HashMap::new();
-        for &(s, o) in edges { fwd.entry(s).or_default().push(o); }
+        for &(s, o) in edges {
+            fwd.entry(s).or_default().push(o);
+        }
         for &(a, b) in edges {
             if let Some(cs) = fwd.get(&b) {
                 for &c in cs {
                     if a != c && !existing.contains(&(a, pred.clone(), c)) {
-                        let a_name = brain.get_entity_by_id(a)?.map(|e| e.name).unwrap_or_default();
-                        let c_name = brain.get_entity_by_id(c)?.map(|e| e.name).unwrap_or_default();
+                        let a_name = brain
+                            .get_entity_by_id(a)?
+                            .map(|e| e.name)
+                            .unwrap_or_default();
+                        let c_name = brain
+                            .get_entity_by_id(c)?
+                            .map(|e| e.name)
+                            .unwrap_or_default();
                         if !a_name.is_empty() && !c_name.is_empty() {
                             inferred.push((a_name, pred.clone(), c_name));
                         }
@@ -173,17 +217,35 @@ pub fn infer_transitive(brain: &Brain) -> Result<Vec<(String, String, String)>, 
     Ok(inferred)
 }
 
-pub fn detect_contradictions(brain: &Brain) -> Result<Vec<(String, String, Vec<String>)>, rusqlite::Error> {
+pub fn detect_contradictions(
+    brain: &Brain,
+) -> Result<Vec<(String, String, Vec<String>)>, rusqlite::Error> {
     let singleton_keys: HashSet<&str> = [
-        "capital", "population", "founded", "ceo", "president", "born",
-        "died", "headquarters", "currency", "language",
-    ].iter().copied().collect();
+        "capital",
+        "population",
+        "founded",
+        "ceo",
+        "president",
+        "born",
+        "died",
+        "headquarters",
+        "currency",
+        "language",
+    ]
+    .iter()
+    .copied()
+    .collect();
     let entities = brain.all_entities()?;
     let mut contradictions = Vec::new();
     for entity in &entities {
         let facts = brain.get_facts_for(entity.id)?;
         let mut by_key: HashMap<String, Vec<String>> = HashMap::new();
-        for f in &facts { by_key.entry(f.key.clone()).or_default().push(f.value.clone()); }
+        for f in &facts {
+            by_key
+                .entry(f.key.clone())
+                .or_default()
+                .push(f.value.clone());
+        }
         for (key, values) in &by_key {
             if singleton_keys.contains(key.as_str()) && values.len() > 1 {
                 contradictions.push((entity.name.clone(), key.clone(), values.clone()));
@@ -198,11 +260,20 @@ pub fn merge_near_duplicates(brain: &Brain) -> Result<Vec<(String, String)>, rus
     let mut merged = Vec::new();
     let mut absorbed: HashSet<i64> = HashSet::new();
     for i in 0..entities.len() {
-        if absorbed.contains(&entities[i].id) { continue; }
+        if absorbed.contains(&entities[i].id) {
+            continue;
+        }
         for j in (i + 1)..entities.len() {
-            if absorbed.contains(&entities[j].id) { continue; }
-            if entities[i].entity_type != entities[j].entity_type { continue; }
-            let dist = levenshtein(&entities[i].name.to_lowercase(), &entities[j].name.to_lowercase());
+            if absorbed.contains(&entities[j].id) {
+                continue;
+            }
+            if entities[i].entity_type != entities[j].entity_type {
+                continue;
+            }
+            let dist = levenshtein(
+                &entities[i].name.to_lowercase(),
+                &entities[j].name.to_lowercase(),
+            );
             if dist > 0 && dist < 3 {
                 let (keep, remove) = if entities[i].confidence >= entities[j].confidence {
                     (&entities[i], &entities[j])
@@ -228,8 +299,14 @@ fn build_adjacency(brain: &Brain) -> Result<HashMap<i64, Vec<i64>>, rusqlite::Er
     Ok(adj)
 }
 
-fn bfs_path(adj: &HashMap<i64, Vec<i64>>, from: i64, to: i64) -> Result<Option<Vec<i64>>, rusqlite::Error> {
-    if from == to { return Ok(Some(vec![from])); }
+fn bfs_path(
+    adj: &HashMap<i64, Vec<i64>>,
+    from: i64,
+    to: i64,
+) -> Result<Option<Vec<i64>>, rusqlite::Error> {
+    if from == to {
+        return Ok(Some(vec![from]));
+    }
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
     let mut parent: HashMap<i64, i64> = HashMap::new();
@@ -244,7 +321,10 @@ fn bfs_path(adj: &HashMap<i64, Vec<i64>>, from: i64, to: i64) -> Result<Option<V
                     if next == to {
                         let mut path = vec![to];
                         let mut cur = to;
-                        while let Some(&p) = parent.get(&cur) { path.push(p); cur = p; }
+                        while let Some(&p) = parent.get(&cur) {
+                            path.push(p);
+                            cur = p;
+                        }
                         path.reverse();
                         return Ok(Some(path));
                     }
@@ -259,10 +339,13 @@ fn bfs_path(adj: &HashMap<i64, Vec<i64>>, from: i64, to: i64) -> Result<Option<V
 pub fn format_path(brain: &Brain, path: &[i64]) -> Result<String, rusqlite::Error> {
     let mut names = Vec::new();
     for &id in path {
-        let name = brain.get_entity_by_id(id)?.map(|e| e.name).unwrap_or_else(|| format!("#{id}"));
+        let name = brain
+            .get_entity_by_id(id)?
+            .map(|e| e.name)
+            .unwrap_or_else(|| format!("#{id}"));
         names.push(name);
     }
-    Ok(names.join(" \xe2\x86\x92 "))
+    Ok(names.join(" → "))
 }
 
 #[cfg(test)]
@@ -369,7 +452,9 @@ mod tests {
         brain.upsert_relation(b, "located_in", c, "test").unwrap();
         let inferred = infer_transitive(&brain).unwrap();
         assert!(!inferred.is_empty());
-        assert!(inferred.iter().any(|(s, _, o)| s == "Paris" && o == "Europe"));
+        assert!(inferred
+            .iter()
+            .any(|(s, _, o)| s == "Paris" && o == "Europe"));
     }
 
     #[test]
@@ -400,7 +485,13 @@ mod tests {
         let merged = merge_near_duplicates(&brain).unwrap();
         assert_eq!(merged.len(), 1);
         let entities = brain.all_entities().unwrap();
-        assert_eq!(entities.iter().filter(|e| e.entity_type == "company").count(), 2);
+        assert_eq!(
+            entities
+                .iter()
+                .filter(|e| e.entity_type == "company")
+                .count(),
+            2
+        );
     }
 
     #[test]
