@@ -241,6 +241,190 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "terms of use",
     "desktop",
     "powered by mediawiki",
+    "footer",
+    "header",
+    "skip to content",
+    "cookie",
+    "accept",
+    "dismiss",
+    "subscribe",
+    "sign in",
+    "sign up",
+    "log out",
+    "loading",
+    "please wait",
+    "click here",
+    "read more",
+    "learn more",
+    "continue reading",
+    "close",
+    "open",
+    "show",
+    "hide",
+    "expand",
+    "collapse",
+    "previous",
+    "next",
+    "back",
+    "forward",
+    "home",
+    "settings",
+    "preferences",
+    "notifications",
+    "appearance",
+    "copyright",
+    "all rights reserved",
+    "terms of service",
+    "external links",
+    "see also",
+    "categories",
+    "further reading",
+    "bibliography",
+    "notes",
+    "from wikipedia",
+    "free encyclopedia",
+    "retrieved",
+    "archived",
+    "cite this",
+    "page",
+    "article",
+    "section",
+    "chapter",
+    "index",
+    "glossary",
+    "appendix",
+    "abstract",
+];
+
+/// Common person name prefixes/titles for entity classification.
+const PERSON_TITLES: &[&str] = &[
+    "dr",
+    "mr",
+    "mrs",
+    "ms",
+    "prof",
+    "professor",
+    "sir",
+    "lord",
+    "lady",
+    "king",
+    "queen",
+    "prince",
+    "princess",
+    "president",
+    "chancellor",
+    "minister",
+    "senator",
+    "governor",
+    "general",
+    "admiral",
+    "captain",
+    "colonel",
+    "saint",
+    "pope",
+    "bishop",
+    "rabbi",
+    "imam",
+    "reverend",
+    "father",
+    "brother",
+    "sister",
+    "mother",
+];
+
+/// Common place suffixes/keywords for entity classification.
+const PLACE_INDICATORS: &[&str] = &[
+    "city",
+    "town",
+    "village",
+    "county",
+    "state",
+    "province",
+    "region",
+    "district",
+    "island",
+    "islands",
+    "river",
+    "lake",
+    "mountain",
+    "mountains",
+    "valley",
+    "sea",
+    "ocean",
+    "bay",
+    "gulf",
+    "strait",
+    "peninsula",
+    "desert",
+    "forest",
+    "park",
+    "street",
+    "avenue",
+    "boulevard",
+    "road",
+    "bridge",
+    "airport",
+    "port",
+    "harbor",
+    "station",
+    "square",
+    "plaza",
+    "cathedral",
+    "church",
+    "mosque",
+    "temple",
+];
+
+/// Common organization suffixes for entity classification.
+const ORG_INDICATORS: &[&str] = &[
+    "inc",
+    "ltd",
+    "llc",
+    "corp",
+    "corporation",
+    "company",
+    "co",
+    "group",
+    "gmbh",
+    "ag",
+    "sa",
+    "foundation",
+    "institute",
+    "university",
+    "college",
+    "school",
+    "academy",
+    "association",
+    "society",
+    "organization",
+    "organisation",
+    "council",
+    "committee",
+    "commission",
+    "agency",
+    "bureau",
+    "department",
+    "ministry",
+    "bank",
+    "fund",
+    "alliance",
+    "federation",
+    "union",
+    "league",
+    "team",
+    "club",
+    "party",
+    "network",
+    "lab",
+    "labs",
+    "laboratory",
+    "laboratories",
+    "technologies",
+    "systems",
+    "solutions",
+    "services",
+    "industries",
+    "enterprises",
 ];
 
 const ABBREVIATIONS: &[&str] = &[
@@ -413,12 +597,76 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     true
 }
 
+/// Classify an entity name into person/place/org/concept based on heuristics.
+fn classify_entity_type(name: &str) -> &'static str {
+    let lower = name.to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+
+    // Check for person title prefix (e.g. "Dr. Smith", "President Obama")
+    if let Some(first) = words.first() {
+        let clean = first.trim_matches('.');
+        if PERSON_TITLES.contains(&clean) {
+            return "person";
+        }
+    }
+
+    // Check for organization indicators (last word or any word)
+    if let Some(last) = words.last() {
+        let clean = last.trim_matches(|c: char| !c.is_alphanumeric());
+        if ORG_INDICATORS.contains(&clean) {
+            return "organization";
+        }
+    }
+    // Also check second-to-last for patterns like "Apple Inc."
+    if words.len() >= 2 {
+        let second_last = words[words.len() - 2].trim_matches(|c: char| !c.is_alphanumeric());
+        if ORG_INDICATORS.contains(&second_last) {
+            return "organization";
+        }
+    }
+
+    // Check for place indicators
+    for w in &words {
+        let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
+        if PLACE_INDICATORS.contains(&clean) {
+            return "place";
+        }
+    }
+
+    // All-caps short acronyms are likely organizations (NASA, UNESCO, NATO)
+    if name.len() >= 3
+        && name.len() <= 6
+        && name.chars().all(|c| c.is_uppercase() || !c.is_alphabetic())
+    {
+        return "organization";
+    }
+
+    // Two or three capitalized words with no indicators → likely person name
+    if words.len() >= 2
+        && words.len() <= 3
+        && name
+            .split_whitespace()
+            .all(|w| w.chars().next().is_some_and(|c| c.is_uppercase()))
+    {
+        // Heuristic: if all words are short-ish (< 15 chars each), likely a person
+        if name.split_whitespace().all(|w| w.len() < 15) {
+            return "person";
+        }
+    }
+
+    "concept"
+}
+
 pub fn extract_entities(sentences: &[String]) -> Vec<(String, String)> {
     let mut entities = Vec::new();
     let stop_en: HashSet<&str> = STOP_WORDS_EN.iter().copied().collect();
     let stop_de: HashSet<&str> = STOP_WORDS_DE.iter().copied().collect();
+    let stop_fr: HashSet<&str> = STOP_WORDS_FR.iter().copied().collect();
+    let stop_it: HashSet<&str> = STOP_WORDS_IT.iter().copied().collect();
+    let stop_es: HashSet<&str> = STOP_WORDS_ES.iter().copied().collect();
+    let all_stops: Vec<&HashSet<&str>> = vec![&stop_en, &stop_de, &stop_fr, &stop_it, &stop_es];
     for sentence in sentences {
-        extract_capitalized(sentence, &stop_en, &stop_de, &mut entities);
+        extract_capitalized(sentence, &all_stops, &mut entities);
         extract_dates(sentence, &mut entities);
         extract_numbers_units(sentence, &mut entities);
         extract_emails(sentence, &mut entities);
@@ -432,18 +680,20 @@ pub fn extract_entities(sentences: &[String]) -> Vec<(String, String)> {
 
 fn extract_capitalized(
     sentence: &str,
-    stop_en: &HashSet<&str>,
-    stop_de: &HashSet<&str>,
+    all_stops: &[&HashSet<&str>],
     entities: &mut Vec<(String, String)>,
 ) {
     let words: Vec<&str> = sentence.split_whitespace().collect();
+    let is_stop = |w: &str| -> bool {
+        let lower = w.to_lowercase();
+        all_stops.iter().any(|set| set.contains(lower.as_str()))
+    };
     let mut i = 0;
     while i < words.len() {
         let word = words[i].trim_matches(|c: char| !c.is_alphanumeric());
         if !word.is_empty()
             && word.chars().next().is_some_and(|c| c.is_uppercase())
-            && !stop_en.contains(word.to_lowercase().as_str())
-            && !stop_de.contains(word.to_lowercase().as_str())
+            && !is_stop(word)
             && i > 0
         {
             let mut phrase = vec![word.to_string()];
@@ -460,11 +710,12 @@ fn extract_capitalized(
             }
             let name = phrase.join(" ");
             if name.len() > 1 {
-                if name.len() > 12 && !name.contains(' ') {
-                    entities.push((name, "compound_noun".to_string()));
+                let etype = if name.len() > 12 && !name.contains(' ') {
+                    "compound_noun"
                 } else {
-                    entities.push((name, "phrase".to_string()));
-                }
+                    classify_entity_type(&name)
+                };
+                entities.push((name, etype.to_string()));
             }
             i = j;
         } else {
