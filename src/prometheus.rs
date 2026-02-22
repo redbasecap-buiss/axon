@@ -16,7 +16,23 @@ use crate::db::Brain;
 // ---------------------------------------------------------------------------
 
 /// Entity types to exclude from discovery (low signal).
-const NOISE_TYPES: &[&str] = &["phrase", "source", "url", "relative_date", "number_unit"];
+const NOISE_TYPES: &[&str] = &[
+    "phrase",
+    "source",
+    "url",
+    "relative_date",
+    "number_unit",
+    "date",
+    "year",
+    "currency",
+    "email",
+    "compound_noun",
+];
+
+/// Predicates too generic to drive discovery.
+const GENERIC_PREDICATES: &[&str] = &[
+    "is", "are", "was", "were", "has", "have", "had", "be", "been", "do", "does", "did",
+];
 
 /// High-value entity types for focused discovery.
 const HIGH_VALUE_TYPES: &[&str] = &[
@@ -34,12 +50,16 @@ fn is_noise_type(t: &str) -> bool {
     NOISE_TYPES.contains(&t)
 }
 
-/// Filter entity IDs to only meaningful ones.
+fn is_generic_predicate(p: &str) -> bool {
+    GENERIC_PREDICATES.contains(&p)
+}
+
+/// Filter entity IDs to only meaningful ones (non-noise type, reasonable name length).
 fn meaningful_ids(brain: &Brain) -> Result<HashSet<i64>> {
     let entities = brain.all_entities()?;
     Ok(entities
         .iter()
-        .filter(|e| !is_noise_type(&e.entity_type))
+        .filter(|e| !is_noise_type(&e.entity_type) && e.name.len() <= 80)
         .map(|e| e.id)
         .collect())
 }
@@ -225,6 +245,83 @@ impl<'a> Prometheus<'a> {
     // Pattern Discovery
     // -----------------------------------------------------------------------
 
+    /// Find entities that share a source URL but have no direct relation.
+    /// In sparse graphs, co-extraction from the same page is strong evidence of relatedness.
+    pub fn find_source_co_occurrences(&self) -> Result<Vec<Pattern>> {
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        // Group entities by source_url
+        let mut source_entities: HashMap<String, HashSet<i64>> = HashMap::new();
+        for r in &relations {
+            if !r.source_url.is_empty() {
+                if meaningful.contains(&r.subject_id) {
+                    source_entities
+                        .entry(r.source_url.clone())
+                        .or_default()
+                        .insert(r.subject_id);
+                }
+                if meaningful.contains(&r.object_id) {
+                    source_entities
+                        .entry(r.source_url.clone())
+                        .or_default()
+                        .insert(r.object_id);
+                }
+            }
+        }
+
+        // Build direct-connection set
+        let mut connected: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            let key = if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            };
+            connected.insert(key);
+        }
+
+        // Find pairs sharing ≥2 sources but not directly connected
+        let mut pair_sources: HashMap<(i64, i64), usize> = HashMap::new();
+        for (_src, entities) in &source_entities {
+            let ids: Vec<i64> = entities.iter().copied().collect();
+            for i in 0..ids.len() {
+                for j in (i + 1)..ids.len() {
+                    let key = if ids[i] < ids[j] {
+                        (ids[i], ids[j])
+                    } else {
+                        (ids[j], ids[i])
+                    };
+                    if !connected.contains(&key) {
+                        *pair_sources.entry(key).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        let mut patterns = Vec::new();
+        for ((a, b), count) in &pair_sources {
+            if *count >= 1 {
+                let a_name = self.entity_name(*a)?;
+                let b_name = self.entity_name(*b)?;
+                patterns.push(Pattern {
+                    id: 0,
+                    pattern_type: PatternType::CoOccurrence,
+                    entities_involved: vec![a_name.clone(), b_name.clone()],
+                    frequency: *count as i64,
+                    last_seen: now_str(),
+                    description: format!(
+                        "{} and {} co-occur in {} source(s) but lack direct relation",
+                        a_name, b_name, count
+                    ),
+                });
+            }
+        }
+        patterns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        patterns.truncate(50);
+        Ok(patterns)
+    }
+
     /// Find co-occurring entity pairs using Jaccard similarity.
     /// Better than raw count for sparse graphs — normalizes by neighbourhood size.
     pub fn find_co_occurrences(&self, min_shared: usize) -> Result<Vec<Pattern>> {
@@ -303,7 +400,7 @@ impl<'a> Prometheus<'a> {
         }
         let mut patterns = Vec::new();
         for (pred, entities) in &pred_entities {
-            if entities.len() >= 3 {
+            if entities.len() >= 3 && !is_generic_predicate(pred) {
                 let names: Vec<String> = entities
                     .iter()
                     .take(5)
@@ -386,7 +483,8 @@ impl<'a> Prometheus<'a> {
         }
         let mut patterns = Vec::new();
         for ((p1, p2), instances) in &motifs {
-            if instances.len() >= min_freq {
+            if instances.len() >= min_freq && !is_generic_predicate(p1) && !is_generic_predicate(p2)
+            {
                 let example_names: Vec<String> = instances
                     .iter()
                     .take(3)
@@ -432,7 +530,7 @@ impl<'a> Prometheus<'a> {
         }
         let mut patterns = Vec::new();
         for ((p1, p2), count) in &seq_count {
-            if *count >= min_freq as i64 {
+            if *count >= min_freq as i64 && !is_generic_predicate(p1) && !is_generic_predicate(p2) {
                 patterns.push(Pattern {
                     id: 0,
                     pattern_type: PatternType::TemporalSequence,
@@ -735,6 +833,39 @@ impl<'a> Prometheus<'a> {
                         pattern_source: "shared_object".to_string(),
                     });
                 }
+            }
+        }
+        Ok(hypotheses)
+    }
+
+    /// Generate hypotheses from source co-occurrence: entities extracted from the same
+    /// source page likely have a semantic relationship.
+    pub fn generate_hypotheses_from_source_co_occurrence(&self) -> Result<Vec<Hypothesis>> {
+        let source_patterns = self.find_source_co_occurrences()?;
+        let mut hypotheses = Vec::new();
+        for p in source_patterns.iter().take(30) {
+            if p.entities_involved.len() >= 2 {
+                let a = &p.entities_involved[0];
+                let b = &p.entities_involved[1];
+                hypotheses.push(Hypothesis {
+                    id: 0,
+                    subject: a.clone(),
+                    predicate: "related_to".to_string(),
+                    object: b.clone(),
+                    confidence: 0.35 + (p.frequency as f64 * 0.1).min(0.3),
+                    evidence_for: vec![format!(
+                        "Co-extracted from {} shared source(s)",
+                        p.frequency
+                    )],
+                    evidence_against: vec![],
+                    reasoning_chain: vec![
+                        format!("{} and {} appear in the same source document(s)", a, b),
+                        "Co-occurrence in source material suggests semantic relation".to_string(),
+                    ],
+                    status: HypothesisStatus::Proposed,
+                    discovered_at: now_str(),
+                    pattern_source: "source_co_occurrence".to_string(),
+                });
             }
         }
         Ok(hypotheses)
@@ -1051,6 +1182,9 @@ impl<'a> Prometheus<'a> {
         let co_occ = self.find_co_occurrences(co_threshold)?;
         all_patterns.extend(co_occ);
 
+        let source_co = self.find_source_co_occurrences()?;
+        all_patterns.extend(source_co);
+
         let clusters = self.find_entity_clusters()?;
         all_patterns.extend(clusters);
 
@@ -1078,6 +1212,9 @@ impl<'a> Prometheus<'a> {
 
         let shared_hyps = self.generate_hypotheses_from_shared_objects()?;
         all_hypotheses.extend(shared_hyps);
+
+        let source_hyps = self.generate_hypotheses_from_source_co_occurrence()?;
+        all_hypotheses.extend(source_hyps);
 
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
@@ -1196,7 +1333,7 @@ impl<'a> Prometheus<'a> {
         // 1. Entity types with low knowledge density (skip noise types)
         let density = crate::graph::knowledge_density(self.brain)?;
         for (etype, (count, avg)) in &density {
-            if *count >= 3 && *avg < 0.5 && !is_noise_type(etype) {
+            if *count >= 3 && *avg < 0.5 && !is_noise_type(etype) && *etype != "unknown" {
                 suggestions.push((
                     etype.clone(),
                     format!(
