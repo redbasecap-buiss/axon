@@ -1885,6 +1885,50 @@ pub fn cohesion_score(brain: &Brain) -> Result<f64, rusqlite::Error> {
     Ok(score.clamp(0.0, 1.0))
 }
 
+/// Topic-bridging score: identifies entities that connect different entity type domains.
+/// An entity linking persons to organizations to places is more "bridging" than one
+/// connected only to other persons. Uses Shannon entropy of neighbor types.
+/// Returns (entity_id, bridging_score, neighbor_type_count) sorted by score.
+pub fn topic_bridging_scores(
+    brain: &Brain,
+    limit: usize,
+) -> Result<Vec<(i64, f64, usize)>, rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let adj = build_adjacency(brain)?;
+    let id_to_type: HashMap<i64, String> = entities
+        .iter()
+        .map(|e| (e.id, e.entity_type.clone()))
+        .collect();
+
+    let mut scores: Vec<(i64, f64, usize)> = Vec::new();
+    for (&node, neighbors) in &adj {
+        if neighbors.len() < 2 {
+            continue;
+        }
+        // Count neighbor types
+        let mut type_counts: HashMap<&str, usize> = HashMap::new();
+        for &nb in neighbors {
+            let t = id_to_type.get(&nb).map(|s| s.as_str()).unwrap_or("unknown");
+            *type_counts.entry(t).or_insert(0) += 1;
+        }
+        let n = neighbors.len() as f64;
+        let mut entropy = 0.0_f64;
+        for &count in type_counts.values() {
+            let p = count as f64 / n;
+            if p > 0.0 {
+                entropy -= p * p.log2();
+            }
+        }
+        let num_types = type_counts.len();
+        if num_types >= 2 {
+            scores.push((node, entropy, num_types));
+        }
+    }
+    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scores.truncate(limit);
+    Ok(scores)
+}
+
 /// Find the best entity pairs to bridge disconnected communities.
 /// Returns (component_a_rep, component_b_rep, entity_a_name, entity_b_name, combined_size)
 /// sorted by combined component size (connecting larger components is more impactful).
@@ -2178,11 +2222,12 @@ mod tests {
         let preds = resource_allocation_predict(&brain, 10).unwrap();
         // A and B share neighbors C and D but aren't directly connected
         assert!(!preds.is_empty());
-        // Top prediction should involve the unconnected pair
-        let top = &preds[0];
-        let ids: HashSet<i64> = [top.0, top.1].into_iter().collect();
-        assert!(ids.contains(&a) || ids.contains(&b));
-        assert!(top.2 > 0.0);
+        // The unconnected pair (A,B) should appear somewhere in predictions with score > 0
+        let ab_pred = preds
+            .iter()
+            .find(|(x, y, _)| (*x == a && *y == b) || (*x == b && *y == a));
+        assert!(ab_pred.is_some(), "A-B pair should be predicted");
+        assert!(ab_pred.unwrap().2 > 0.0);
     }
 
     #[test]

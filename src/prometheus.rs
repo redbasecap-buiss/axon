@@ -308,6 +308,72 @@ fn is_noise_name(name: &str) -> bool {
         "henry",
         "phillips",
         "admiral",
+        "director",
+        "minimum",
+        "maximum",
+        "define",
+        "storms",
+        "formulas",
+        "candidates",
+        "prejudice",
+        "birthplace",
+        "novels",
+        "slaughter",
+        "inferno",
+        "scotsman",
+        "century",
+        "decades",
+        "period",
+        "chapter",
+        "volume",
+        "edition",
+        "series",
+        "region",
+        "area",
+        "system",
+        "process",
+        "method",
+        "approach",
+        "model",
+        "structure",
+        "function",
+        "principle",
+        "concept",
+        "element",
+        "factor",
+        "feature",
+        "aspect",
+        "issue",
+        "problem",
+        "solution",
+        "result",
+        "effect",
+        "impact",
+        "role",
+        "type",
+        "form",
+        "kind",
+        "level",
+        "degree",
+        "range",
+        "rate",
+        "size",
+        "number",
+        "amount",
+        "value",
+        "point",
+        "source",
+        "basis",
+        "terms",
+        "means",
+        "end",
+        "part",
+        "side",
+        "case",
+        "fact",
+        "idea",
+        "view",
+        "sense",
     ];
     if word_count == 1 && generic_caps.contains(&lower_trimmed) {
         return true;
@@ -2968,9 +3034,22 @@ impl<'a> Prometheus<'a> {
                             || lower.ends_with("ness")
                             || lower.ends_with("ung") // German suffix
                             || lower.ends_with("keit") // German suffix
-                            || lower.ends_with("schaft")); // German suffix
-                                                           // Only purge generic-looking single words for concepts
-                    is_concept_or_unknown && too_generic && lower.len() < 15
+                            || lower.ends_with("schaft") // German suffix
+                            || lower.ends_with("ing")
+                            || lower.ends_with("ity")
+                            || lower.ends_with("ism")
+                            || lower.ends_with("ure")
+                            || lower.ends_with("ary")
+                            || lower.ends_with("ery")
+                            || lower.ends_with("ory"));
+                    // Also purge plural common nouns as concepts
+                    let is_plural_common = is_concept_or_unknown
+                        && lower.ends_with('s')
+                        && !lower.ends_with("ss")
+                        && lower.len() <= 10
+                        && lower.chars().next().map_or(false, |c| c.is_lowercase());
+                    // Only purge generic-looking single words for concepts
+                    (is_concept_or_unknown && too_generic && lower.len() < 15) || is_plural_common
                 }
                 2 | 3 => {
                     // Multi-word fragments: "Seventh Through", "Open Zihintpause Pause"

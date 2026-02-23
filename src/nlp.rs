@@ -2132,7 +2132,7 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         ];
         let marker_count = words
             .iter()
-            .filter(|w| sentence_markers.contains(&w))
+            .filter(|w| sentence_markers.contains(w))
             .count();
         if marker_count >= 2 {
             return false;
