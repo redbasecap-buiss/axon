@@ -422,6 +422,15 @@ async fn main() -> anyhow::Result<()> {
                         }
                         println!();
                     }
+                    // Enrichment targets
+                    let enrichment = p.rank_enrichment_targets(10).unwrap_or_default();
+                    if !enrichment.is_empty() {
+                        println!("Top enrichment targets (need deeper crawling):");
+                        for (name, etype, score, reason) in &enrichment {
+                            println!("  🎯 [{:.3}] {} ({}): {}", score, name, etype, reason);
+                        }
+                        println!();
+                    }
                     // Crawl suggestions
                     let suggestions = p.suggest_crawl_topics().unwrap_or_default();
                     if !suggestions.is_empty() {

@@ -2119,6 +2119,9 @@ impl<'a> Prometheus<'a> {
         // Purge generic single-word islands (adverbs, adjectives, citation surnames)
         let generic_purged = self.purge_generic_single_word_islands().unwrap_or(0);
 
+        // Purge multi-word island noise (fragments, misclassifications)
+        let multiword_purged = self.purge_multiword_island_noise().unwrap_or(0);
+
         // Refine associated_with predicates using entity type pairs
         let predicates_refined = self.refine_associated_with().unwrap_or(0);
 
@@ -2170,7 +2173,7 @@ impl<'a> Prometheus<'a> {
              {} compound relations + {} compound merged, {} concat split ({}r/{}c), {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} convergence-pass merges, \
-             {} generic islands purged, {} predicates refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} predicates refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -2222,6 +2225,7 @@ impl<'a> Prometheus<'a> {
             auto_consolidated,
             convergence_merges,
             generic_purged,
+            multiword_purged,
             predicates_refined,
             promoted,
             pair_deduped,
@@ -2420,6 +2424,176 @@ impl<'a> Prometheus<'a> {
         }
 
         Ok(suggestions)
+    }
+
+    /// Rank connected entities by enrichment priority: which entities would benefit
+    /// most from deeper crawling? Combines PageRank importance, low fact/relation
+    /// count, and high-value entity type into a single score.
+    /// Returns (entity_name, entity_type, score, reason) sorted by priority.
+    pub fn rank_enrichment_targets(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, f64, String)>> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        // Only consider connected entities
+        let mut connected: HashSet<i64> = HashSet::new();
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // PageRank for importance weighting
+        let pr = crate::graph::pagerank(self.brain, 0.85, 20)?;
+
+        // Type value weights
+        let type_weight = |t: &str| -> f64 {
+            match t {
+                "person" => 1.5,
+                "concept" => 1.3,
+                "organization" => 1.2,
+                "place" => 1.0,
+                "technology" => 1.4,
+                "event" => 1.1,
+                _ => 0.5,
+            }
+        };
+
+        let mut targets: Vec<(String, String, f64, String)> = Vec::new();
+        for e in &entities {
+            if !connected.contains(&e.id) || is_noise_type(&e.entity_type) || is_noise_name(&e.name)
+            {
+                continue;
+            }
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            let rank = pr.get(&e.id).copied().unwrap_or(0.0);
+            let facts = self.brain.get_facts_for(e.id)?.len();
+
+            // Enrichment score: high importance + low knowledge = high priority
+            // Entities with high PageRank but few connections/facts need enrichment most
+            let sparsity = 1.0 / (1.0 + deg as f64 + facts as f64);
+            let importance = rank * 10000.0; // Normalize PageRank
+            let tw = type_weight(&e.entity_type);
+            let score = importance * sparsity * tw;
+
+            if score > 0.001 {
+                let reason = format!(
+                    "PageRank {:.4}, {} relations, {} facts — {} type",
+                    rank, deg, facts, e.entity_type
+                );
+                targets.push((e.name.clone(), e.entity_type.clone(), score, reason));
+            }
+        }
+
+        targets.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        targets.truncate(limit);
+        Ok(targets)
+    }
+
+    /// Detect multi-word island entities that are likely NLP extraction artifacts.
+    /// Patterns: "Noun Verb" fragments, reversed "Surname Firstname" citation format,
+    /// entities containing common academic terms mixed with proper nouns.
+    /// Returns count of entities purged.
+    pub fn purge_multiword_island_noise(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Words that signal sentence fragments when appearing in entity names
+        let fragment_signals: HashSet<&str> = [
+            "quiz",
+            "film",
+            "printed",
+            "feature",
+            "mosaics",
+            "explorations",
+            "mission",
+            "lexicon",
+            "revue",
+            "etablierte",
+            "kirchen",
+            "lycée",
+            "recipients",
+            "glance",
+            "visualize",
+            "shrieking",
+            "servile",
+            "thrilling",
+            "arrives",
+            "vessel",
+            "resting",
+            "gefolgschaft",
+            "hintergrund",
+            "überblick",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        // Non-person type indicators wrongly classified as persons
+        let not_person_patterns: &[&str] =
+            &["age", "bsd", "hat", "kong", "ship", "hms", "uss", "iss"];
+
+        let mut purged = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            let words: Vec<&str> = lower.split_whitespace().collect();
+
+            let should_purge = if words.len() >= 2 {
+                // Check for fragment signal words
+                words.iter().any(|w| fragment_signals.contains(w))
+            } else {
+                false
+            };
+
+            // Purge entities with names containing non-ASCII quote artifacts
+            let has_artifact = e.name.contains("Has-") && e.name.contains("Ayş");
+
+            if should_purge || has_artifact {
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                    Ok(())
+                })?;
+                purged += 1;
+            }
+
+            // Fix type misclassification: "Bronze Age", "Red Hat", etc. aren't persons
+            if e.entity_type == "person" && words.len() == 2 {
+                let last = words[1];
+                if not_person_patterns.contains(&last) {
+                    let new_type = if last == "age" {
+                        "concept"
+                    } else if last == "hat" || last == "bsd" {
+                        "technology"
+                    } else {
+                        "concept"
+                    };
+                    self.brain.with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE entities SET entity_type = ?1 WHERE id = ?2",
+                            params![new_type, e.id],
+                        )?;
+                        Ok(())
+                    })?;
+                }
+            }
+        }
+        Ok(purged)
     }
 
     /// Cluster island entities by type and name similarity to suggest batch crawl targets.
