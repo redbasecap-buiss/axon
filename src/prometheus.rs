@@ -1707,6 +1707,9 @@ impl<'a> Prometheus<'a> {
         // Prefix island consolidation (merge "Euler" island → "Leonhard Euler" connected)
         let prefix_merged = self.consolidate_prefix_islands().unwrap_or(0);
 
+        // Word-overlap island merging (aggressive: merge "Marie Curie Avenue" → "Marie Curie")
+        let word_merged = self.word_overlap_island_merge(0.6).unwrap_or(0);
+
         let summary = format!(
             "Discovered {} patterns, generated {} new hypotheses ({} confirmed, {} rejected), \
              auto-resolved {} existing ({}✓ {}✗), {} island entities, {} meaningful relations, \
@@ -1717,7 +1720,7 @@ impl<'a> Prometheus<'a> {
              {} name subsumptions found, {} types fixed, {} noise entities purged, \
              {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected, \
              {} fact-inferred relations, {} name cross-references, \
-             {} compound relations + {} compound merged, {} prefix-merged",
+             {} compound relations + {} compound merged, {} prefix-merged, {} word-overlap merged",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1753,6 +1756,7 @@ impl<'a> Prometheus<'a> {
             compound_rels,
             compound_merged,
             prefix_merged,
+            word_merged,
         );
 
         Ok(DiscoveryReport {
@@ -3485,6 +3489,129 @@ impl<'a> Prometheus<'a> {
         Ok(merged)
     }
 
+    /// Aggressive island consolidation via word-overlap matching.
+    /// For each isolated entity, find the best-matching connected entity of compatible type
+    /// using Jaccard word similarity. If similarity ≥ threshold, merge.
+    /// This handles cases like "Marie Curie Avenue" → merge into "Marie Curie".
+    /// Returns count of merges performed.
+    pub fn word_overlap_island_merge(&self, min_jaccard: f64) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Build word sets for connected entities, grouped by type
+        struct ConnectedInfo {
+            id: i64,
+            words: HashSet<String>,
+            word_count: usize,
+        }
+        let mut connected_by_type: HashMap<String, Vec<ConnectedInfo>> = HashMap::new();
+        for e in &entities {
+            if !connected.contains(&e.id) || is_noise_name(&e.name) || is_noise_type(&e.entity_type)
+            {
+                continue;
+            }
+            let words: HashSet<String> = e
+                .name
+                .to_lowercase()
+                .split_whitespace()
+                .filter(|w| w.len() >= 3)
+                .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+                .filter(|w| !w.is_empty())
+                .collect();
+            if words.is_empty() {
+                continue;
+            }
+            let wc = words.len();
+            connected_by_type
+                .entry(e.entity_type.clone())
+                .or_default()
+                .push(ConnectedInfo {
+                    id: e.id,
+                    words,
+                    word_count: wc,
+                });
+        }
+        // Also allow cross-type matching for person→concept, person→place, etc.
+        // Build a flat list for cross-type fallback
+        let all_connected: Vec<&ConnectedInfo> =
+            connected_by_type.values().flat_map(|v| v.iter()).collect();
+
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<i64> = HashSet::new();
+
+        for e in &entities {
+            if connected.contains(&e.id) || absorbed.contains(&e.id) {
+                continue;
+            }
+            if is_noise_name(&e.name) || is_noise_type(&e.entity_type) || e.name.len() < 4 {
+                continue;
+            }
+            let island_words: HashSet<String> = e
+                .name
+                .to_lowercase()
+                .split_whitespace()
+                .filter(|w| w.len() >= 3)
+                .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+                .filter(|w| !w.is_empty())
+                .collect();
+            if island_words.is_empty() {
+                continue;
+            }
+
+            // First try same-type matches
+            let candidates = connected_by_type.get(&e.entity_type);
+            let mut best: Option<(i64, f64)> = None;
+
+            if let Some(cands) = candidates {
+                for c in cands {
+                    let intersection = island_words.intersection(&c.words).count();
+                    if intersection == 0 {
+                        continue;
+                    }
+                    let union = island_words.union(&c.words).count();
+                    let jaccard = intersection as f64 / union as f64;
+                    // Also check containment: if island words are a superset/subset of connected
+                    let containment =
+                        intersection as f64 / island_words.len().min(c.word_count) as f64;
+                    let score = jaccard.max(containment * 0.9); // containment slightly discounted
+                    if score >= min_jaccard && (best.is_none() || score > best.unwrap().1) {
+                        best = Some((c.id, score));
+                    }
+                }
+            }
+
+            // Cross-type fallback: only if island words fully contained in a connected entity
+            if best.is_none() && island_words.len() >= 2 {
+                for c in &all_connected {
+                    let intersection = island_words.intersection(&c.words).count();
+                    let containment = intersection as f64 / island_words.len() as f64;
+                    if containment >= 0.95 && intersection >= 2 {
+                        let jaccard =
+                            intersection as f64 / island_words.union(&c.words).count() as f64;
+                        if jaccard >= min_jaccard * 0.8 {
+                            best = Some((c.id, jaccard));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some((target_id, _score)) = best {
+                if target_id != e.id {
+                    self.brain.merge_entities(e.id, target_id)?;
+                    absorbed.insert(e.id);
+                    merged += 1;
+                }
+            }
+        }
+        Ok(merged)
+    }
+
     fn entity_name(&self, id: i64) -> Result<String> {
         Ok(self
             .brain
@@ -3735,6 +3862,72 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
     if current_type == "person" || current_type == "concept" {
         if word_count >= 2 && words.iter().any(|w| place_words.contains(w)) {
             return Some("place");
+        }
+    }
+
+    // Compound entities misclassified as person: "X Building", "X Day", "X Award", etc.
+    if current_type == "person" && word_count >= 2 {
+        if let Some(last) = words.last() {
+            // These suffixes mean it's a place, not a person
+            let place_suffixes = [
+                "building",
+                "center",
+                "centre",
+                "house",
+                "suite",
+                "hall",
+                "park",
+                "square",
+                "street",
+                "avenue",
+                "boulevard",
+                "museum",
+                "library",
+                "hospital",
+                "station",
+                "airport",
+            ];
+            if place_suffixes.contains(last) {
+                return Some("place");
+            }
+            // These suffixes mean it's an organization
+            let org_suffixes = [
+                "institute",
+                "foundation",
+                "association",
+                "society",
+                "academy",
+                "council",
+                "committee",
+                "commission",
+                "agency",
+                "bureau",
+            ];
+            if org_suffixes.contains(last) {
+                return Some("organization");
+            }
+            // These suffixes mean it's an event
+            let event_suffixes = ["day", "festival", "ceremony", "conference", "symposium"];
+            if event_suffixes.contains(last) {
+                return Some("event");
+            }
+            // These suffixes mean it's a concept/thing
+            let concept_suffixes = [
+                "award",
+                "prize",
+                "medal",
+                "biography",
+                "original",
+                "wired",
+                "founder",
+                "countess",
+                "notes",
+                "letters",
+                "papers",
+            ];
+            if concept_suffixes.contains(last) {
+                return Some("concept");
+            }
         }
     }
 
