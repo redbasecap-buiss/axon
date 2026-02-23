@@ -861,6 +861,170 @@ impl<'a> Prometheus<'a> {
         Ok(patterns)
     }
 
+    /// Find predicate chain patterns: A→p1→B→p2→C suggests a compound relation A→(p1∘p2)→C.
+    /// E.g., "Einstein" →born_in→ "Germany" →located_in→ "Europe" suggests "Einstein" associated_with "Europe".
+    /// Returns patterns with the chain predicates and involved entities.
+    pub fn find_predicate_chains(&self, min_freq: usize) -> Result<Vec<Pattern>> {
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        // Build outgoing edges: entity_id → [(predicate, target_id)]
+        let mut outgoing: HashMap<i64, Vec<(String, i64)>> = HashMap::new();
+        for r in &relations {
+            if meaningful.contains(&r.subject_id)
+                && meaningful.contains(&r.object_id)
+                && !is_generic_predicate(&r.predicate)
+            {
+                outgoing
+                    .entry(r.subject_id)
+                    .or_default()
+                    .push((r.predicate.clone(), r.object_id));
+            }
+        }
+
+        // Count predicate chain motifs: (p1, p2) → frequency
+        let mut chain_count: HashMap<(String, String), Vec<(i64, i64, i64)>> = HashMap::new();
+        for (&a, edges_a) in &outgoing {
+            for (p1, b) in edges_a {
+                if let Some(edges_b) = outgoing.get(b) {
+                    for (p2, c) in edges_b {
+                        if *c != a && p1 != p2 {
+                            let key = (p1.clone(), p2.clone());
+                            chain_count.entry(key).or_default().push((a, *b, *c));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut patterns = Vec::new();
+        for ((p1, p2), instances) in &chain_count {
+            if instances.len() >= min_freq {
+                let example_names: Vec<String> = instances
+                    .iter()
+                    .take(3)
+                    .filter_map(|(a, b, c)| {
+                        let an = self.entity_name(*a).ok()?;
+                        let bn = self.entity_name(*b).ok()?;
+                        let cn = self.entity_name(*c).ok()?;
+                        Some(format!("{}→{}→{}", an, bn, cn))
+                    })
+                    .collect();
+                patterns.push(Pattern {
+                    id: 0,
+                    pattern_type: PatternType::FrequentSubgraph,
+                    entities_involved: example_names,
+                    frequency: instances.len() as i64,
+                    last_seen: now_str(),
+                    description: format!(
+                        "Chain pattern ({} → {}) appears {} times — transitive relation candidate",
+                        p1,
+                        p2,
+                        instances.len()
+                    ),
+                });
+            }
+        }
+        patterns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        patterns.truncate(30);
+        Ok(patterns)
+    }
+
+    /// Generate hypotheses from predicate chains: if A→p1→B→p2→C occurs frequently,
+    /// propose that A is transitively related to C.
+    pub fn generate_hypotheses_from_chains(&self) -> Result<Vec<Hypothesis>> {
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        let mut outgoing: HashMap<i64, Vec<(String, i64)>> = HashMap::new();
+        for r in &relations {
+            if meaningful.contains(&r.subject_id)
+                && meaningful.contains(&r.object_id)
+                && !is_generic_predicate(&r.predicate)
+            {
+                outgoing
+                    .entry(r.subject_id)
+                    .or_default()
+                    .push((r.predicate.clone(), r.object_id));
+            }
+        }
+
+        // Build direct connection set
+        let mut connected: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            let key = if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            };
+            connected.insert(key);
+        }
+
+        // Transitive predicate pairs that suggest compound relations
+        let transitive_chains: &[(&str, &str, &str)] = &[
+            ("born_in", "located_in", "associated_with"),
+            ("located_in", "located_in", "located_in"),
+            ("part_of", "part_of", "part_of"),
+            ("member_of", "part_of", "associated_with"),
+            ("works_at", "located_in", "associated_with"),
+            ("founded_by", "born_in", "associated_with"),
+            ("created_by", "member_of", "associated_with"),
+            ("headquartered_in", "located_in", "operates_in"),
+        ];
+
+        let mut hypotheses = Vec::new();
+        for (&a, edges_a) in &outgoing {
+            for (p1, b) in edges_a {
+                if let Some(edges_b) = outgoing.get(b) {
+                    for (p2, c) in edges_b {
+                        if *c == a {
+                            continue;
+                        }
+                        let key = if a < *c { (a, *c) } else { (*c, a) };
+                        if connected.contains(&key) {
+                            continue;
+                        }
+                        // Check if this chain matches a known transitive pattern
+                        for &(cp1, cp2, new_pred) in transitive_chains {
+                            if p1 == cp1 && p2 == cp2 {
+                                let a_name = self.entity_name(a)?;
+                                let b_name = self.entity_name(*b)?;
+                                let c_name = self.entity_name(*c)?;
+                                hypotheses.push(Hypothesis {
+                                    id: 0,
+                                    subject: a_name.clone(),
+                                    predicate: new_pred.to_string(),
+                                    object: c_name.clone(),
+                                    confidence: 0.5,
+                                    evidence_for: vec![format!(
+                                        "Chain: {} →{}→ {} →{}→ {}",
+                                        a_name, p1, b_name, p2, c_name
+                                    )],
+                                    evidence_against: vec![],
+                                    reasoning_chain: vec![
+                                        format!("{} {} {}", a_name, p1, b_name),
+                                        format!("{} {} {}", b_name, p2, c_name),
+                                        format!(
+                                            "Transitive chain ({} → {}) implies {} {} {}",
+                                            p1, p2, a_name, new_pred, c_name
+                                        ),
+                                    ],
+                                    status: HypothesisStatus::Proposed,
+                                    discovered_at: now_str(),
+                                    pattern_source: "predicate_chain".to_string(),
+                                });
+                                if hypotheses.len() >= 50 {
+                                    return Ok(hypotheses);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(hypotheses)
+    }
+
     /// Find statistical anomalies — predicates that are surprisingly absent for certain entities.
     pub fn find_anomalies(&self) -> Result<Vec<Pattern>> {
         // For each entity_type, collect which predicates are common (>50%)
@@ -1565,6 +1729,9 @@ impl<'a> Prometheus<'a> {
         let anomalies = self.find_anomalies()?;
         all_patterns.extend(anomalies);
 
+        let chains = self.find_predicate_chains(2)?;
+        all_patterns.extend(chains);
+
         // Deduplicate and save patterns
         self.dedup_patterns(&mut all_patterns);
         for p in &all_patterns {
@@ -1617,6 +1784,13 @@ impl<'a> Prometheus<'a> {
         // 2d. Community bridge hypotheses
         let bridge_hyps = self.generate_hypotheses_from_community_bridges()?;
         all_hypotheses.extend(bridge_hyps);
+
+        // 2e. Predicate chain hypotheses
+        let chain_weight = self.get_pattern_weight("predicate_chain")?;
+        if chain_weight >= 0.05 {
+            let chain_hyps = self.generate_hypotheses_from_chains()?;
+            all_hypotheses.extend(chain_hyps);
+        }
 
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;

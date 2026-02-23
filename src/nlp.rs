@@ -1902,6 +1902,18 @@ fn classify_entity_type(name: &str) -> &'static str {
                     || clean.ends_with("ary")
                     || clean.ends_with("ous")
                     || clean.ends_with("ive")
+                    || clean.ends_with("ons")
+                    || clean.ends_with("als")
+                    || clean.ends_with("ems")
+                    || clean.ends_with("ies")
+                    || clean.ends_with("ures")
+                    || clean.ends_with("ths")
+                    || clean.ends_with("nce")
+                    || clean.ends_with("age")
+                    || clean.ends_with("ual")
+                    || clean.ends_with("cal")
+                    || clean.ends_with("lar")
+                    || clean.ends_with("ble")
             });
             // Also check if any word is a concept/place/org indicator
             let has_indicator = words.iter().any(|w| {

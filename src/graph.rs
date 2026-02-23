@@ -847,6 +847,60 @@ pub fn degree_distribution(brain: &Brain) -> Result<Vec<(usize, usize)>, rusqlit
     Ok(result)
 }
 
+/// Estimated graph diameter and average shortest path length via sampled BFS.
+/// Returns (estimated_diameter, avg_path_length, sample_size).
+/// Samples up to `sample` source nodes for efficiency.
+pub fn estimated_diameter(
+    brain: &Brain,
+    sample: usize,
+) -> Result<(usize, f64, usize), rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let ids: Vec<i64> = adj.keys().copied().collect();
+    let n = ids.len();
+    if n == 0 {
+        return Ok((0, 0.0, 0));
+    }
+
+    let step = if n <= sample { 1 } else { n / sample };
+    let sources: Vec<i64> = ids.iter().step_by(step).copied().take(sample).collect();
+
+    let mut max_dist = 0usize;
+    let mut total_dist = 0u64;
+    let mut pair_count = 0u64;
+
+    for &s in &sources {
+        let mut visited: HashMap<i64, usize> = HashMap::new();
+        visited.insert(s, 0);
+        let mut queue = VecDeque::new();
+        queue.push_back(s);
+
+        while let Some(v) = queue.pop_front() {
+            let d = visited[&v];
+            if let Some(neighbors) = adj.get(&v) {
+                for &w in neighbors {
+                    if !visited.contains_key(&w) {
+                        let nd = d + 1;
+                        visited.insert(w, nd);
+                        if nd > max_dist {
+                            max_dist = nd;
+                        }
+                        total_dist += nd as u64;
+                        pair_count += 1;
+                        queue.push_back(w);
+                    }
+                }
+            }
+        }
+    }
+
+    let avg = if pair_count > 0 {
+        total_dist as f64 / pair_count as f64
+    } else {
+        0.0
+    };
+    Ok((max_dist, avg, sources.len()))
+}
+
 /// Graph density: ratio of actual edges to possible edges.
 pub fn graph_density(brain: &Brain) -> Result<f64, rusqlite::Error> {
     let n = brain.all_entities()?.len() as f64;
@@ -1094,10 +1148,13 @@ pub fn graph_summary(brain: &Brain) -> Result<String, rusqlite::Error> {
     let largest_pct = health.get("largest_component_pct").copied().unwrap_or(0.0);
     let avg_deg = health.get("avg_degree").copied().unwrap_or(0.0);
 
+    let (diameter, avg_path, _) = estimated_diameter(brain, 50)?;
+
     Ok(format!(
         "Graph: {} entities, {} relations, density {:.6}\n\
          Connected: {} ({:.1}% isolated), {} components (largest {:.1}%)\n\
-         Avg degree: {:.2}, Power law: α={:.2} (R²={:.2} {})\n",
+         Avg degree: {:.2}, Diameter: ~{}, Avg path: {:.2}\n\
+         Power law: α={:.2} (R²={:.2} {})\n",
         entities,
         rels,
         density,
@@ -1110,6 +1167,8 @@ pub fn graph_summary(brain: &Brain) -> Result<String, rusqlite::Error> {
         components,
         largest_pct,
         avg_deg,
+        diameter,
+        avg_path,
         exponent,
         r2,
         if r2 > 0.8 {
