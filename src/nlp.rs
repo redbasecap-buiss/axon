@@ -2692,6 +2692,17 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             "westerners",
             "development board",
             "authorization",
+            "university",
+            "institute",
+            "academy",
+            "college",
+            "school",
+            "committee",
+            "department",
+            "museum",
+            "foundation",
+            "laboratory",
+            "observatory",
         ];
         if person_blacklist_words.iter().any(|w| lower.contains(w)) {
             return false;
@@ -2782,6 +2793,58 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             if etype == "person" {
                 return false;
             }
+        }
+    }
+
+    // Reject multi-word concepts ending with adjective/fragment words (parsing artifacts)
+    if etype == "concept" && lower.contains(' ') {
+        let last_word = lower.split_whitespace().last().unwrap_or("");
+        let fragment_endings = [
+            "electronic",
+            "virtual",
+            "aerial",
+            "mechanical",
+            "optical",
+            "digital",
+            "classical",
+            "musical",
+            "physical",
+            "chemical",
+            "biological",
+            "geological",
+            "astronomical",
+            "mathematical",
+            "statistical",
+            "computational",
+            "experimental",
+            "theoretical",
+            "numerical",
+            "analytical",
+            "structural",
+            "functional",
+        ];
+        let first_word = lower.split_whitespace().next().unwrap_or("");
+        let fragment_starts = [
+            "applications",
+            "properties",
+            "interpreter",
+            "compiler",
+            "processor",
+            "introducing",
+            "acquiring",
+            "dissolving",
+            "combining",
+            "meanwhile",
+        ];
+        if fragment_endings.contains(&last_word) && !lower.contains(" and ") {
+            // Only reject if it looks like a fragment (2 words, no connectors)
+            let word_count = lower.split_whitespace().count();
+            if word_count <= 3 {
+                return false;
+            }
+        }
+        if fragment_starts.contains(&first_word) {
+            return false;
         }
     }
 
