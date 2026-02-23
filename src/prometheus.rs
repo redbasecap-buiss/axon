@@ -297,6 +297,19 @@ fn is_noise_name(name: &str) -> bool {
         "strom",
         "like",
         "daughter",
+        "airport",
+        "cathedral",
+        "city",
+        "county",
+        "church",
+        "reformed",
+        "orthodox",
+        "catholic",
+        "association",
+        "mathematical",
+        "henry",
+        "phillips",
+        "admiral",
     ];
     if word_count == 1 && generic_caps.contains(&lower_trimmed.as_ref()) {
         return true;
@@ -1917,6 +1930,13 @@ impl<'a> Prometheus<'a> {
         if chain_weight >= 0.05 {
             let chain_hyps = self.generate_hypotheses_from_chains()?;
             all_hypotheses.extend(chain_hyps);
+        }
+
+        // 2f. Near-miss connection hypotheses (entities with many indirect paths but no direct edge)
+        let near_miss_weight = self.get_pattern_weight("near_miss")?;
+        if near_miss_weight >= 0.05 {
+            let near_miss_hyps = self.generate_hypotheses_from_near_misses()?;
+            all_hypotheses.extend(near_miss_hyps);
         }
 
         // 3. Island entities as gaps
@@ -4931,6 +4951,118 @@ impl<'a> Prometheus<'a> {
         candidates.truncate(limit);
         Ok(candidates)
     }
+
+    /// Find entities that are "almost connected" — they share 2+ hop paths through
+    /// the graph but no direct edge. These are high-value hypothesis targets because
+    /// a direct relation likely exists but wasn't extracted.
+    /// Returns (entity_a, entity_b, path_count, shortest_path_len, suggested_predicate).
+    pub fn find_near_miss_connections(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, usize, usize, String)>> {
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        // Build adjacency for meaningful entities only
+        let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+        let mut direct: HashSet<(i64, i64)> = HashSet::new();
+        let mut pred_map: HashMap<(i64, i64), String> = HashMap::new();
+        for r in &relations {
+            if meaningful.contains(&r.subject_id) && meaningful.contains(&r.object_id) {
+                adj.entry(r.subject_id).or_default().insert(r.object_id);
+                adj.entry(r.object_id).or_default().insert(r.subject_id);
+                let key = if r.subject_id < r.object_id {
+                    (r.subject_id, r.object_id)
+                } else {
+                    (r.object_id, r.subject_id)
+                };
+                direct.insert(key);
+                pred_map.insert(key, r.predicate.clone());
+            }
+        }
+
+        // For each entity, do a 2-hop BFS to find entities reachable in exactly 2 hops
+        // that share multiple 2-hop paths (strong indirect connection signal)
+        let mut near_misses: Vec<(String, String, usize, usize, String)> = Vec::new();
+        let entities: Vec<i64> = adj.keys().copied().collect();
+
+        // Sample to avoid O(n²) on large graphs
+        let sample_size = entities.len().min(200);
+        let step = if entities.len() <= sample_size {
+            1
+        } else {
+            entities.len() / sample_size
+        };
+
+        for &src in entities.iter().step_by(step).take(sample_size) {
+            let src_nb = match adj.get(&src) {
+                Some(s) => s,
+                None => continue,
+            };
+            // Collect 2-hop targets with path counts
+            let mut two_hop_count: HashMap<i64, usize> = HashMap::new();
+            for &mid in src_nb {
+                if let Some(mid_nb) = adj.get(&mid) {
+                    for &target in mid_nb {
+                        if target != src && !src_nb.contains(&target) {
+                            let key = if src < target {
+                                (src, target)
+                            } else {
+                                (target, src)
+                            };
+                            if !direct.contains(&key) {
+                                *two_hop_count.entry(target).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Entities reachable via 3+ distinct 2-hop paths are strong candidates
+            for (&target, &count) in &two_hop_count {
+                if count >= 3 {
+                    let src_name = self.entity_name(src)?;
+                    let tgt_name = self.entity_name(target)?;
+                    // Suggest predicate based on most common predicate in shared neighbourhood
+                    let suggested = "related_to".to_string();
+                    near_misses.push((src_name, tgt_name, count, 2, suggested));
+                }
+            }
+        }
+
+        near_misses.sort_by(|a, b| b.2.cmp(&a.2));
+        near_misses.truncate(limit);
+        Ok(near_misses)
+    }
+
+    /// Generate hypotheses from near-miss connections (entities with multiple
+    /// indirect paths but no direct edge).
+    pub fn generate_hypotheses_from_near_misses(&self) -> Result<Vec<Hypothesis>> {
+        let near_misses = self.find_near_miss_connections(30)?;
+        let mut hypotheses = Vec::new();
+        for (a, b, path_count, _path_len, pred) in &near_misses {
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a.clone(),
+                predicate: pred.clone(),
+                object: b.clone(),
+                confidence: 0.45 + (*path_count as f64 * 0.05).min(0.3),
+                evidence_for: vec![format!(
+                    "{} and {} connected via {} distinct 2-hop paths",
+                    a, b, path_count
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!("{} indirect paths between {} and {}", path_count, a, b),
+                    "Multiple indirect connections suggest a missing direct relation".to_string(),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "near_miss".to_string(),
+            });
+        }
+        Ok(hypotheses)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5132,6 +5264,46 @@ fn is_extraction_noise(name: &str, entity_type: &str) -> bool {
         return true;
     }
 
+    // Mixed-script names (Latin + Cyrillic/Arabic/CJK) — usually translation artifacts
+    let has_latin = lower.chars().any(|c| c.is_ascii_alphabetic());
+    let has_non_latin = name.chars().any(|c| {
+        c.is_alphabetic()
+            && !c.is_ascii_alphabetic()
+            && c != 'é'
+            && c != 'è'
+            && c != 'ê'
+            && c != 'ë'
+            && c != 'à'
+            && c != 'â'
+            && c != 'ä'
+            && c != 'ö'
+            && c != 'ü'
+            && c != 'ß'
+            && c != 'ñ'
+            && c != 'ç'
+            && c != 'î'
+            && c != 'ô'
+            && c != 'û'
+            && c != 'æ'
+            && c != 'ø'
+            && c != 'å'
+            && c != 'í'
+            && c != 'ó'
+            && c != 'ú'
+    });
+    if has_latin && has_non_latin && word_count >= 3 {
+        return true;
+    }
+
+    // Names ending with "Post-Intelligencer", "Modelling", "Diploma" — org/concept, not entities
+    let noise_endings = ["post-intelligencer", "modelling", "diploma", "semantics"];
+    if word_count >= 2 {
+        let last = lower.split_whitespace().last().unwrap_or("");
+        if noise_endings.contains(&last) {
+            return true;
+        }
+    }
+
     false
 }
 
@@ -5174,6 +5346,89 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
     if current_type == "person" || current_type == "concept" {
         if word_count >= 2 && words.iter().any(|w| place_words.contains(w)) {
             return Some("place");
+        }
+    }
+
+    // Place → person: names that look like "Firstname Lastname" classified as place
+    // Heuristic: 2-3 words, all capitalized, no place/org indicators, no numbers
+    if current_type == "place" && (word_count == 2 || word_count == 3) {
+        let has_place_word = words.iter().any(|w| place_words.contains(w));
+        let has_org_word = words.iter().any(|w| {
+            [
+                "university",
+                "college",
+                "institute",
+                "company",
+                "corp",
+                "inc",
+                "street",
+                "avenue",
+                "road",
+                "turnpike",
+                "post-intelligencer",
+                "semantics",
+                "modelling",
+                "diploma",
+            ]
+            .contains(w)
+        });
+        let has_tech_word = words.iter().any(|w| {
+            [
+                "spark",
+                "hadoop",
+                "kafka",
+                "kubernetes",
+                "docker",
+                "tensorflow",
+                "pytorch",
+                "bayes",
+                "naive",
+                "artificial",
+                "neural",
+                "quantum",
+            ]
+            .contains(w)
+        });
+        let has_digit = lower.chars().any(|c| c.is_ascii_digit());
+        if !has_place_word && !has_org_word && !has_tech_word && !has_digit {
+            // Check if words look like proper name components (capitalized, alphabetic)
+            let all_name_like = words.iter().all(|w| {
+                w.len() >= 2 && w.chars().all(|c| c.is_alphabetic() || c == '-' || c == '.')
+            });
+            // Person names don't usually contain these
+            let non_person_words = [
+                "soviet-allied",
+                "off",
+                "columbia",
+                "cuban",
+                "brazilian",
+                "carolingian",
+                "imperial",
+                "byzantine",
+            ];
+            let has_non_person = words.iter().any(|w| non_person_words.contains(w));
+            if all_name_like && !has_non_person && word_count <= 3 {
+                // Additional check: is the last word a common surname-like word?
+                // Avoid reclassifying "West Berlin" etc.
+                let first_word = words[0];
+                let last_word = words[word_count - 1];
+                // If first word is a cardinal direction or common adjective, keep as place
+                let adj_first = [
+                    "new", "old", "great", "upper", "lower", "central", "western", "eastern",
+                    "northern", "southern", "south", "north", "east", "west",
+                ];
+                if !adj_first.contains(&first_word) {
+                    // Likely a person name misclassified as place
+                    // But be conservative: only if last word >= 4 chars (likely surname)
+                    if last_word.len() >= 4 {
+                        return Some("person");
+                    }
+                }
+            }
+        }
+        // Place → technology: known software/tech names
+        if has_tech_word {
+            return Some("technology");
         }
     }
 
