@@ -1827,31 +1827,78 @@ impl<'a> Prometheus<'a> {
     }
 
     /// Generate hypotheses from type-based gaps.
+    /// Instead of generating unfalsifiable "object=?" hypotheses, we try to find
+    /// a plausible object by looking at what other entities of the same type connect to
+    /// via the missing predicate.
     pub fn generate_hypotheses_from_type_gaps(&self) -> Result<Vec<Hypothesis>> {
         let gaps = self.find_type_gaps()?;
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        // Build predicate→object mapping from existing relations for same-type entities
+        let entities = self.brain.all_entities()?;
+        let id_to_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+        let mut type_pred_objects: HashMap<(String, String), Vec<(i64, String)>> = HashMap::new();
+        for r in &relations {
+            if meaningful.contains(&r.subject_id) && meaningful.contains(&r.object_id) {
+                if let Some(&etype) = id_to_type.get(&r.subject_id) {
+                    type_pred_objects
+                        .entry((etype.to_string(), r.predicate.clone()))
+                        .or_default()
+                        .push((
+                            r.object_id,
+                            self.entity_name(r.object_id).unwrap_or_default(),
+                        ));
+                }
+            }
+        }
+
         let mut hypotheses = Vec::new();
-        for (entity, predicate, etype) in &gaps {
-            let h = Hypothesis {
-                id: 0,
-                subject: entity.clone(),
-                predicate: predicate.clone(),
-                object: "?".to_string(),
-                confidence: 0.5,
-                evidence_for: vec![format!(
-                    "Most entities of type '{}' have predicate '{}'",
-                    etype, predicate
-                )],
-                evidence_against: vec![],
-                reasoning_chain: vec![
-                    format!("Entity '{}' is of type '{}'", entity, etype),
-                    format!("Most '{}' entities have predicate '{}'", etype, predicate),
-                    format!("'{}' lacks this predicate — likely a gap", entity),
-                ],
-                status: HypothesisStatus::Proposed,
-                discovered_at: now_str(),
-                pattern_source: "type_gap".to_string(),
-            };
-            hypotheses.push(h);
+        for (entity, predicate, etype) in gaps.iter().take(100) {
+            // Find the most common object for this (type, predicate) pair
+            let key = (etype.clone(), predicate.clone());
+            if let Some(objects) = type_pred_objects.get(&key) {
+                // Count object frequency
+                let mut obj_freq: HashMap<&str, usize> = HashMap::new();
+                for (_, name) in objects {
+                    *obj_freq.entry(name.as_str()).or_insert(0) += 1;
+                }
+                // Pick the most common object (if it appears in >30% of cases)
+                let total = objects.len();
+                if let Some((&best_obj, &count)) = obj_freq.iter().max_by_key(|(_, &c)| c) {
+                    if count as f64 / total as f64 > 0.3
+                        && !best_obj.is_empty()
+                        && best_obj != entity
+                    {
+                        hypotheses.push(Hypothesis {
+                            id: 0,
+                            subject: entity.clone(),
+                            predicate: predicate.clone(),
+                            object: best_obj.to_string(),
+                            confidence: 0.45,
+                            evidence_for: vec![format!(
+                                "{}/{} '{}' entities with '{}' point to '{}'",
+                                count, total, etype, predicate, best_obj
+                            )],
+                            evidence_against: vec![],
+                            reasoning_chain: vec![
+                                format!("Entity '{}' is of type '{}'", entity, etype),
+                                format!(
+                                    "Most '{}' entities have '{}' → '{}'",
+                                    etype, predicate, best_obj
+                                ),
+                                format!("'{}' likely also {} '{}'", entity, predicate, best_obj),
+                            ],
+                            status: HypothesisStatus::Proposed,
+                            discovered_at: now_str(),
+                            pattern_source: "type_gap".to_string(),
+                        });
+                    }
+                }
+            }
         }
         Ok(hypotheses)
     }
@@ -2488,7 +2535,7 @@ impl<'a> Prometheus<'a> {
         all_hypotheses.extend(gap_hyps);
 
         let shared_weight = self.get_pattern_weight("shared_object")?;
-        if shared_weight >= 0.05 {
+        if shared_weight >= 0.10 {
             let shared_hyps = self.generate_hypotheses_from_shared_objects()?;
             all_hypotheses.extend(shared_hyps);
         }
@@ -2888,6 +2935,9 @@ impl<'a> Prometheus<'a> {
         // Hypothesis pair deduplication (prevent bloat from multiple runs)
         let pair_deduped = self.dedup_hypotheses_by_pair().unwrap_or(0);
 
+        // Cap total hypothesis count to prevent unbounded DB growth
+        let hyp_capped = self.cap_hypothesis_count(2000).unwrap_or(0);
+
         // K-core analysis: find the dense backbone
         let (max_k, core_members) =
             crate::graph::densest_core(self.brain, 3).unwrap_or((0, vec![]));
@@ -2933,7 +2983,7 @@ impl<'a> Prometheus<'a> {
              {} connected-containment merged, {} aggressive-prefix deduped, \
              {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, \
-             {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
+             {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -3005,6 +3055,7 @@ impl<'a> Prometheus<'a> {
             promoted,
             fragment_cleaned,
             pair_deduped,
+            hyp_capped,
             max_k,
             core_members.len(),
             trend_line,
@@ -6356,10 +6407,43 @@ impl<'a> Prometheus<'a> {
         Ok(count)
     }
 
-    /// Aggressive hypothesis cleanup: reject all testing hypotheses older than `max_days`
-    /// with confidence below `max_confidence`, regardless of the normal rejection threshold.
-    /// This prevents the testing queue from growing unboundedly.
-    /// Returns count of hypotheses rejected.
+    /// Cap hypothesis DB size: delete oldest rejected hypotheses to stay under `max_total`.
+    /// Keeps confirmed and testing; only prunes rejected (lowest value).
+    /// Returns count of hypotheses deleted.
+    pub fn cap_hypothesis_count(&self, max_total: usize) -> Result<usize> {
+        let total: i64 = self.brain.with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM hypotheses", [], |row| row.get(0))
+        })?;
+        if (total as usize) <= max_total {
+            return Ok(0);
+        }
+        let excess = total as usize - max_total;
+        // Delete oldest rejected first, then oldest confirmed
+        let deleted = self.brain.with_conn(|conn| {
+            let d1 = conn.execute(
+                &format!(
+                    "DELETE FROM hypotheses WHERE id IN (SELECT id FROM hypotheses WHERE status = 'rejected' ORDER BY discovered_at ASC LIMIT {})",
+                    excess
+                ),
+                [],
+            )?;
+            let remaining = excess.saturating_sub(d1);
+            let d2 = if remaining > 0 {
+                conn.execute(
+                    &format!(
+                        "DELETE FROM hypotheses WHERE id IN (SELECT id FROM hypotheses WHERE status = 'confirmed' ORDER BY discovered_at ASC LIMIT {})",
+                        remaining
+                    ),
+                    [],
+                )?
+            } else {
+                0
+            };
+            Ok(d1 + d2)
+        })?;
+        Ok(deleted)
+    }
+
     /// Clean up fragment hypotheses: reject confirmed/testing hypotheses where both
     /// subject and object are single-word short strings (likely NLP extraction fragments
     /// like "Grace" → "Hopper" rather than real discoveries).
@@ -12159,19 +12243,25 @@ mod tests {
     #[test]
     fn test_generate_hypotheses_from_type_gaps() {
         let brain = test_brain();
-        let a = brain.upsert_entity("A", "animal").unwrap();
-        let b = brain.upsert_entity("B", "animal").unwrap();
-        let c = brain.upsert_entity("C", "animal").unwrap();
-        let _d = brain.upsert_entity("D", "animal").unwrap();
-        let f = brain.upsert_entity("Food", "thing").unwrap();
+        let a = brain.upsert_entity("Cat Alpha", "animal").unwrap();
+        let b = brain.upsert_entity("Dog Beta", "animal").unwrap();
+        let c = brain.upsert_entity("Fox Gamma", "animal").unwrap();
+        let _d = brain.upsert_entity("Elk Delta", "animal").unwrap();
+        let f = brain.upsert_entity("Grass Food", "thing").unwrap();
         brain.upsert_relation(a, "eats", f, "test").unwrap();
         brain.upsert_relation(b, "eats", f, "test").unwrap();
         brain.upsert_relation(c, "eats", f, "test").unwrap();
         let p = Prometheus::new(&brain).unwrap();
         let hyps = p.generate_hypotheses_from_type_gaps().unwrap();
-        assert!(hyps
-            .iter()
-            .any(|h| h.subject == "D" && h.predicate == "eats"));
+        assert!(
+            hyps.iter().any(|h| h.subject == "Elk Delta"
+                && h.predicate == "eats"
+                && h.object == "Grass Food"),
+            "hyps: {:?}",
+            hyps.iter()
+                .map(|h| format!("{} {} {}", h.subject, h.predicate, h.object))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
