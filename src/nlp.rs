@@ -3214,8 +3214,13 @@ fn extract_capitalized_inner(
         {
             let mut phrase = vec![word.to_string()];
             let mut j = i + 1;
-            // Max 4 words per entity phrase to avoid capturing paragraphs
-            while j < words.len() && phrase.len() < 4 {
+            // Linking words that can appear inside entity names (e.g. "University of California")
+            const ENTITY_LINKING_WORDS: &[&str] = &[
+                "of", "the", "de", "del", "di", "du", "von", "van", "la", "le", "les", "el", "al",
+                "das", "des", "der", "den", "für", "for", "sur", "en", "upon", "on", "in", "at",
+            ];
+            // Max 6 words per entity phrase to capture "University of California at Berkeley"
+            while j < words.len() && phrase.len() < 6 {
                 let next = words[j]
                     .trim_matches(|c: char| !c.is_alphanumeric())
                     .trim_end_matches("'s")
@@ -3223,6 +3228,22 @@ fn extract_capitalized_inner(
                 if !next.is_empty() && next.chars().next().is_some_and(|c| c.is_uppercase()) {
                     phrase.push(next.to_string());
                     j += 1;
+                } else if !next.is_empty()
+                    && ENTITY_LINKING_WORDS.contains(&next.to_lowercase().as_str())
+                    && j + 1 < words.len()
+                {
+                    // Look ahead: only include linking word if followed by a capitalized word
+                    let after = words[j + 1]
+                        .trim_matches(|c: char| !c.is_alphanumeric())
+                        .trim_end_matches("'s")
+                        .trim_end_matches("\u{2019}s");
+                    if !after.is_empty() && after.chars().next().is_some_and(|c| c.is_uppercase()) {
+                        phrase.push(next.to_string());
+                        phrase.push(after.to_string());
+                        j += 2;
+                    } else {
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -4396,10 +4417,10 @@ mod tests {
     }
 
     #[test]
-    fn test_phrase_max_4_words() {
-        // A long sequence of capitalized words should be capped at 4
+    fn test_phrase_max_6_words() {
+        // A long sequence of capitalized words should be capped at 6
         let sentences = vec![
-            "We visited The Very Long Name Organization Department Division yesterday.".into(),
+            "We visited The Very Long Name Organization Department Division Bureau Section yesterday.".into(),
         ];
         let entities = extract_entities(&sentences);
         for (name, etype) in &entities {
@@ -4412,13 +4433,41 @@ mod tests {
             {
                 let word_count = name.split_whitespace().count();
                 assert!(
-                    word_count <= 4,
-                    "Entity '{}' has {} words, max 4",
+                    word_count <= 6,
+                    "Entity '{}' has {} words, max 6",
                     name,
                     word_count
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_linking_words_bridge_entities() {
+        // "University of California" should be captured as a single entity
+        let sentences =
+            vec!["He studied at the University of California at Berkeley in 1990.".into()];
+        let entities = extract_entities(&sentences);
+        let names: Vec<String> = entities.iter().map(|(n, _)| n.clone()).collect();
+        assert!(
+            names.iter().any(|n| n.contains("University of California")),
+            "Expected 'University of California' entity, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_linking_words_require_capitalized_follower() {
+        // Linking word "of" should NOT bridge if next word is lowercase
+        let sentences = vec!["The Battle of the ages was fierce.".into()];
+        let entities = extract_entities(&sentences);
+        let names: Vec<String> = entities.iter().map(|(n, _)| n.clone()).collect();
+        // Should not create "Battle of the ages"
+        assert!(
+            !names.iter().any(|n| n.contains("ages")),
+            "Should not bridge to lowercase: {:?}",
+            names
+        );
     }
 
     #[test]
