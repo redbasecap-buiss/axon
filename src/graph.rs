@@ -3519,3 +3519,164 @@ pub fn algebraic_connectivity_estimate(
 
     Ok((normalized, interpretation))
 }
+
+/// Temporal momentum scoring: entities gaining connections in recent facts score higher.
+/// Uses fact timestamps to weight edges by recency (exponential decay).
+/// Returns entity_id → momentum score, sorted descending.
+pub fn temporal_momentum(
+    brain: &Brain,
+    half_life_days: f64,
+    limit: usize,
+) -> Result<Vec<(i64, f64)>, rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let relations = brain.all_relations()?;
+    let id_set: HashSet<i64> = entities.iter().map(|e| e.id).collect();
+
+    // Parse the most recent timestamp as "now" reference
+    let now = chrono::Utc::now().timestamp() as f64;
+    let decay_rate = (2.0_f64).ln() / (half_life_days * 86400.0);
+
+    // Accumulate recency-weighted degree for each entity
+    let mut momentum: HashMap<i64, f64> = HashMap::new();
+    for r in &relations {
+        if !id_set.contains(&r.subject_id) || !id_set.contains(&r.object_id) {
+            continue;
+        }
+        // Use relation's created_at as timestamp proxy
+        let age_secs = (now - r.learned_at.and_utc().timestamp() as f64).max(0.0);
+        let weight = (-decay_rate * age_secs).exp() * r.confidence.max(0.01);
+        *momentum.entry(r.subject_id).or_insert(0.0) += weight;
+        *momentum.entry(r.object_id).or_insert(0.0) += weight;
+    }
+
+    let mut scores: Vec<(i64, f64)> = momentum.into_iter().collect();
+    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scores.truncate(limit);
+    Ok(scores)
+}
+
+/// Network motif census: count occurrences of 3-node motifs (triangles, feed-forward loops,
+/// chains, mutual dyads). Returns a map from motif name to count.
+/// Useful for understanding the structural character of the knowledge graph.
+pub fn motif_census(brain: &Brain) -> Result<HashMap<String, usize>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let entities = brain.all_entities()?;
+    let id_set: HashSet<i64> = entities.iter().map(|e| e.id).collect();
+
+    // Build directed adjacency
+    let mut out: HashMap<i64, HashSet<i64>> = HashMap::new();
+    for r in &relations {
+        if id_set.contains(&r.subject_id) && id_set.contains(&r.object_id) {
+            out.entry(r.subject_id).or_default().insert(r.object_id);
+        }
+    }
+
+    // Also build undirected neighbors for sampling
+    let mut neighbors: HashMap<i64, HashSet<i64>> = HashMap::new();
+    for r in &relations {
+        if id_set.contains(&r.subject_id) && id_set.contains(&r.object_id) {
+            neighbors
+                .entry(r.subject_id)
+                .or_default()
+                .insert(r.object_id);
+            neighbors
+                .entry(r.object_id)
+                .or_default()
+                .insert(r.subject_id);
+        }
+    }
+
+    let mut triangles = 0usize;
+    let mut feed_forward = 0usize; // A→B, A→C, B→C
+    let mut chains = 0usize; // A→B→C (no A→C)
+    let mut mutual_dyads = 0usize; // A↔B
+
+    // Count mutual dyads
+    for (&a, targets) in &out {
+        for &b in targets {
+            if let Some(b_targets) = out.get(&b) {
+                if b_targets.contains(&a) && a < b {
+                    mutual_dyads += 1;
+                }
+            }
+        }
+    }
+
+    // Sample 3-node motifs: for each edge A→B, check common neighbors
+    // Limit sampling to prevent O(n³) blowup
+    let mut sampled = 0usize;
+    let max_samples = 100_000usize;
+    'outer: for (&a, a_targets) in &out {
+        for &b in a_targets {
+            if sampled >= max_samples {
+                break 'outer;
+            }
+            // Check all neighbors of B
+            let b_targets = out.get(&b).cloned().unwrap_or_default();
+            for &c in b_targets.iter() {
+                if c == a {
+                    continue;
+                }
+                sampled += 1;
+                if sampled >= max_samples {
+                    break 'outer;
+                }
+                let a_to_c = out.get(&a).map_or(false, |t| t.contains(&c));
+                let c_to_a = out.get(&c).map_or(false, |t| t.contains(&a));
+                if a_to_c && c_to_a {
+                    triangles += 1;
+                } else if a_to_c {
+                    feed_forward += 1;
+                } else {
+                    chains += 1;
+                }
+            }
+        }
+    }
+
+    let mut census = HashMap::new();
+    census.insert("triangles".into(), triangles);
+    census.insert("feed_forward_loops".into(), feed_forward);
+    census.insert("chains".into(), chains);
+    census.insert("mutual_dyads".into(), mutual_dyads);
+    census.insert("samples".into(), sampled);
+    Ok(census)
+}
+
+/// Identify "rising star" entities: high temporal momentum but low current degree.
+/// These are entities rapidly gaining connections — potential discovery hotspots.
+pub fn rising_stars(
+    brain: &Brain,
+    limit: usize,
+) -> Result<Vec<(i64, String, f64, usize)>, rusqlite::Error> {
+    let momentum = temporal_momentum(brain, 30.0, 500)?;
+    let entities = brain.all_entities()?;
+    let id_to_name: HashMap<i64, &str> = entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+
+    // Count degree
+    let relations = brain.all_relations()?;
+    let mut degree: HashMap<i64, usize> = HashMap::new();
+    for r in &relations {
+        *degree.entry(r.subject_id).or_insert(0) += 1;
+        *degree.entry(r.object_id).or_insert(0) += 1;
+    }
+
+    // Rising star score = momentum / (degree + 1) — high momentum relative to current size
+    let mut stars: Vec<(i64, String, f64, usize)> = momentum
+        .iter()
+        .filter_map(|&(id, m)| {
+            let d = degree.get(&id).copied().unwrap_or(0);
+            let name = id_to_name.get(&id).copied().unwrap_or("?");
+            let score = m / (d as f64 + 1.0);
+            if score > 0.01 {
+                Some((id, name.to_string(), score, d))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    stars.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    stars.truncate(limit);
+    Ok(stars)
+}

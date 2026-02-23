@@ -3113,6 +3113,14 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(jc_hyps);
         }
 
+        // 2n. Rising star hypotheses (high momentum, low degree entities)
+        let rs_weight = self.get_pattern_weight("rising_star")?;
+        if rs_weight >= 0.05 {
+            let rs_hyps = self.generate_hypotheses_from_rising_stars()?;
+            eprintln!("[PROMETHEUS] rising_stars: {} hypotheses", rs_hyps.len());
+            all_hypotheses.extend(rs_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -3446,6 +3454,9 @@ impl<'a> Prometheus<'a> {
         // Cap total hypothesis count to prevent unbounded DB growth
         let hyp_capped = self.cap_hypothesis_count(2000).unwrap_or(0);
 
+        // Network motif census (structural patterns)
+        let motifs = crate::graph::motif_census(self.brain).unwrap_or_default();
+
         // K-core analysis: find the dense backbone
         let (max_k, core_members) =
             crate::graph::densest_core(self.brain, 3).unwrap_or((0, vec![]));
@@ -3497,7 +3508,8 @@ impl<'a> Prometheus<'a> {
              {} connected-containment merged, {} aggressive-prefix deduped, \
              {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, \
-             {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone{}",
+             {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
+             motifs: {}△ {}ff {}ch {}↔{}",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -3576,6 +3588,10 @@ impl<'a> Prometheus<'a> {
             max_k,
             core_members.len(),
             trend_line,
+            motifs.get("triangles").copied().unwrap_or(0),
+            motifs.get("feed_forward_loops").copied().unwrap_or(0),
+            motifs.get("chains").copied().unwrap_or(0),
+            motifs.get("mutual_dyads").copied().unwrap_or(0),
         );
         // Append health check and strategy diversity to summary
         let diversity_line = self
@@ -8529,6 +8545,127 @@ impl<'a> Prometheus<'a> {
                 pattern_source: "jaccard".to_string(),
             });
         }
+        Ok(hypotheses)
+    }
+
+    /// Generate hypotheses from "rising star" entities — high temporal momentum but low degree.
+    /// These entities are rapidly gaining connections and likely have undiscovered links.
+    /// Pairs rising stars with high-PageRank entities in the same type domain.
+    pub fn generate_hypotheses_from_rising_stars(&self) -> Result<Vec<Hypothesis>> {
+        let stars = crate::graph::rising_stars(self.brain, 20)?;
+        if stars.is_empty() {
+            return Ok(vec![]);
+        }
+        let meaningful = meaningful_ids(self.brain)?;
+        let entities = self.brain.all_entities()?;
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Get PageRank scores for hub identification
+        let pr = crate::graph::pagerank(self.brain, 0.85, 20)?;
+        let mut type_hubs: HashMap<String, Vec<(i64, f64)>> = HashMap::new();
+        for (&id, &score) in &pr {
+            if !meaningful.contains(&id) {
+                continue;
+            }
+            let etype = id_type.get(&id).copied().unwrap_or("unknown");
+            type_hubs
+                .entry(etype.to_string())
+                .or_default()
+                .push((id, score));
+        }
+        for hubs in type_hubs.values_mut() {
+            hubs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            hubs.truncate(10);
+        }
+
+        // Build existing connections set
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            let key = if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            };
+            connected.insert(key);
+        }
+
+        let mut hypotheses = Vec::new();
+        for (star_id, star_name, momentum, degree) in &stars {
+            if !meaningful.contains(star_id) || is_noise_name(star_name) {
+                continue;
+            }
+            let star_type = id_type.get(star_id).copied().unwrap_or("unknown");
+
+            // Find top hubs in the same type that aren't already connected
+            if let Some(hubs) = type_hubs.get(star_type) {
+                for &(hub_id, hub_pr) in hubs.iter().take(3) {
+                    if hub_id == *star_id {
+                        continue;
+                    }
+                    let key = if *star_id < hub_id {
+                        (*star_id, hub_id)
+                    } else {
+                        (hub_id, *star_id)
+                    };
+                    if connected.contains(&key) {
+                        continue;
+                    }
+                    let hub_name = id_name.get(&hub_id).copied().unwrap_or("?");
+                    if is_noise_name(hub_name) {
+                        continue;
+                    }
+                    let predicate = match star_type {
+                        "person" => "contemporary_of",
+                        "concept" => "related_concept",
+                        "organization" | "company" => "affiliated_with",
+                        "technology" => "builds_on",
+                        _ => "related_to",
+                    };
+                    let confidence = self
+                        .calibrated_confidence(
+                            "rising_star",
+                            (0.35 + (momentum * 0.1).min(0.3) + (hub_pr * 10.0).min(0.2)).min(0.85),
+                        )
+                        .unwrap_or(0.45);
+                    hypotheses.push(Hypothesis {
+                        id: 0,
+                        subject: star_name.clone(),
+                        predicate: predicate.to_string(),
+                        object: hub_name.to_string(),
+                        confidence,
+                        evidence_for: vec![
+                            format!(
+                                "Rising star: momentum {:.3}, degree {} (rapidly growing)",
+                                momentum, degree
+                            ),
+                            format!("Hub PageRank: {:.4}", hub_pr),
+                        ],
+                        evidence_against: vec![],
+                        reasoning_chain: vec![
+                            format!(
+                                "{} is a rising star ({} type) with high temporal momentum",
+                                star_name, star_type
+                            ),
+                            format!(
+                                "{} is a top hub in the same domain (PageRank {:.4})",
+                                hub_name, hub_pr
+                            ),
+                            "Rapidly growing entities likely connect to domain hubs".to_string(),
+                        ],
+                        status: HypothesisStatus::Proposed,
+                        discovered_at: now_str(),
+                        pattern_source: "rising_star".to_string(),
+                    });
+                }
+            }
+        }
+        hypotheses.truncate(30);
         Ok(hypotheses)
     }
 
