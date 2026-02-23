@@ -1120,6 +1120,49 @@ pub fn graph_summary(brain: &Brain) -> Result<String, rusqlite::Error> {
     ))
 }
 
+/// Inter-community edge density: ratio of edges between communities vs within.
+/// Higher ratio suggests the graph needs more bridging connections.
+/// Returns (intra_edges, inter_edges, ratio).
+pub fn inter_community_density(brain: &Brain) -> Result<(usize, usize, f64), rusqlite::Error> {
+    let communities = louvain_communities(brain)?;
+    let relations = brain.all_relations()?;
+    let mut intra = 0usize;
+    let mut inter = 0usize;
+    for r in &relations {
+        let cs = communities.get(&r.subject_id).copied();
+        let co = communities.get(&r.object_id).copied();
+        match (cs, co) {
+            (Some(a), Some(b)) if a == b => intra += 1,
+            (Some(_), Some(_)) => inter += 1,
+            _ => {}
+        }
+    }
+    let ratio = if intra > 0 {
+        inter as f64 / intra as f64
+    } else {
+        0.0
+    };
+    Ok((intra, inter, ratio))
+}
+
+/// Graph fragmentation score: 0.0 = perfectly connected, 1.0 = completely fragmented.
+/// Based on fraction of node pairs that are unreachable from each other.
+pub fn fragmentation_score(brain: &Brain) -> Result<f64, rusqlite::Error> {
+    let components = connected_components(brain)?;
+    let n = components.iter().map(|c| c.len()).sum::<usize>() as f64;
+    if n <= 1.0 {
+        return Ok(0.0);
+    }
+    // Sum of s_i * (n - s_i) for each component = total unreachable pairs * 2
+    let mut unreachable_pairs = 0.0_f64;
+    for c in &components {
+        let s = c.len() as f64;
+        unreachable_pairs += s * (n - s);
+    }
+    // Normalize: max unreachable = n*(n-1) when all singletons
+    Ok(unreachable_pairs / (n * (n - 1.0)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

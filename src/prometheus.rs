@@ -1734,6 +1734,9 @@ impl<'a> Prometheus<'a> {
         // Word-overlap island merging (aggressive: merge "Marie Curie Avenue" → "Marie Curie")
         let word_merged = self.word_overlap_island_merge(0.6).unwrap_or(0);
 
+        // Fragment island purging (remove single-word fragments like "Lovelace", "Hopper")
+        let fragment_purged = self.purge_fragment_islands().unwrap_or(0);
+
         // K-core analysis: find the dense backbone
         let (max_k, core_members) =
             crate::graph::densest_core(self.brain, 3).unwrap_or((0, vec![]));
@@ -1749,7 +1752,7 @@ impl<'a> Prometheus<'a> {
              {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected, \
              {} fact-inferred relations, {} name cross-references, \
              {} compound relations + {} compound merged, {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
-             k-core: k={} with {} entities in dense backbone",
+             {} fragment-purged, k-core: k={} with {} entities in dense backbone",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1788,6 +1791,7 @@ impl<'a> Prometheus<'a> {
             prefix_merged,
             suffix_merged,
             word_merged,
+            fragment_purged,
             max_k,
             core_members.len(),
         );
@@ -3514,22 +3518,39 @@ impl<'a> Prometheus<'a> {
             connected.insert(r.object_id);
         }
 
-        // Build connected entity names by type
-        let mut type_names: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+        // Build connected entity names (all types in one flat list for cross-type matching)
+        let mut all_connected_names: Vec<(i64, String, String)> = Vec::new();
         for e in &entities {
             if connected.contains(&e.id)
                 && !is_noise_name(&e.name)
                 && !is_noise_type(&e.entity_type)
             {
-                type_names
-                    .entry(e.entity_type.clone())
-                    .or_default()
-                    .push((e.id, e.name.to_lowercase()));
+                all_connected_names.push((e.id, e.name.to_lowercase(), e.entity_type.clone()));
             }
         }
 
         let mut merged = 0usize;
         let mut absorbed: HashSet<i64> = HashSet::new();
+
+        // Compatible type pairs for cross-type merging
+        let compatible_types = |a: &str, b: &str| -> bool {
+            if a == b {
+                return true;
+            }
+            matches!(
+                (a, b),
+                ("person", "concept")
+                    | ("concept", "person")
+                    | ("person", "organization")
+                    | ("organization", "person")
+                    | ("place", "concept")
+                    | ("concept", "place")
+                    | ("technology", "concept")
+                    | ("concept", "technology")
+                    | ("organization", "concept")
+                    | ("concept", "organization")
+            )
+        };
 
         for e in &entities {
             if connected.contains(&e.id) || absorbed.contains(&e.id) {
@@ -3540,37 +3561,33 @@ impl<'a> Prometheus<'a> {
             }
             let lower = e.name.to_lowercase();
 
-            // Check if this island's name is the beginning of a connected entity of same type
-            if let Some(candidates) = type_names.get(&e.entity_type) {
-                let mut best: Option<(i64, usize)> = None;
-                for (cid, cname) in candidates {
-                    if *cid == e.id {
-                        continue;
-                    }
-                    // Island name is prefix of connected entity
-                    if cname.starts_with(&lower) && cname.len() > lower.len() {
-                        let next_char = cname.as_bytes()[lower.len()];
-                        if next_char == b' ' || next_char == b'-' {
-                            // Prefer shorter connected names (closer match)
-                            if best.is_none() || cname.len() < best.unwrap().1 {
-                                best = Some((*cid, cname.len()));
-                            }
+            let mut best: Option<(i64, usize, bool)> = None; // (id, len, same_type)
+            for (cid, cname, ctype) in &all_connected_names {
+                if *cid == e.id {
+                    continue;
+                }
+                // Island name is prefix of connected entity
+                if cname.starts_with(&lower) && cname.len() > lower.len() {
+                    let next_char = cname.as_bytes()[lower.len()];
+                    if next_char == b' ' || next_char == b'-' {
+                        let same_type = ctype == &e.entity_type;
+                        if !same_type && !compatible_types(&e.entity_type, ctype) {
+                            continue;
                         }
-                    }
-                    // Connected name is prefix of island (island is more specific)
-                    if lower.starts_with(cname.as_str()) && lower.len() > cname.len() {
-                        let next_char = lower.as_bytes()[cname.len()];
-                        if next_char == b' ' || next_char == b'-' {
-                            // Link rather than merge (island is a more specific variant)
-                            // Will be handled by decompose_compound_entities
+                        // Prefer same-type matches, then shorter names
+                        let dominated = best.map_or(false, |(_, blen, bsame)| {
+                            (same_type && !bsame) || (same_type == bsame && cname.len() < blen)
+                        });
+                        if best.is_none() || dominated {
+                            best = Some((*cid, cname.len(), same_type));
                         }
                     }
                 }
-                if let Some((target_id, _)) = best {
-                    self.brain.merge_entities(e.id, target_id)?;
-                    absorbed.insert(e.id);
-                    merged += 1;
-                }
+            }
+            if let Some((target_id, _, _)) = best {
+                self.brain.merge_entities(e.id, target_id)?;
+                absorbed.insert(e.id);
+                merged += 1;
             }
         }
         Ok(merged)
@@ -3697,6 +3714,75 @@ impl<'a> Prometheus<'a> {
             }
         }
         Ok(merged)
+    }
+
+    /// Purge single-word island entities that are clearly fragments of known multi-word
+    /// connected entities. E.g., "Lovelace" when "Ada Lovelace" exists connected,
+    /// "Hopper" when "Grace Hopper" exists connected.
+    /// Only purges when the single word appears in ≥2 connected entity names of its type.
+    /// Returns count of entities removed.
+    pub fn purge_fragment_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Build index: for each word, which connected entities contain it?
+        let mut word_to_connected: HashMap<String, Vec<i64>> = HashMap::new();
+        for e in &entities {
+            if connected.contains(&e.id)
+                && !is_noise_type(&e.entity_type)
+                && !is_noise_name(&e.name)
+                && e.name.contains(' ')
+            {
+                for word in e.name.split_whitespace() {
+                    let lower = word.to_lowercase();
+                    if lower.len() >= 3 {
+                        word_to_connected.entry(lower).or_default().push(e.id);
+                    }
+                }
+            }
+        }
+
+        let mut removed = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            // Only target single-word islands
+            if e.name.contains(' ') || e.name.len() < 3 {
+                continue;
+            }
+            if is_noise_type(&e.entity_type) {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            // Check if this word appears as a component of connected entities
+            if let Some(matches) = word_to_connected.get(&lower) {
+                if matches.len() >= 1 {
+                    // This single word is a fragment of at least one known entity
+                    // Check if it has any facts worth keeping
+                    let facts = self.brain.get_facts_for(e.id)?;
+                    if facts.is_empty() {
+                        // If there's exactly one match, merge into it
+                        if matches.len() == 1 {
+                            self.brain.merge_entities(e.id, matches[0])?;
+                        } else {
+                            // Multiple matches — just delete the fragment
+                            self.brain.with_conn(|conn| {
+                                conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                                Ok(())
+                            })?;
+                        }
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        Ok(removed)
     }
 
     /// Suffix-strip island merge: for island entities like "Ada Lovelace WIRED",
@@ -4479,6 +4565,136 @@ fn is_common_english_word(lower: &str) -> bool {
         "bibliothèque",
         "musique",
         "conseil",
+        // Common nouns that appear as capitalized island entities
+        "structure",
+        "formation",
+        "electric",
+        "graph",
+        "problem",
+        "changes",
+        "names",
+        "upper",
+        "studies",
+        "addresses",
+        "accuracy",
+        "acoustics",
+        "adulthood",
+        "advancements",
+        "afterwards",
+        "lab",
+        "bay",
+        "base",
+        "stem",
+        "pass",
+        "quart",
+        "manus",
+        "court",
+        "office",
+        "sea",
+        "matter",
+        "engine",
+        "climate",
+        "difference",
+        "federal",
+        "church",
+        "states",
+        "catholic",
+        "reformed",
+        "american",
+        "scientific",
+        "monthly",
+        "notices",
+        "colloquium",
+        "academic",
+        "accepted",
+        "adiabatic",
+        "chapters",
+        "principles",
+        "applications",
+        "communications",
+        "mechanics",
+        "dynamics",
+        "thermodynamics",
+        "optics",
+        "physics",
+        "chemistry",
+        "biology",
+        "geometry",
+        "algebra",
+        "calculus",
+        "statistics",
+        "probability",
+        "topology",
+        "engineering",
+        "architecture",
+        "philosophy",
+        "psychology",
+        "sociology",
+        "anthropology",
+        "economics",
+        "politics",
+        "diplomacy",
+        "agriculture",
+        "industry",
+        "commerce",
+        "infrastructure",
+        "parliament",
+        "congress",
+        "senate",
+        "democracy",
+        "monarchy",
+        "aristocracy",
+        "bureaucracy",
+        "independence",
+        "sovereignty",
+        "territory",
+        "population",
+        "immigration",
+        "emigration",
+        "colonization",
+        "modernization",
+        "industrialization",
+        "urbanization",
+        "globalization",
+        "reformation",
+        "enlightenment",
+        "renaissance",
+        "conquest",
+        "invasion",
+        "rebellion",
+        "uprising",
+        "coup",
+        "siege",
+        "battle",
+        "campaign",
+        "alliance",
+        "treaty",
+        "armistice",
+        "ceasefire",
+        "occupation",
+        "liberation",
+        "resistance",
+        "propaganda",
+        "censorship",
+        "persecution",
+        "genocide",
+        "massacre",
+        "famine",
+        "plague",
+        "epidemic",
+        "pandemic",
+        "drought",
+        "flood",
+        "earthquake",
+        "volcano",
+        "tsunami",
+        "catastrophe",
+        "disaster",
+        "crisis",
+        "recession",
+        "depression",
+        "inflation",
+        "prosperity",
     ];
     COMMON_WORDS.contains(&lower)
 }
