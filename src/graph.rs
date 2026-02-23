@@ -2271,6 +2271,112 @@ mod tests {
 /// This is better than Jaccard for hub-heavy graphs because it normalizes
 /// by the smaller neighborhood, making it robust to degree imbalance.
 /// Returns (entity_a_id, entity_b_id, overlap_score) sorted by score desc.
+/// Degree assortativity coefficient — measures whether high-degree nodes connect
+/// to other high-degree nodes (positive) or low-degree nodes (negative).
+/// Returns r ∈ [-1, 1]. Positive = assortative, negative = disassortative.
+pub fn degree_assortativity(brain: &Brain) -> Result<f64, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let relations = brain.all_relations()?;
+
+    if relations.is_empty() {
+        return Ok(0.0);
+    }
+
+    // Each undirected edge contributes once: (deg(u), deg(v))
+    let mut seen: HashSet<(i64, i64)> = HashSet::new();
+    let mut sum_xy = 0.0_f64;
+    let mut sum_x = 0.0_f64;
+    let mut sum_y = 0.0_f64;
+    let mut sum_x2 = 0.0_f64;
+    let mut sum_y2 = 0.0_f64;
+    let mut m = 0.0_f64;
+
+    for r in &relations {
+        let key = if r.subject_id < r.object_id {
+            (r.subject_id, r.object_id)
+        } else {
+            (r.object_id, r.subject_id)
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+        let dx = adj.get(&r.subject_id).map(|v| v.len()).unwrap_or(0) as f64;
+        let dy = adj.get(&r.object_id).map(|v| v.len()).unwrap_or(0) as f64;
+        sum_xy += dx * dy;
+        sum_x += dx;
+        sum_y += dy;
+        sum_x2 += dx * dx;
+        sum_y2 += dy * dy;
+        m += 1.0;
+    }
+
+    if m == 0.0 {
+        return Ok(0.0);
+    }
+
+    let numerator = sum_xy / m - (sum_x / m) * (sum_y / m);
+    let denom = ((sum_x2 / m - (sum_x / m).powi(2)) * (sum_y2 / m - (sum_y / m).powi(2))).sqrt();
+
+    if denom < 1e-12 {
+        Ok(0.0)
+    } else {
+        Ok(numerator / denom)
+    }
+}
+
+/// Type assortativity — fraction of edges connecting same-type entities.
+/// Higher values mean entities tend to connect within their type.
+pub fn type_assortativity(brain: &Brain) -> Result<(f64, HashMap<String, f64>), rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let relations = brain.all_relations()?;
+    let id_type: HashMap<i64, String> = entities
+        .iter()
+        .map(|e| (e.id, e.entity_type.clone()))
+        .collect();
+
+    let mut total = 0usize;
+    let mut same_type = 0usize;
+    let mut type_same: HashMap<String, usize> = HashMap::new();
+    let mut type_total: HashMap<String, usize> = HashMap::new();
+
+    for r in &relations {
+        let st = id_type
+            .get(&r.subject_id)
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+        let ot = id_type.get(&r.object_id).map(|s| s.as_str()).unwrap_or("?");
+        total += 1;
+        *type_total.entry(st.to_string()).or_insert(0) += 1;
+        *type_total.entry(ot.to_string()).or_insert(0) += 1;
+        if st == ot {
+            same_type += 1;
+            *type_same.entry(st.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let global = if total > 0 {
+        same_type as f64 / total as f64
+    } else {
+        0.0
+    };
+    let per_type: HashMap<String, f64> = type_total
+        .iter()
+        .map(|(t, &tot)| {
+            let s = type_same.get(t).copied().unwrap_or(0);
+            (
+                t.clone(),
+                if tot > 0 {
+                    s as f64 * 2.0 / tot as f64
+                } else {
+                    0.0
+                },
+            )
+        })
+        .collect();
+
+    Ok((global, per_type))
+}
+
 pub fn neighborhood_overlap(
     brain: &Brain,
     min_score: f64,

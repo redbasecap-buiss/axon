@@ -2363,6 +2363,13 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(no_hyps);
         }
 
+        // 2k. Triadic closure (open triads with ≥2 mutual neighbors)
+        let tc_weight = self.get_pattern_weight("triadic_closure")?;
+        if tc_weight >= 0.05 {
+            let tc_hyps = self.generate_hypotheses_from_triadic_closure()?;
+            all_hypotheses.extend(tc_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -6764,6 +6771,128 @@ impl<'a> Prometheus<'a> {
         Ok(hypotheses)
     }
 
+    /// Triadic closure hypothesis generation: if A→B and B→C but not A→C,
+    /// and A and C are of compatible types, hypothesize A→C.
+    /// Weighted by number of distinct intermediaries (more paths = higher confidence).
+    pub fn generate_hypotheses_from_triadic_closure(&self) -> Result<Vec<Hypothesis>> {
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let entities = self.brain.all_entities()?;
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Build adjacency with predicate info
+        let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+        let mut edge_preds: HashMap<(i64, i64), String> = HashMap::new();
+        for r in &relations {
+            if !meaningful.contains(&r.subject_id) || !meaningful.contains(&r.object_id) {
+                continue;
+            }
+            adj.entry(r.subject_id).or_default().insert(r.object_id);
+            adj.entry(r.object_id).or_default().insert(r.subject_id);
+            let key = if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            };
+            edge_preds.entry(key).or_insert_with(|| r.predicate.clone());
+        }
+
+        // Direct edge set
+        let direct: HashSet<(i64, i64)> = edge_preds.keys().copied().collect();
+
+        // Find open triads: A-B-C where A and C are not connected
+        // For efficiency, only consider nodes with degree 3..100
+        let candidates: Vec<i64> = adj
+            .iter()
+            .filter(|(_, nb)| nb.len() >= 3 && nb.len() <= 100)
+            .map(|(&id, _)| id)
+            .collect();
+
+        // Count intermediaries for each (A,C) pair
+        let mut pair_intermediaries: HashMap<(i64, i64), Vec<i64>> = HashMap::new();
+        for &b in &candidates {
+            let nb: Vec<i64> = adj[&b].iter().copied().collect();
+            // Cap to avoid O(n²) within large neighborhoods
+            if nb.len() > 80 {
+                continue;
+            }
+            for i in 0..nb.len() {
+                for j in (i + 1)..nb.len() {
+                    let a = nb[i].min(nb[j]);
+                    let c = nb[i].max(nb[j]);
+                    if !direct.contains(&(a, c)) {
+                        pair_intermediaries.entry((a, c)).or_default().push(b);
+                    }
+                }
+            }
+        }
+
+        // Only generate hypotheses for pairs with ≥2 intermediaries (strong triadic signal)
+        let mut scored: Vec<((i64, i64), usize)> = pair_intermediaries
+            .iter()
+            .filter(|(_, intermediaries)| intermediaries.len() >= 2)
+            .map(|(&pair, intermediaries)| (pair, intermediaries.len()))
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.truncate(50);
+
+        let mut hypotheses = Vec::new();
+        for ((a, c), count) in scored {
+            let a_name = id_name.get(&a).copied().unwrap_or("?");
+            let c_name = id_name.get(&c).copied().unwrap_or("?");
+            let a_type = id_type.get(&a).copied().unwrap_or("?");
+            let c_type = id_type.get(&c).copied().unwrap_or("?");
+
+            if is_noise_name(a_name) || is_noise_name(c_name) {
+                continue;
+            }
+
+            let predicate = match (a_type, c_type) {
+                ("person", "person") => "contemporary_of",
+                ("concept", "concept") => "related_concept",
+                ("place", "place") => "associated_with",
+                ("person", "organization") | ("organization", "person") => "affiliated_with",
+                _ => "related_to",
+            };
+
+            let intermediary_names: Vec<String> = pair_intermediaries[&(a, c)]
+                .iter()
+                .take(5)
+                .filter_map(|&id| id_name.get(&id).map(|n| n.to_string()))
+                .collect();
+
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.to_string(),
+                predicate: predicate.to_string(),
+                object: c_name.to_string(),
+                confidence: 0.40 + (count as f64 * 0.08).min(0.35),
+                evidence_for: vec![format!(
+                    "{} and {} share {} mutual connections: {}",
+                    a_name,
+                    c_name,
+                    count,
+                    intermediary_names.join(", ")
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!("Triadic closure: {} mutual neighbors", count),
+                    format!("Intermediaries: {}", intermediary_names.join(", ")),
+                    "Open triads tend to close in real-world networks".to_string(),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "triadic_closure".to_string(),
+            });
+        }
+        Ok(hypotheses)
+    }
+
     /// Aggressively purge single-word island entities that are clearly generic English words,
     /// citation surnames, adverbs, or adjectives. These entities have zero relations and
     /// zero facts — they contribute nothing to the knowledge graph.
@@ -7904,6 +8033,128 @@ impl<'a> Prometheus<'a> {
             "order",
             "courier",
             "herald",
+            // Common English words that cause spurious token matches
+            "you",
+            "your",
+            "all",
+            "one",
+            "two",
+            "three",
+            "first",
+            "last",
+            "next",
+            "only",
+            "just",
+            "more",
+            "most",
+            "some",
+            "many",
+            "any",
+            "each",
+            "every",
+            "other",
+            "such",
+            "same",
+            "way",
+            "day",
+            "year",
+            "man",
+            "men",
+            "out",
+            "into",
+            "over",
+            "also",
+            "after",
+            "before",
+            "how",
+            "why",
+            "what",
+            "when",
+            "where",
+            "there",
+            "here",
+            "about",
+            "between",
+            "through",
+            "during",
+            "under",
+            "along",
+            "both",
+            "well",
+            "back",
+            "even",
+            "still",
+            "then",
+            "than",
+            "very",
+            "too",
+            "much",
+            "now",
+            "long",
+            "made",
+            "make",
+            "like",
+            "will",
+            "can",
+            "may",
+            "could",
+            "would",
+            "should",
+            "use",
+            "used",
+            "core",
+            "easy",
+            "fast",
+            "high",
+            "low",
+            "left",
+            "right",
+            "real",
+            "true",
+            "full",
+            "good",
+            "best",
+            "need",
+            "take",
+            "give",
+            "find",
+            "know",
+            "come",
+            "part",
+            "work",
+            "world",
+            "life",
+            "being",
+            "place",
+            "thing",
+            "point",
+            "small",
+            "large",
+            "early",
+            "late",
+            "half",
+            "end",
+            "side",
+            "line",
+            "land",
+            "head",
+            "hand",
+            "eye",
+            "face",
+            "book",
+            "war",
+            "bury",
+            "compare",
+            "finally",
+            "scientist",
+            "tri",
+            "bin",
+            "hasan",
+            "webb",
+            "revenge",
+            "encoder",
+            "belt",
+            "road",
         ]
         .into_iter()
         .collect();
