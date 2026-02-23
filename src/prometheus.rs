@@ -2332,6 +2332,12 @@ impl<'a> Prometheus<'a> {
         // Purge single-word concept islands (adjectives, common nouns, non-English stubs)
         let concept_islands_purged = self.purge_single_word_concept_islands().unwrap_or(0);
 
+        // Purge mistyped person islands (multi-word "person" entities that aren't people)
+        let mistyped_person_purged = self.purge_mistyped_person_islands().unwrap_or(0);
+
+        // Token-based island reconnection (TF-IDF shared token matching)
+        let token_reconnected = self.reconnect_islands_by_tokens().unwrap_or(0);
+
         // Refine associated_with predicates using entity type pairs
         let predicates_refined = self.refine_associated_with().unwrap_or(0);
 
@@ -2384,7 +2390,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} predicates refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} token-reconnected, {} predicates refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -2444,6 +2450,8 @@ impl<'a> Prometheus<'a> {
             multiword_purged,
             fragment_islands_purged,
             concept_islands_purged,
+            mistyped_person_purged,
+            token_reconnected,
             predicates_refined,
             promoted,
             pair_deduped,
@@ -7253,6 +7261,497 @@ impl<'a> Prometheus<'a> {
         scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         scores.truncate(limit);
         Ok(scores)
+    }
+
+    /// Token-based island reconnection: match island entities to connected entities
+    /// via significant shared name tokens. E.g., island "Möngke Khan" connects to
+    /// "Genghis Khan" via shared token "Khan". Uses TF-IDF-like weighting — rare
+    /// tokens that appear in few entity names are more informative than common ones.
+    /// Only connects when the shared tokens are significant (not stopwords, not too common).
+    pub fn reconnect_islands_by_tokens(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Build direct-connection set
+        let mut edges: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            let key = if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            };
+            edges.insert(key);
+        }
+
+        // Tokenize all entity names, compute document frequency per token
+        let stopwords: HashSet<&str> = [
+            "the", "of", "and", "in", "on", "for", "to", "by", "from", "with", "at", "an", "or",
+            "a", "is", "was", "are", "were", "be", "been", "has", "had", "have", "do", "does",
+            "did", "not", "no", "but", "if", "as", "it", "its", "his", "her", "he", "she", "they",
+            "their", "this", "that", "which", "who", "whom", "de", "la", "le", "les", "du", "des",
+            "von", "van", "der", "den", "di", "el",
+        ]
+        .into_iter()
+        .collect();
+
+        // Token → entity IDs (only for meaningful, non-noise entities)
+        let mut token_entities: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut entity_tokens: HashMap<i64, Vec<String>> = HashMap::new();
+        let entity_map: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+
+        for e in &entities {
+            if !meaningful.contains(&e.id)
+                || is_noise_name(&e.name)
+                || is_noise_type(&e.entity_type)
+            {
+                continue;
+            }
+            let tokens: Vec<String> = e
+                .name
+                .split_whitespace()
+                .filter(|w| w.len() >= 3 && !stopwords.contains(&w.to_lowercase().as_str()))
+                .map(|w| w.to_lowercase())
+                .collect();
+            for t in &tokens {
+                token_entities.entry(t.clone()).or_default().push(e.id);
+            }
+            entity_tokens.insert(e.id, tokens);
+        }
+
+        let total_entities = entities.len().max(1) as f64;
+
+        // For each island entity, find best connected match via shared significant tokens
+        let mut reconnected = 0usize;
+        let islands: Vec<i64> = entities
+            .iter()
+            .filter(|e| {
+                meaningful.contains(&e.id)
+                    && !connected.contains(&e.id)
+                    && !is_noise_name(&e.name)
+                    && !is_noise_type(&e.entity_type)
+                    && e.name.split_whitespace().count() >= 2 // At least 2-word names for token matching
+            })
+            .map(|e| e.id)
+            .collect();
+
+        for &island_id in &islands {
+            let island_toks = match entity_tokens.get(&island_id) {
+                Some(t) if !t.is_empty() => t,
+                _ => continue,
+            };
+
+            // Score each connected entity by TF-IDF-like shared token weight
+            let mut candidates: HashMap<i64, f64> = HashMap::new();
+            for tok in island_toks {
+                let doc_freq = token_entities.get(tok).map(|v| v.len()).unwrap_or(0) as f64;
+                if doc_freq < 2.0 || doc_freq > total_entities * 0.1 {
+                    continue; // Too rare (unique to island) or too common
+                }
+                let idf = (total_entities / doc_freq).ln();
+                if let Some(matching_ids) = token_entities.get(tok) {
+                    for &mid in matching_ids {
+                        if mid == island_id || !connected.contains(&mid) {
+                            continue;
+                        }
+                        let key = if island_id < mid {
+                            (island_id, mid)
+                        } else {
+                            (mid, island_id)
+                        };
+                        if edges.contains(&key) {
+                            continue;
+                        }
+                        *candidates.entry(mid).or_insert(0.0) += idf;
+                    }
+                }
+            }
+
+            // Find best candidate — require minimum score (at least 1 significant shared token)
+            if let Some((&best_id, &best_score)) = candidates
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                if best_score < 1.5 {
+                    continue; // Not significant enough
+                }
+                let island_name = entity_map
+                    .get(&island_id)
+                    .map(|e| e.name.as_str())
+                    .unwrap_or("?");
+                let target_name = entity_map
+                    .get(&best_id)
+                    .map(|e| e.name.as_str())
+                    .unwrap_or("?");
+                let island_type = entity_map
+                    .get(&island_id)
+                    .map(|e| e.entity_type.as_str())
+                    .unwrap_or("?");
+                let target_type = entity_map
+                    .get(&best_id)
+                    .map(|e| e.entity_type.as_str())
+                    .unwrap_or("?");
+
+                // Determine predicate based on types
+                let predicate = match (island_type, target_type) {
+                    ("person", "person") => "contemporary_of",
+                    ("place", "place") => "associated_with",
+                    ("concept", "concept") => "related_concept",
+                    ("person", "organization") | ("organization", "person") => "affiliated_with",
+                    ("person", "place") | ("place", "person") => "associated_with",
+                    _ => "associated_with",
+                };
+
+                eprintln!(
+                    "  [token-reconnect] {} → {} (score: {:.2}, pred: {})",
+                    island_name, target_name, best_score, predicate
+                );
+                self.brain.upsert_relation(
+                    island_id,
+                    predicate,
+                    best_id,
+                    "prometheus:token_reconnect",
+                )?;
+                reconnected += 1;
+                if reconnected >= 100 {
+                    break; // Cap per run
+                }
+            }
+        }
+        Ok(reconnected)
+    }
+
+    /// Purge island entities mistyped as "person" that are clearly not people.
+    /// Catches patterns like "Gravitational Waves" (concept), "Modern Japan" (place/concept),
+    /// "Collected Works" (concept), etc.
+    pub fn purge_mistyped_person_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Non-person indicators: words that strongly suggest the entity is NOT a person
+        let concept_words: HashSet<&str> = [
+            "waves",
+            "theory",
+            "theorem",
+            "equation",
+            "equations",
+            "method",
+            "methods",
+            "algorithm",
+            "process",
+            "effect",
+            "phenomenon",
+            "principle",
+            "law",
+            "laws",
+            "paradox",
+            "conjecture",
+            "hypothesis",
+            "model",
+            "formula",
+            "series",
+            "function",
+            "transform",
+            "distribution",
+            "constant",
+            "number",
+            "numbers",
+            "problem",
+            "space",
+            "group",
+            "ring",
+            "field",
+            "operator",
+            "integral",
+            "differential",
+            "system",
+            "systems",
+            "machine",
+            "engine",
+            "device",
+            "network",
+            "protocol",
+            "code",
+            "language",
+            "architecture",
+            "framework",
+            "structure",
+            "works",
+            "collection",
+            "collected",
+            "correspondence",
+            "letters",
+            "papers",
+            "manuscript",
+            "text",
+            "book",
+            "edition",
+            "volume",
+            "treaty",
+            "declaration",
+            "manifesto",
+            "charter",
+            "revolution",
+            "movement",
+            "campaign",
+            "battle",
+            "war",
+            "siege",
+            "invasion",
+            "expedition",
+            "conquest",
+            "migration",
+            "diaspora",
+            "genocide",
+            "massacre",
+            "crisis",
+            "reform",
+            "policy",
+            "agreement",
+            "alliance",
+            "coalition",
+            "prices",
+            "trade",
+            "market",
+            "economy",
+            "currency",
+            "values",
+            "money",
+            "modern",
+            "ancient",
+            "medieval",
+            "classical",
+            "contemporary",
+            "early",
+            "late",
+            "online",
+            "digital",
+            "virtual",
+            "mobile",
+            "wireless",
+        ]
+        .into_iter()
+        .collect();
+
+        let place_words: HashSet<&str> = [
+            "japan",
+            "china",
+            "india",
+            "europe",
+            "asia",
+            "africa",
+            "america",
+            "russia",
+            "france",
+            "germany",
+            "england",
+            "spain",
+            "italy",
+            "greece",
+            "egypt",
+            "persia",
+            "arabia",
+            "ottoman",
+            "byzantine",
+            "roman",
+            "british",
+            "french",
+            "german",
+            "danish",
+            "english",
+            "swedish",
+            "norwegian",
+            "finnish",
+            "dutch",
+            "polish",
+            "czech",
+            "hungarian",
+            "austrian",
+            "swiss",
+            "scottish",
+            "irish",
+            "welsh",
+        ]
+        .into_iter()
+        .collect();
+
+        let mut purged = 0usize;
+        for e in &entities {
+            if e.entity_type != "person" || connected.contains(&e.id) {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 {
+                continue; // Single-word handled elsewhere
+            }
+            let lower_words: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+
+            // Check if any word is a strong non-person indicator
+            let has_concept_word = lower_words
+                .iter()
+                .any(|w| concept_words.contains(w.as_str()));
+            let has_place_word = lower_words.iter().any(|w| place_words.contains(w.as_str()));
+
+            if has_concept_word || has_place_word {
+                // Double check: does it look like "Firstname ConceptWord"? (e.g., "Ada Works" is noise)
+                // But "Isaac Newton" should NOT match — "Newton" isn't in concept_words
+                eprintln!(
+                    "  [mistyped-person-purge] deleting island '{}' (id={})",
+                    e.name, e.id
+                );
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                    Ok(())
+                })?;
+                purged += 1;
+            }
+        }
+        Ok(purged)
+    }
+
+    /// Cross-type token bridge: find pairs of entities of different types that share
+    /// significant name tokens and are in different components, suggesting a bridge.
+    /// E.g., "Bayesian Learning" (concept) and "Thomas Bayes" (person) share "Bayes/Bayesian".
+    /// Returns (entity_a_name, entity_b_name, shared_tokens, bridge_value).
+    pub fn find_cross_type_token_bridges(&self) -> Result<Vec<(String, String, Vec<String>, f64)>> {
+        let entities = self.brain.all_entities()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let relations = self.brain.all_relations()?;
+
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Only consider connected entities with decent types
+        let high_value: HashSet<&str> = [
+            "person",
+            "organization",
+            "concept",
+            "technology",
+            "place",
+            "company",
+        ]
+        .into_iter()
+        .collect();
+
+        // Build stem → entity mapping (simple: lowercase, strip trailing 's', 'ed', 'ing')
+        fn stem(word: &str) -> String {
+            let w = word.to_lowercase();
+            if w.len() > 4 {
+                if let Some(s) = w.strip_suffix("ing") {
+                    return s.to_string();
+                }
+                if let Some(s) = w.strip_suffix("ed") {
+                    return s.to_string();
+                }
+                if let Some(s) = w.strip_suffix("ian") {
+                    return s.to_string();
+                }
+                if let Some(s) = w.strip_suffix("ean") {
+                    return s.to_string();
+                }
+            }
+            if w.len() > 3 {
+                if let Some(s) = w.strip_suffix('s') {
+                    return s.to_string();
+                }
+            }
+            w
+        }
+
+        let stopwords: HashSet<&str> = [
+            "the", "of", "and", "in", "on", "for", "to", "by", "from", "with",
+        ]
+        .into_iter()
+        .collect();
+
+        let mut stem_entities: HashMap<String, Vec<i64>> = HashMap::new();
+        let entity_map: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+
+        for e in &entities {
+            if !meaningful.contains(&e.id)
+                || !high_value.contains(e.entity_type.as_str())
+                || !connected.contains(&e.id)
+            {
+                continue;
+            }
+            for word in e.name.split_whitespace() {
+                if word.len() < 3 || stopwords.contains(&word.to_lowercase().as_str()) {
+                    continue;
+                }
+                let s = stem(word);
+                if s.len() >= 3 {
+                    stem_entities.entry(s).or_default().push(e.id);
+                }
+            }
+        }
+
+        // Find cross-type pairs sharing stems
+        let mut edges: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            let key = if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            };
+            edges.insert(key);
+        }
+
+        let mut bridges: Vec<(String, String, Vec<String>, f64)> = Vec::new();
+        let mut seen_pairs: HashSet<(i64, i64)> = HashSet::new();
+
+        for (stem_word, eids) in &stem_entities {
+            if eids.len() < 2 || eids.len() > 50 {
+                continue; // Too unique or too common
+            }
+            for i in 0..eids.len().min(20) {
+                for j in (i + 1)..eids.len().min(20) {
+                    let a = eids[i];
+                    let b = eids[j];
+                    let key = if a < b { (a, b) } else { (b, a) };
+                    if edges.contains(&key) || !seen_pairs.insert(key) {
+                        continue;
+                    }
+                    let type_a = entity_map
+                        .get(&a)
+                        .map(|e| e.entity_type.as_str())
+                        .unwrap_or("");
+                    let type_b = entity_map
+                        .get(&b)
+                        .map(|e| e.entity_type.as_str())
+                        .unwrap_or("");
+                    if type_a == type_b {
+                        continue; // Same type — not a cross-type bridge
+                    }
+                    let name_a = entity_map.get(&a).map(|e| e.name.as_str()).unwrap_or("");
+                    let name_b = entity_map.get(&b).map(|e| e.name.as_str()).unwrap_or("");
+                    bridges.push((
+                        name_a.to_string(),
+                        name_b.to_string(),
+                        vec![stem_word.clone()],
+                        1.0,
+                    ));
+                }
+            }
+        }
+
+        bridges.truncate(50);
+        Ok(bridges)
     }
 }
 

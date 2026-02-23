@@ -1579,6 +1579,61 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "mind",
     "coat",
     "tool",
+    // Short single-word noise that keeps appearing
+    "area",
+    "bang",
+    "blog",
+    "book",
+    "bulk",
+    "call",
+    "case",
+    "code",
+    "cold",
+    "drop",
+    "dust",
+    "fall",
+    "fine",
+    "food",
+    "glow",
+    "guru",
+    "halt",
+    "hand",
+    "keen",
+    "know",
+    "laws",
+    "lazy",
+    "life",
+    "link",
+    "load",
+    "lust",
+    "mock",
+    "moon",
+    "much",
+    "neon",
+    "past",
+    "path",
+    "post",
+    "push",
+    "rear",
+    "role",
+    "roof",
+    "sept",
+    "sons",
+    "thus",
+    "tour",
+    "true",
+    "west",
+    "wiki",
+    "zero",
+    "icon",
+    "flow",
+    "slim",
+    "play",
+    "ones",
+    "aeon",
+    "bold",
+    "mine",
+    "chap",
     // Generic nouns/adjectives that appear as single-word false entities
     "atoms",
     "audio",
@@ -1999,6 +2054,11 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
                 return false;
             }
         }
+    }
+
+    // Reject CITEREF citation keys (e.g. "CITEREFWilkinson2012")
+    if lower.starts_with("citeref") || lower.contains("citeref") {
+        return false;
     }
 
     // Reject Wikipedia language sidebar entries (e.g. "Afrikaans Alemannisch", "Lombard Latviešu")
