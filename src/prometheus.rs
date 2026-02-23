@@ -1695,11 +1695,17 @@ impl<'a> Prometheus<'a> {
         // Island reconnection
         let reconnected = self.reconnect_islands().unwrap_or(0);
 
-        // Fact-based relation inference (new: creates relations from facts)
+        // Fact-based relation inference
         let fact_inferred = self.infer_relations_from_facts().unwrap_or(0);
 
-        // Entity name cross-referencing (new: links entities mentioned in other entity names)
+        // Entity name cross-referencing
         let name_crossrefs = self.crossref_entity_names().unwrap_or(0);
+
+        // Compound entity decomposition (break "Ada Lovelace Building" → named_after → "Ada Lovelace")
+        let (compound_rels, compound_merged) = self.decompose_compound_entities().unwrap_or((0, 0));
+
+        // Prefix island consolidation (merge "Euler" island → "Leonhard Euler" connected)
+        let prefix_merged = self.consolidate_prefix_islands().unwrap_or(0);
 
         let summary = format!(
             "Discovered {} patterns, generated {} new hypotheses ({} confirmed, {} rejected), \
@@ -1710,7 +1716,8 @@ impl<'a> Prometheus<'a> {
              {} fuzzy duplicates ({} auto-merge, {} auto-merged), {} sparse topic domains, \
              {} name subsumptions found, {} types fixed, {} noise entities purged, \
              {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected, \
-             {} fact-inferred relations, {} name cross-references",
+             {} fact-inferred relations, {} name cross-references, \
+             {} compound relations + {} compound merged, {} prefix-merged",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1743,6 +1750,9 @@ impl<'a> Prometheus<'a> {
             reconnected,
             fact_inferred,
             name_crossrefs,
+            compound_rels,
+            compound_merged,
+            prefix_merged,
         );
 
         Ok(DiscoveryReport {
@@ -3237,6 +3247,242 @@ impl<'a> Prometheus<'a> {
             }
         }
         Ok(created)
+    }
+
+    /// Decompose compound entity names into base entity + qualifier.
+    /// E.g., "Ada Lovelace Building" → relates to existing "Ada Lovelace" entity
+    /// with predicate "named_after". Also handles patterns like:
+    /// - "X Award" → X + Award concept
+    /// - "X Institute" → X + organization  
+    /// - "X Day" → X + event
+    /// Returns count of new relations created and entities cleaned up.
+    pub fn decompose_compound_entities(&self) -> Result<(usize, usize)> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Build name→id lookup for connected entities (these are the "real" entities)
+        let mut name_to_id: HashMap<String, i64> = HashMap::new();
+        for e in &entities {
+            if connected.contains(&e.id)
+                && !is_noise_name(&e.name)
+                && !is_noise_type(&e.entity_type)
+            {
+                name_to_id.insert(e.name.to_lowercase(), e.id);
+            }
+        }
+        // Also include high-confidence islands
+        for e in &entities {
+            if !connected.contains(&e.id) && e.confidence >= 0.8 && !is_noise_name(&e.name) {
+                name_to_id.entry(e.name.to_lowercase()).or_insert(e.id);
+            }
+        }
+
+        // Qualifier suffixes that indicate compound entities
+        let qualifier_map: &[(&str, &str)] = &[
+            ("building", "named_after"),
+            ("house", "named_after"),
+            ("suite", "named_after"),
+            ("center", "named_after"),
+            ("centre", "named_after"),
+            ("institute", "named_after"),
+            ("foundation", "named_after"),
+            ("award", "named_after"),
+            ("prize", "named_after"),
+            ("day", "named_after"),
+            ("biography", "subject_of"),
+            ("original", "variant_of"),
+            ("countess", "title_of"),
+            ("theorem", "attributed_to"),
+            ("equation", "attributed_to"),
+            ("principle", "attributed_to"),
+            ("law", "attributed_to"),
+            ("conjecture", "attributed_to"),
+            ("paradox", "attributed_to"),
+            ("constant", "attributed_to"),
+            ("transform", "attributed_to"),
+            ("distribution", "attributed_to"),
+            ("method", "attributed_to"),
+            ("algorithm", "attributed_to"),
+            ("bridge", "named_after"),
+            ("tower", "named_after"),
+            ("park", "named_after"),
+            ("university", "named_after"),
+            ("college", "named_after"),
+            ("school", "named_after"),
+            ("museum", "named_after"),
+            ("library", "named_after"),
+            ("hospital", "named_after"),
+            ("airport", "named_after"),
+            ("station", "named_after"),
+            ("square", "named_after"),
+            ("street", "named_after"),
+        ];
+
+        let mut relations_created = 0usize;
+        let mut entities_merged = 0usize;
+        let mut existing_rels: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            existing_rels.insert((r.subject_id, r.object_id));
+        }
+
+        for e in &entities {
+            if is_noise_name(&e.name) || is_noise_type(&e.entity_type) {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            let words: Vec<&str> = lower.split_whitespace().collect();
+            if words.len() < 2 {
+                continue;
+            }
+
+            // Check if the last word is a qualifier
+            let last = *words.last().unwrap();
+            let qualifier_pred = qualifier_map
+                .iter()
+                .find(|(q, _)| *q == last)
+                .map(|(_, p)| *p);
+
+            if let Some(pred) = qualifier_pred {
+                // Try progressively shorter prefixes to find a matching base entity
+                for prefix_len in (1..words.len()).rev() {
+                    let prefix: String = words[..prefix_len].join(" ");
+                    if let Some(&base_id) = name_to_id.get(&prefix) {
+                        if base_id != e.id && !existing_rels.contains(&(e.id, base_id)) {
+                            self.brain.upsert_relation(e.id, pred, base_id, "")?;
+                            existing_rels.insert((e.id, base_id));
+                            relations_created += 1;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Also handle "X Y Z" where "Y Z" is a known entity (e.g., "Babbage Ada Lovelace")
+            if words.len() >= 3 {
+                for split in 1..words.len() {
+                    let suffix: String = words[split..].join(" ");
+                    if let Some(&base_id) = name_to_id.get(&suffix) {
+                        if base_id != e.id && !existing_rels.contains(&(e.id, base_id)) {
+                            self.brain
+                                .upsert_relation(e.id, "references", base_id, "")?;
+                            existing_rels.insert((e.id, base_id));
+                            relations_created += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Merge truly redundant island entities: if an island "X Qualifier" has the same
+        // type as base entity "X" and the qualifier is just noise, merge into X
+        let noise_qualifiers: HashSet<&str> =
+            ["original", "wired", "founder"].iter().copied().collect();
+        let entities_refreshed = self.brain.all_entities()?;
+        for e in &entities_refreshed {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            let words: Vec<&str> = lower.split_whitespace().collect();
+            if words.len() < 2 {
+                continue;
+            }
+            let last = *words.last().unwrap();
+            if !noise_qualifiers.contains(last) {
+                continue;
+            }
+            let prefix: String = words[..words.len() - 1].join(" ");
+            if let Some(&base_id) = name_to_id.get(&prefix) {
+                if base_id != e.id {
+                    self.brain.merge_entities(e.id, base_id)?;
+                    entities_merged += 1;
+                }
+            }
+        }
+
+        Ok((relations_created, entities_merged))
+    }
+
+    /// Aggressive island consolidation: for each island entity, check if its name
+    /// is an exact prefix match of a connected entity (same type). If so, merge.
+    /// Handles cases like "Euler" (island) → "Leonhard Euler" (connected).
+    /// Returns count of merges.
+    pub fn consolidate_prefix_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Build connected entity names by type
+        let mut type_names: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+        for e in &entities {
+            if connected.contains(&e.id)
+                && !is_noise_name(&e.name)
+                && !is_noise_type(&e.entity_type)
+            {
+                type_names
+                    .entry(e.entity_type.clone())
+                    .or_default()
+                    .push((e.id, e.name.to_lowercase()));
+            }
+        }
+
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<i64> = HashSet::new();
+
+        for e in &entities {
+            if connected.contains(&e.id) || absorbed.contains(&e.id) {
+                continue;
+            }
+            if is_noise_name(&e.name) || is_noise_type(&e.entity_type) || e.name.len() < 4 {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+
+            // Check if this island's name is the beginning of a connected entity of same type
+            if let Some(candidates) = type_names.get(&e.entity_type) {
+                let mut best: Option<(i64, usize)> = None;
+                for (cid, cname) in candidates {
+                    if *cid == e.id {
+                        continue;
+                    }
+                    // Island name is prefix of connected entity
+                    if cname.starts_with(&lower) && cname.len() > lower.len() {
+                        let next_char = cname.as_bytes()[lower.len()];
+                        if next_char == b' ' || next_char == b'-' {
+                            // Prefer shorter connected names (closer match)
+                            if best.is_none() || cname.len() < best.unwrap().1 {
+                                best = Some((*cid, cname.len()));
+                            }
+                        }
+                    }
+                    // Connected name is prefix of island (island is more specific)
+                    if lower.starts_with(cname.as_str()) && lower.len() > cname.len() {
+                        let next_char = lower.as_bytes()[cname.len()];
+                        if next_char == b' ' || next_char == b'-' {
+                            // Link rather than merge (island is a more specific variant)
+                            // Will be handled by decompose_compound_entities
+                        }
+                    }
+                }
+                if let Some((target_id, _)) = best {
+                    self.brain.merge_entities(e.id, target_id)?;
+                    absorbed.insert(e.id);
+                    merged += 1;
+                }
+            }
+        }
+        Ok(merged)
     }
 
     fn entity_name(&self, id: i64) -> Result<String> {
