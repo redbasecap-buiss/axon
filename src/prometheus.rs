@@ -2221,6 +2221,9 @@ impl<'a> Prometheus<'a> {
         // Purge multi-word island noise (fragments, misclassifications)
         let multiword_purged = self.purge_multiword_island_noise().unwrap_or(0);
 
+        // Purge fragment island entities (NLP extraction errors)
+        let fragment_islands_purged = self.purge_fragment_island_entities().unwrap_or(0);
+
         // Refine associated_with predicates using entity type pairs
         let predicates_refined = self.refine_associated_with().unwrap_or(0);
 
@@ -2273,7 +2276,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} convergence-pass merges, \
              {} connected-containment merged, \
-             {} generic islands purged, {} multiword noise purged, {} predicates refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} predicates refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -2327,6 +2330,7 @@ impl<'a> Prometheus<'a> {
             containment_merged,
             generic_purged,
             multiword_purged,
+            fragment_islands_purged,
             predicates_refined,
             promoted,
             pair_deduped,
@@ -2692,6 +2696,112 @@ impl<'a> Prometheus<'a> {
                         Ok(())
                     })?;
                 }
+            }
+        }
+        Ok(purged)
+    }
+
+    /// Purge island entities whose names contain mixed-case fragments indicating
+    /// NLP extraction errors (e.g. "Derivatives Several", "CEO Calista Redmond",
+    /// "Heimgartner Susanna Zürich"). These are sentence fragments, not real entities.
+    /// Also fixes "State X" person misclassifications for connected entities.
+    /// Returns count of entities removed.
+    pub fn purge_fragment_island_entities(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Words that signal extraction fragments when appearing in entity names
+        let fragment_words: HashSet<&str> = [
+            "several",
+            "various",
+            "multiple",
+            "numerous",
+            "certain",
+            "particular",
+            "respective",
+            "notable",
+            "significant",
+            "prominent",
+            "renowned",
+            "alleged",
+            "supposed",
+            "purported",
+            "attempted",
+            "failed",
+            "increasingly",
+            "particularly",
+            "especially",
+            "approximately",
+            "subsequently",
+            "simultaneously",
+            "predominantly",
+            "primarily",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        // Title prefixes that when combined with names create fragments
+        let title_prefixes: &[&str] = &[
+            "ceo",
+            "cfo",
+            "cto",
+            "coo",
+            "vp",
+            "svp",
+            "evp",
+            "director",
+            "chairman",
+            "president",
+            "secretary",
+            "minister",
+            "ambassador",
+            "governor",
+            "senator",
+            "professor",
+            "dr",
+            "dean",
+            "provost",
+        ];
+
+        let mut purged = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            let words: Vec<&str> = lower.split_whitespace().collect();
+            if words.len() < 2 {
+                continue;
+            }
+
+            let should_purge =
+                // Contains fragment signal words
+                words.iter().any(|w| fragment_words.contains(w))
+                // Starts with a title prefix (e.g. "CEO Calista Redmond")
+                || title_prefixes.contains(&words[0])
+                // "State X" patterns that are secretary-of-state fragments
+                || (words[0] == "state" && words.len() >= 2 && e.entity_type == "person")
+                // Names with 4+ words where first word is lowercase-looking role
+                || (words.len() >= 4 && words[0].len() <= 6 && e.entity_type == "person"
+                    && !words[0].chars().next().unwrap_or('a').is_uppercase()
+                    && e.name.chars().next().unwrap_or('a').is_lowercase());
+
+            if should_purge {
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                    Ok(())
+                })?;
+                purged += 1;
             }
         }
         Ok(purged)
@@ -7129,6 +7239,46 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
     let known_orgs: &[&str] = &["new scientist", "scientific american", "nature"];
     if current_type == "person" && known_orgs.contains(&lower) {
         return Some("organization");
+    }
+
+    // "State X" patterns misclassified as person (e.g. "State Anthem", "Crusader States")
+    // But keep "State Henry Kissinger" etc. — those are "Secretary of State + name" fragments
+    if current_type == "person" && word_count >= 2 {
+        let state_concept_suffixes = [
+            "anthem",
+            "church",
+            "churches",
+            "estate",
+            "estates",
+            "states",
+            "clause",
+            "sicilies",
+            "council",
+            "militia",
+            "department",
+        ];
+        if let Some(last) = words.last() {
+            if state_concept_suffixes.contains(last) {
+                return Some("concept");
+            }
+        }
+        // "X Church" → organization
+        let org_last = ["church", "churches", "orthodox", "catholic"];
+        if let Some(last) = words.last() {
+            if org_last.contains(last) {
+                return Some("organization");
+            }
+        }
+        // "Federated States", "Crusader States", "First/Second/Third Estate"
+        if let Some(first) = words.first() {
+            let ordinal_first = ["first", "second", "third", "fourth", "fifth"];
+            if ordinal_first.contains(first) {
+                let concept_second = ["estate", "estates", "republic", "empire", "crusade"];
+                if word_count == 2 && concept_second.contains(&words[1]) {
+                    return Some("concept");
+                }
+            }
+        }
     }
 
     // Single-word entities that are obviously not persons

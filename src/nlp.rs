@@ -1760,6 +1760,30 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             "balanced",
             "cosmic",
             "march",
+            "miniature",
+            "literacy",
+            "regeneration",
+            "democracy",
+            "hospital",
+            "discover",
+            "evening",
+            "historic",
+            "refugee",
+            "cryptographic",
+            "functional",
+            "optimized",
+            "pioneering",
+            "highly",
+            "loved",
+            "spartan",
+            "variant",
+            "cotton",
+            "serial",
+            "reflection",
+            "historical",
+            "medieval",
+            "commemorations",
+            "business",
         ];
         if lower.contains(' ') && leading_verbs.contains(&first_word) {
             return false;
@@ -1882,9 +1906,25 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         }
     }
 
-    // Reject single long CamelCase words (code identifiers, not knowledge entities)
+    // Reject single long words (code identifiers, not knowledge entities)
     if !lower.contains(' ') && trimmed.len() > 20 {
         return false;
+    }
+
+    // Reject camelCase code identifiers (e.g. BTreeMap, CoreMarks, DevTerm)
+    if !trimmed.contains(' ') && trimmed.len() > 3 {
+        let mut transitions = 0;
+        let chars_vec: Vec<char> = trimmed.chars().collect();
+        for k in 1..chars_vec.len() {
+            if chars_vec[k].is_uppercase() && chars_vec[k - 1].is_lowercase() {
+                transitions += 1;
+            }
+        }
+        // True camelCase has lowercase→uppercase transitions mid-word
+        // But allow known patterns like "McDonald" (1 transition is fine for names)
+        if transitions >= 2 {
+            return false;
+        }
     }
 
     // Reject nationality-adjective phrases that aren't real entities

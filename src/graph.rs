@@ -1586,6 +1586,48 @@ pub fn type_entropy(brain: &Brain) -> Result<(f64, usize, String, f64), rusqlite
     Ok((entropy, counts.len(), top_type, top_count as f64 / n))
 }
 
+/// Score how much adding an edge between two entities would reduce fragmentation.
+/// Returns the increase in reachable pairs normalized by total possible pairs.
+/// Higher score = more valuable connection. Useful for prioritizing hypothesis validation.
+pub fn edge_connectivity_value(
+    brain: &Brain,
+    entity_a: i64,
+    entity_b: i64,
+) -> Result<f64, rusqlite::Error> {
+    let components = connected_components(brain)?;
+    let n: usize = components.iter().map(|c| c.len()).sum();
+    if n <= 1 {
+        return Ok(0.0);
+    }
+
+    // Find which components a and b belong to
+    let mut comp_a = None;
+    let mut comp_b = None;
+    for (idx, comp) in components.iter().enumerate() {
+        if comp.contains(&entity_a) {
+            comp_a = Some(idx);
+        }
+        if comp.contains(&entity_b) {
+            comp_b = Some(idx);
+        }
+    }
+
+    match (comp_a, comp_b) {
+        (Some(a), Some(b)) if a != b => {
+            // Connecting two different components: new reachable pairs = size_a * size_b
+            let sa = components[a].len() as f64;
+            let sb = components[b].len() as f64;
+            let max_pairs = n as f64 * (n as f64 - 1.0) / 2.0;
+            if max_pairs > 0.0 {
+                Ok(sa * sb / max_pairs)
+            } else {
+                Ok(0.0)
+            }
+        }
+        _ => Ok(0.0), // Same component or not found
+    }
+}
+
 /// Graph fragmentation score: 0.0 = perfectly connected, 1.0 = completely fragmented.
 /// Based on fraction of node pairs that are unreachable from each other.
 pub fn fragmentation_score(brain: &Brain) -> Result<f64, rusqlite::Error> {
