@@ -1145,6 +1145,172 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "fight",
     "roots",
     "kings",
+    "adage",
+    "adieu",
+    "african",
+    "alpine",
+    "always",
+    "analog",
+    "analyst",
+    "ancient",
+    "angry",
+    "angular",
+    "annual",
+    "answer",
+    "apart",
+    "abstract",
+    "active",
+    "actual",
+    "average",
+    "aware",
+    "broad",
+    "capable",
+    "complex",
+    "compound",
+    "complete",
+    "critical",
+    "crucial",
+    "direct",
+    "distinct",
+    "diverse",
+    "domestic",
+    "dominant",
+    "dramatic",
+    "dynamic",
+    "effective",
+    "efficient",
+    "elaborate",
+    "elegant",
+    "evident",
+    "exact",
+    "explicit",
+    "external",
+    "extreme",
+    "formal",
+    "frequent",
+    "fundamental",
+    "genuine",
+    "global",
+    "gradual",
+    "hostile",
+    "ideal",
+    "identical",
+    "implicit",
+    "independent",
+    "indirect",
+    "infinite",
+    "inherent",
+    "innocent",
+    "instant",
+    "intense",
+    "internal",
+    "inverse",
+    "isolated",
+    "lateral",
+    "legitimate",
+    "liberal",
+    "literal",
+    "logical",
+    "marginal",
+    "massive",
+    "mature",
+    "maximum",
+    "medieval",
+    "medium",
+    "mental",
+    "minimal",
+    "moderate",
+    "molecular",
+    "moral",
+    "mutual",
+    "native",
+    "natural",
+    "negative",
+    "neutral",
+    "noble",
+    "nominal",
+    "normal",
+    "nuclear",
+    "numerical",
+    "obvious",
+    "organic",
+    "parallel",
+    "partial",
+    "passive",
+    "permanent",
+    "persistent",
+    "physical",
+    "plural",
+    "polar",
+    "portable",
+    "positive",
+    "precise",
+    "profound",
+    "progressive",
+    "prominent",
+    "proper",
+    "proportional",
+    "pure",
+    "radical",
+    "random",
+    "rational",
+    "raw",
+    "realistic",
+    "reasonable",
+    "regular",
+    "relevant",
+    "remote",
+    "rigid",
+    "robust",
+    "rough",
+    "royal",
+    "rural",
+    "secular",
+    "severe",
+    "shallow",
+    "sharp",
+    "simple",
+    "singular",
+    "slight",
+    "solar",
+    "solid",
+    "sparse",
+    "spatial",
+    "stable",
+    "static",
+    "steep",
+    "strict",
+    "structural",
+    "subtle",
+    "sudden",
+    "sufficient",
+    "superior",
+    "supreme",
+    "symbolic",
+    "synthetic",
+    "temporal",
+    "terminal",
+    "thermal",
+    "tight",
+    "tiny",
+    "total",
+    "tough",
+    "trivial",
+    "tropical",
+    "ultimate",
+    "uniform",
+    "unique",
+    "universal",
+    "urban",
+    "urgent",
+    "valid",
+    "vertical",
+    "virtual",
+    "visible",
+    "visual",
+    "vital",
+    "volatile",
+    "wealthy",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -1180,6 +1346,11 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
 
     // Reject single generic words
     if !lower.contains(' ') && GENERIC_SINGLE_WORDS.contains(&lower.as_str()) {
+        return false;
+    }
+
+    // Reject single-word person titles used alone (President, Queen, etc.)
+    if !lower.contains(' ') && PERSON_TITLES.contains(&lower.as_str()) {
         return false;
     }
 
@@ -2644,6 +2815,28 @@ mod tests {
             "entities: {:?}",
             entities
         );
+    }
+
+    #[test]
+    fn test_single_word_person_titles_rejected() {
+        // Single-word person titles like "President", "Queen" should be rejected
+        assert!(!is_valid_entity("President", "person"));
+        assert!(!is_valid_entity("Queen", "person"));
+        assert!(!is_valid_entity("Minister", "person"));
+        // But multi-word names with titles are fine
+        assert!(is_valid_entity("President Obama", "person"));
+        assert!(is_valid_entity("Queen Elizabeth", "person"));
+    }
+
+    #[test]
+    fn test_generic_adjectives_rejected() {
+        // Single-word adjectives/adverbs should not be entities
+        assert!(!is_valid_entity("Ancient", "concept"));
+        assert!(!is_valid_entity("Dynamic", "concept"));
+        assert!(!is_valid_entity("Massive", "concept"));
+        assert!(!is_valid_entity("Noble", "concept"));
+        // But real entity names that happen to be adjectives are fine in multi-word
+        assert!(is_valid_entity("Noble Prize", "concept"));
     }
 
     #[test]

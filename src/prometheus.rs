@@ -1280,7 +1280,8 @@ impl<'a> Prometheus<'a> {
         Ok(false)
     }
 
-    /// Score a hypothesis based on available evidence.
+    /// Score a hypothesis based on available evidence, community co-membership,
+    /// and k-core depth.
     pub fn score_hypothesis(&self, hypothesis: &mut Hypothesis) -> Result<f64> {
         let mut score = 0.5_f64;
         // Boost for more evidence_for
@@ -1294,6 +1295,10 @@ impl<'a> Prometheus<'a> {
                 .evidence_against
                 .push("Contradicts existing knowledge".to_string());
         }
+
+        // Note: community and k-core boosting is done in batch via
+        // boost_hypotheses_with_graph_structure() to avoid recomputing per-hypothesis.
+
         // Apply pattern weight
         let weight = self.get_pattern_weight(&hypothesis.pattern_source)?;
         score *= weight;
@@ -1631,6 +1636,15 @@ impl<'a> Prometheus<'a> {
         for h in all_hypotheses.iter_mut().take(200) {
             self.score_hypothesis(h)?;
             self.validate_hypothesis(h)?;
+        }
+        // Batch-boost using graph structure (communities + k-cores) — computed once
+        let boost_slice = if all_hypotheses.len() > 200 {
+            &mut all_hypotheses[..200]
+        } else {
+            &mut all_hypotheses[..]
+        };
+        let _ = self.boost_hypotheses_with_graph_structure(boost_slice);
+        for h in all_hypotheses.iter().take(200) {
             let _ = self.save_hypothesis(h);
         }
 
@@ -1710,6 +1724,10 @@ impl<'a> Prometheus<'a> {
         // Word-overlap island merging (aggressive: merge "Marie Curie Avenue" → "Marie Curie")
         let word_merged = self.word_overlap_island_merge(0.6).unwrap_or(0);
 
+        // K-core analysis: find the dense backbone
+        let (max_k, core_members) =
+            crate::graph::densest_core(self.brain, 3).unwrap_or((0, vec![]));
+
         let summary = format!(
             "Discovered {} patterns, generated {} new hypotheses ({} confirmed, {} rejected), \
              auto-resolved {} existing ({}✓ {}✗), {} island entities, {} meaningful relations, \
@@ -1720,7 +1738,8 @@ impl<'a> Prometheus<'a> {
              {} name subsumptions found, {} types fixed, {} noise entities purged, \
              {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected, \
              {} fact-inferred relations, {} name cross-references, \
-             {} compound relations + {} compound merged, {} prefix-merged, {} word-overlap merged",
+             {} compound relations + {} compound merged, {} prefix-merged, {} word-overlap merged, \
+             k-core: k={} with {} entities in dense backbone",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1757,6 +1776,8 @@ impl<'a> Prometheus<'a> {
             compound_merged,
             prefix_merged,
             word_merged,
+            max_k,
+            core_members.len(),
         );
 
         Ok(DiscoveryReport {
@@ -2170,6 +2191,58 @@ impl<'a> Prometheus<'a> {
         Ok((confirmed, rejected))
     }
 
+    /// Batch-boost hypotheses using graph structure (communities + k-cores).
+    /// Computes expensive graph metrics once, then applies to all hypotheses.
+    pub fn boost_hypotheses_with_graph_structure(
+        &self,
+        hypotheses: &mut [Hypothesis],
+    ) -> Result<()> {
+        // Compute once
+        let communities = crate::graph::louvain_communities(self.brain)?;
+        let cores = crate::graph::k_core_decomposition(self.brain)?;
+
+        // Build name→id cache
+        let entities = self.brain.all_entities()?;
+        let name_to_id: HashMap<String, i64> = entities
+            .iter()
+            .map(|e| (e.name.to_lowercase(), e.id))
+            .collect();
+
+        for h in hypotheses.iter_mut() {
+            if h.object == "?" {
+                continue;
+            }
+            let s_id = name_to_id.get(&h.subject.to_lowercase()).copied();
+            let o_id = name_to_id.get(&h.object.to_lowercase()).copied();
+
+            if let (Some(sid), Some(oid)) = (s_id, o_id) {
+                // Community co-membership boost
+                if let (Some(&cs), Some(&co)) =
+                    (communities.get(&sid), communities.get(&oid))
+                {
+                    if cs == co {
+                        h.confidence = (h.confidence + 0.15).min(1.0);
+                        h.evidence_for.push(
+                            "Subject and object belong to the same graph community".to_string(),
+                        );
+                    }
+                }
+                // K-core depth boost
+                let s_core = cores.get(&sid).copied().unwrap_or(0);
+                let o_core = cores.get(&oid).copied().unwrap_or(0);
+                let min_core = s_core.min(o_core);
+                if min_core >= 2 {
+                    h.confidence = (h.confidence + 0.05 * min_core as f64).min(1.0);
+                    h.evidence_for.push(format!(
+                        "Both entities in {}-core (deeply embedded)",
+                        min_core
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Check if a hypothesis already exists (dedup across runs).
     fn hypothesis_exists(&self, subject: &str, predicate: &str, object: &str) -> Result<bool> {
         self.brain.with_conn(|conn| {
@@ -2314,7 +2387,11 @@ impl<'a> Prometheus<'a> {
 
                     // High overlap = likely duplicate
                     if jaccard >= 0.5 && intersection >= 2 {
-                        let action = if jaccard >= 0.8 {
+                        // Auto-merge if very high Jaccard OR if Jaccard ≥ 0.7 and
+                        // names have similar length (avoids merging "X" into "X Y Z")
+                        let len_ratio = name_a.len().min(name_b.len()) as f64
+                            / name_a.len().max(name_b.len()) as f64;
+                        let action = if jaccard >= 0.8 || (jaccard >= 0.7 && len_ratio >= 0.6) {
                             "merge".to_string()
                         } else {
                             "review".to_string()

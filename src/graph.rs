@@ -968,6 +968,71 @@ pub fn find_articulation_points(brain: &Brain) -> Result<Vec<i64>, rusqlite::Err
     Ok(ap.into_iter().collect())
 }
 
+/// K-core decomposition: find the maximal subgraph where every node has degree ≥ k.
+/// Returns a map of entity_id → core_number (the highest k for which the entity is in the k-core).
+/// Higher core number = more deeply embedded in the dense part of the graph.
+pub fn k_core_decomposition(brain: &Brain) -> Result<HashMap<i64, usize>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let mut degree: HashMap<i64, usize> = adj
+        .iter()
+        .map(|(&id, neighbors)| (id, neighbors.len()))
+        .collect();
+    let mut core: HashMap<i64, usize> = HashMap::new();
+    let mut remaining: HashSet<i64> = degree.keys().copied().collect();
+
+    // Iteratively peel nodes with lowest degree
+    while !remaining.is_empty() {
+        // Find current minimum degree among remaining nodes
+        let min_deg = remaining
+            .iter()
+            .map(|id| degree.get(id).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+
+        // Collect all nodes with this minimum degree
+        let to_remove: Vec<i64> = remaining
+            .iter()
+            .filter(|id| degree.get(id).copied().unwrap_or(0) <= min_deg)
+            .copied()
+            .collect();
+
+        for &node in &to_remove {
+            core.insert(node, min_deg);
+            remaining.remove(&node);
+            // Reduce degree of remaining neighbors
+            if let Some(neighbors) = adj.get(&node) {
+                for &nb in neighbors {
+                    if remaining.contains(&nb) {
+                        if let Some(d) = degree.get_mut(&nb) {
+                            *d = d.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(core)
+}
+
+/// Find the densest k-core (highest k with ≥ min_size nodes).
+/// Returns (k, node_ids) for the densest core meeting the size threshold.
+pub fn densest_core(brain: &Brain, min_size: usize) -> Result<(usize, Vec<i64>), rusqlite::Error> {
+    let cores = k_core_decomposition(brain)?;
+    let max_k = cores.values().copied().max().unwrap_or(0);
+
+    for k in (1..=max_k).rev() {
+        let members: Vec<i64> = cores
+            .iter()
+            .filter(|(_, &v)| v >= k)
+            .map(|(&id, _)| id)
+            .collect();
+        if members.len() >= min_size {
+            return Ok((k, members));
+        }
+    }
+    Ok((0, vec![]))
+}
+
 /// Entity similarity: Jaccard similarity based on shared predicates.
 /// Returns top similar pairs above threshold.
 pub fn entity_similarity(
@@ -1208,6 +1273,40 @@ mod tests {
         let formatted = format_path(&brain, &path).unwrap();
         assert!(formatted.contains("Alice"));
         assert!(formatted.contains("Charlie"));
+    }
+
+    #[test]
+    fn test_k_core_decomposition() {
+        let brain = Brain::open_in_memory().unwrap();
+        // Create a triangle (3-clique) + one pendant node
+        let a = brain.upsert_entity("A", "node").unwrap();
+        let b = brain.upsert_entity("B", "node").unwrap();
+        let c = brain.upsert_entity("C", "node").unwrap();
+        let d = brain.upsert_entity("D", "node").unwrap();
+        brain.upsert_relation(a, "link", b, "test").unwrap();
+        brain.upsert_relation(b, "link", c, "test").unwrap();
+        brain.upsert_relation(a, "link", c, "test").unwrap();
+        brain.upsert_relation(a, "link", d, "test").unwrap(); // D is pendant (degree 1)
+        let cores = k_core_decomposition(&brain).unwrap();
+        // A, B, C form a 2-core (triangle), D is in 1-core only
+        assert_eq!(*cores.get(&d).unwrap(), 1);
+        assert!(*cores.get(&a).unwrap() >= 2);
+        assert!(*cores.get(&b).unwrap() >= 2);
+        assert!(*cores.get(&c).unwrap() >= 2);
+    }
+
+    #[test]
+    fn test_densest_core() {
+        let brain = Brain::open_in_memory().unwrap();
+        let a = brain.upsert_entity("A", "node").unwrap();
+        let b = brain.upsert_entity("B", "node").unwrap();
+        let c = brain.upsert_entity("C", "node").unwrap();
+        brain.upsert_relation(a, "link", b, "test").unwrap();
+        brain.upsert_relation(b, "link", c, "test").unwrap();
+        brain.upsert_relation(a, "link", c, "test").unwrap();
+        let (k, members) = densest_core(&brain, 3).unwrap();
+        assert_eq!(k, 2);
+        assert_eq!(members.len(), 3);
     }
 
     #[test]
