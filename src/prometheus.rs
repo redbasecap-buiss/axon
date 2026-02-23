@@ -3123,6 +3123,7 @@ impl<'a> Prometheus<'a> {
 
         // Refine generic predicates using entity type pairs
         let predicates_refined = self.refine_associated_with().unwrap_or(0);
+        let contextual_refined = self.refine_associated_with_contextual().unwrap_or(0);
         let contributed_refined = self.refine_contributed_to().unwrap_or(0);
 
         // Promote mature testing hypotheses (>3 days, confidence >= 0.65)
@@ -3183,7 +3184,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, \
              {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
@@ -3255,6 +3256,7 @@ impl<'a> Prometheus<'a> {
             cross_component_merged,
             tfidf_reconnected,
             predicates_refined,
+            contextual_refined,
             contributed_refined,
             promoted,
             fragment_cleaned,
@@ -8332,16 +8334,183 @@ impl<'a> Prometheus<'a> {
                 ("event", "place") | ("place", "event") => "held_in",
                 _ => continue,
             };
-            self.brain.with_conn(|conn| {
-                conn.execute(
+            let ok = self.brain.with_conn(|conn| {
+                // Try UPDATE; if unique constraint fails (refined predicate already exists),
+                // just DELETE the redundant associated_with row.
+                let res = conn.execute(
                     "UPDATE relations SET predicate = ?1 WHERE id = ?2",
                     params![new_pred, r.id],
-                )?;
-                Ok(())
+                );
+                match res {
+                    Ok(_) => Ok(true),
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                }
             })?;
-            updated += 1;
+            if ok {
+                updated += 1;
+            }
         }
         Ok(updated)
+    }
+
+    /// Refine remaining `associated_with` predicates using neighborhood context.
+    /// For type pairs not handled by `refine_associated_with` (e.g., place-place,
+    /// technology-technology), infer the predicate by looking at what predicates
+    /// the subject entity most commonly uses with similar-type objects.
+    /// Falls back to type-pair heuristics for common cases.
+    pub fn refine_associated_with_contextual(&self) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let id_to_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Build subject→[(predicate, object_type)] for non-associated_with relations
+        let mut subject_pred_patterns: HashMap<i64, Vec<(&str, &str)>> = HashMap::new();
+        for r in &relations {
+            if r.predicate != "associated_with" && r.predicate != "related_to" {
+                if let Some(&otype) = id_to_type.get(&r.object_id) {
+                    subject_pred_patterns
+                        .entry(r.subject_id)
+                        .or_default()
+                        .push((&r.predicate, otype));
+                }
+            }
+        }
+
+        let mut updated = 0usize;
+        for r in &relations {
+            if r.predicate != "associated_with" {
+                continue;
+            }
+            let s_type = id_to_type.get(&r.subject_id).copied().unwrap_or("unknown");
+            let o_type = id_to_type.get(&r.object_id).copied().unwrap_or("unknown");
+
+            // Only handle type pairs that refine_associated_with skips
+            let new_pred = match (s_type, o_type) {
+                ("place", "place") => "located_near",
+                ("technology", "technology") => "related_technology",
+                ("technology", "concept") | ("concept", "technology") => "implements",
+                ("technology", "person") => "created_by",
+                ("technology", "organization") | ("organization", "technology") => "develops",
+                ("event", "event") => "concurrent_with",
+                ("product", "person") => "created_by",
+                ("product", "organization") => "produced_by",
+                ("product", "technology") | ("technology", "product") => "uses",
+                ("company", "person") | ("person", "company") => "affiliated_with",
+                ("company", "place") | ("place", "company") => "headquartered_in",
+                ("company", "company") => "partner_of",
+                ("company", "concept") | ("concept", "company") => "works_on",
+                _ => {
+                    // Context-based: if subject has a dominant predicate for this object type, use it
+                    if let Some(patterns) = subject_pred_patterns.get(&r.subject_id) {
+                        let type_matches: Vec<&&str> = patterns
+                            .iter()
+                            .filter(|(_, ot)| *ot == o_type)
+                            .map(|(p, _)| p)
+                            .collect();
+                        if !type_matches.is_empty() {
+                            // Pick most common predicate for this type pair
+                            let mut freq: HashMap<&&str, usize> = HashMap::new();
+                            for p in &type_matches {
+                                *freq.entry(p).or_insert(0) += 1;
+                            }
+                            if let Some((&&best, &count)) = freq.iter().max_by_key(|(_, &c)| c) {
+                                if count >= 2 && best != "associated_with" {
+                                    best
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            let ok = self.brain.with_conn(|conn| {
+                let res = conn.execute(
+                    "UPDATE relations SET predicate = ?1 WHERE id = ?2",
+                    params![new_pred, r.id],
+                );
+                match res {
+                    Ok(_) => Ok(true),
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                }
+            })?;
+            if ok {
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
+    /// Score and classify island entities by crawl priority.
+    /// Returns Vec of (entity_name, entity_type, priority_score, reason) sorted by priority.
+    /// High-priority islands are well-named entities of valuable types that would
+    /// benefit most from being connected to the graph via targeted crawling.
+    pub fn classify_island_priority(&self) -> Result<Vec<(String, String, f64, String)>> {
+        let islands = self.find_island_entities()?;
+        let mut scored: Vec<(String, String, f64, String)> = Vec::new();
+
+        for (name, etype) in &islands {
+            let mut score = 0.0_f64;
+            let mut reasons = Vec::new();
+
+            // Type value
+            let type_score = match etype.as_str() {
+                "person" => 0.8,
+                "organization" | "company" => 0.7,
+                "concept" | "technology" => 0.6,
+                "place" => 0.4,
+                "event" | "product" => 0.5,
+                _ => 0.1,
+            };
+            score += type_score;
+            reasons.push(format!("type:{}", etype));
+
+            // Name quality: multi-word proper nouns are higher quality
+            let word_count = name.split_whitespace().count();
+            if word_count >= 2 && word_count <= 4 {
+                score += 0.3;
+                reasons.push("good-name-length".into());
+            } else if word_count == 1 && name.len() >= 4 {
+                score += 0.1;
+            }
+
+            // Capitalization: properly capitalized suggests real entity
+            let first_char_upper = name.chars().next().is_some_and(|c| c.is_uppercase());
+            if first_char_upper {
+                score += 0.1;
+            }
+
+            // Skip noise
+            if is_noise_name(name) || is_noise_type(etype) {
+                continue;
+            }
+
+            scored.push((name.clone(), etype.clone(), score, reasons.join(", ")));
+        }
+
+        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(scored)
     }
 
     /// Refine overly generic `contributed_to` predicates into more specific ones
@@ -8373,14 +8542,25 @@ impl<'a> Prometheus<'a> {
                 ("place", "concept") | ("concept", "place") => "relevant_to",
                 _ => continue,
             };
-            self.brain.with_conn(|conn| {
-                conn.execute(
+            let ok = self.brain.with_conn(|conn| {
+                let res = conn.execute(
                     "UPDATE relations SET predicate = ?1 WHERE id = ?2",
                     params![new_pred, r.id],
-                )?;
-                Ok(())
+                );
+                match res {
+                    Ok(_) => Ok(true),
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                }
             })?;
-            updated += 1;
+            if ok {
+                updated += 1;
+            }
         }
         Ok(updated)
     }
