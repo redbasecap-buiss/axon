@@ -122,6 +122,22 @@ impl Brain {
     }
 
     pub fn upsert_entity(&self, name: &str, entity_type: &str) -> Result<i64> {
+        // Reject ephemeral/noise types that shouldn't be stored as entities
+        const REJECTED_TYPES: &[&str] = &[
+            "date",
+            "year",
+            "number_unit",
+            "relative_date",
+            "source",
+            "url",
+            "unknown",
+        ];
+        if REJECTED_TYPES.contains(&entity_type) {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "Rejected entity type '{}' for '{}'",
+                entity_type, name
+            )));
+        }
         let now = Utc::now()
             .naive_utc()
             .format("%Y-%m-%d %H:%M:%S")
@@ -187,12 +203,16 @@ impl Brain {
         let mut relation_count = 0;
         let mut fact_count = 0;
 
-        // Insert entities
+        // Insert entities (skip rejected types gracefully)
         let mut entity_ids = std::collections::HashMap::new();
         for (name, etype) in &extracted.entities {
-            let id = self.upsert_entity(name, etype)?;
-            entity_ids.insert(name.clone(), id);
-            entity_count += 1;
+            match self.upsert_entity(name, etype) {
+                Ok(id) => {
+                    entity_ids.insert(name.clone(), id);
+                    entity_count += 1;
+                }
+                Err(_) => continue, // filtered out by type/length guard
+            }
         }
 
         // Insert relations
@@ -222,11 +242,14 @@ impl Brain {
         }
 
         // Insert facts (keywords as facts about a source entity)
+        // Note: "source" type is rejected by upsert_entity, so we store keywords
+        // as facts on the first real entity instead, or skip if none exist.
         if !extracted.keywords.is_empty() {
-            let source_id = self.upsert_entity(&extracted.source_url, "source")?;
-            for kw in &extracted.keywords {
-                self.upsert_fact(source_id, "keyword", kw, &extracted.source_url)?;
-                fact_count += 1;
+            if let Some(&first_id) = entity_ids.values().next() {
+                for kw in &extracted.keywords {
+                    self.upsert_fact(first_id, "keyword", kw, &extracted.source_url)?;
+                    fact_count += 1;
+                }
             }
         }
 
