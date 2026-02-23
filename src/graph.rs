@@ -1527,6 +1527,65 @@ pub fn adamic_adar_predict(
     Ok(scores)
 }
 
+/// Predicate entropy: measures the information content / diversity of predicate usage.
+/// Higher entropy = more diverse predicate vocabulary = richer semantic graph.
+/// Low entropy = over-reliance on a few generic predicates.
+/// Returns (entropy_bits, top_predicate, top_predicate_fraction).
+pub fn predicate_entropy(brain: &Brain) -> Result<(f64, String, f64), rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    if relations.is_empty() {
+        return Ok((0.0, String::new(), 0.0));
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for r in &relations {
+        *counts.entry(r.predicate.clone()).or_insert(0) += 1;
+    }
+    let n = relations.len() as f64;
+    let mut entropy = 0.0_f64;
+    let mut top_pred = String::new();
+    let mut top_count = 0usize;
+    for (pred, &count) in &counts {
+        if count > top_count {
+            top_count = count;
+            top_pred = pred.clone();
+        }
+        let p = count as f64 / n;
+        if p > 0.0 {
+            entropy -= p * p.log2();
+        }
+    }
+    let top_frac = top_count as f64 / n;
+    Ok((entropy, top_pred, top_frac))
+}
+
+/// Entity type distribution entropy — measures how diverse the entity types are.
+/// Returns (entropy_bits, num_types, dominant_type, dominant_fraction).
+pub fn type_entropy(brain: &Brain) -> Result<(f64, usize, String, f64), rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    if entities.is_empty() {
+        return Ok((0.0, 0, String::new(), 0.0));
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for e in &entities {
+        *counts.entry(e.entity_type.clone()).or_insert(0) += 1;
+    }
+    let n = entities.len() as f64;
+    let mut entropy = 0.0_f64;
+    let mut top_type = String::new();
+    let mut top_count = 0usize;
+    for (etype, &count) in &counts {
+        if count > top_count {
+            top_count = count;
+            top_type = etype.clone();
+        }
+        let p = count as f64 / n;
+        if p > 0.0 {
+            entropy -= p * p.log2();
+        }
+    }
+    Ok((entropy, counts.len(), top_type, top_count as f64 / n))
+}
+
 /// Graph fragmentation score: 0.0 = perfectly connected, 1.0 = completely fragmented.
 /// Based on fraction of node pairs that are unreachable from each other.
 pub fn fragmentation_score(brain: &Brain) -> Result<f64, rusqlite::Error> {

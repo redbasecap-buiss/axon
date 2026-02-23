@@ -1961,6 +1961,16 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         }
     }
 
+    // Reject single-word entities classified as "person" — real people have at least two words
+    if etype == "person" && !lower.contains(' ') {
+        return false;
+    }
+
+    // Reject single-word concepts under 4 chars (too ambiguous to be useful)
+    if etype == "concept" && !lower.contains(' ') && trimmed.len() < 4 {
+        return false;
+    }
+
     // Reject entities containing Wikipedia reference/citation fragments
     if lower.contains("archived")
         || lower.contains("isbn")

@@ -431,6 +431,24 @@ async fn main() -> anyhow::Result<()> {
                         }
                         println!();
                     }
+                    // Predicate & type entropy
+                    if let Ok((pred_ent, top_pred, top_frac)) =
+                        crate::graph::predicate_entropy(&brain)
+                    {
+                        if let Ok((type_ent, num_types, top_type, type_frac)) =
+                            crate::graph::type_entropy(&brain)
+                        {
+                            println!("Graph information content:");
+                            println!(
+                                "  📐 Predicate entropy: {:.2} bits (top: '{}' at {:.0}%)",
+                                pred_ent,
+                                top_pred,
+                                top_frac * 100.0
+                            );
+                            println!("  📐 Type entropy: {:.2} bits across {} types (dominant: '{}' at {:.0}%)", type_ent, num_types, top_type, type_frac * 100.0);
+                            println!();
+                        }
+                    }
                     // Crawl suggestions
                     let suggestions = p.suggest_crawl_topics().unwrap_or_default();
                     if !suggestions.is_empty() {

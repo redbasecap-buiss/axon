@@ -706,6 +706,101 @@ impl<'a> Prometheus<'a> {
         Ok(patterns)
     }
 
+    /// Find co-occurring entity pairs using Pointwise Mutual Information (PMI).
+    /// PMI measures how much more likely two entities are to co-occur (share a source)
+    /// than expected by chance. Better than Jaccard for sparse graphs because it
+    /// accounts for entity frequency — rare entities co-occurring is more informative
+    /// than common ones. PMI = log2(P(a,b) / (P(a) * P(b)))
+    pub fn find_pmi_co_occurrences(&self, min_pmi: f64) -> Result<Vec<Pattern>> {
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        // Build entity → set of source URLs
+        let mut entity_sources: HashMap<i64, HashSet<String>> = HashMap::new();
+        let mut all_sources: HashSet<String> = HashSet::new();
+        for r in &relations {
+            if !r.source_url.is_empty() {
+                all_sources.insert(r.source_url.clone());
+                if meaningful.contains(&r.subject_id) {
+                    entity_sources
+                        .entry(r.subject_id)
+                        .or_default()
+                        .insert(r.source_url.clone());
+                }
+                if meaningful.contains(&r.object_id) {
+                    entity_sources
+                        .entry(r.object_id)
+                        .or_default()
+                        .insert(r.source_url.clone());
+                }
+            }
+        }
+
+        let n = all_sources.len() as f64;
+        if n < 2.0 {
+            return Ok(vec![]);
+        }
+
+        // Build direct-connection set
+        let mut connected: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            let key = if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            };
+            connected.insert(key);
+        }
+
+        // Only consider entities appearing in ≥1 source
+        let candidates: Vec<(i64, &HashSet<String>)> = entity_sources
+            .iter()
+            .filter(|(_, sources)| !sources.is_empty())
+            .map(|(&id, sources)| (id, sources))
+            .collect();
+
+        let mut patterns = Vec::new();
+        for i in 0..candidates.len() {
+            for j in (i + 1)..candidates.len() {
+                let (a, sa) = candidates[i];
+                let (b, sb) = candidates[j];
+                let key = if a < b { (a, b) } else { (b, a) };
+                if connected.contains(&key) {
+                    continue;
+                }
+                let joint = sa.intersection(sb).count() as f64;
+                if joint < 1.0 {
+                    continue;
+                }
+                let p_ab = joint / n;
+                let p_a = sa.len() as f64 / n;
+                let p_b = sb.len() as f64 / n;
+                let pmi = (p_ab / (p_a * p_b)).log2();
+                if pmi >= min_pmi {
+                    let a_name = self.entity_name(a)?;
+                    let b_name = self.entity_name(b)?;
+                    patterns.push(Pattern {
+                        id: 0,
+                        pattern_type: PatternType::CoOccurrence,
+                        entities_involved: vec![a_name.clone(), b_name.clone()],
+                        frequency: joint as i64,
+                        last_seen: now_str(),
+                        description: format!(
+                            "{} and {} have PMI={:.2} ({} shared sources) — statistically surprising co-occurrence",
+                            a_name, b_name, pmi, joint as i64
+                        ),
+                    });
+                }
+            }
+        }
+        patterns.sort_by(|a, b| {
+            // Sort by PMI (embedded in description), approximate by frequency for now
+            b.frequency.cmp(&a.frequency)
+        });
+        patterns.truncate(30);
+        Ok(patterns)
+    }
+
     /// Find entity clusters: groups of entities connected by the same predicate type.
     /// Useful for discovering thematic clusters in sparse graphs.
     pub fn find_entity_clusters(&self) -> Result<Vec<Pattern>> {
@@ -1870,6 +1965,9 @@ impl<'a> Prometheus<'a> {
 
         let anomalies = self.find_anomalies()?;
         all_patterns.extend(anomalies);
+
+        let pmi_patterns = self.find_pmi_co_occurrences(1.0)?;
+        all_patterns.extend(pmi_patterns);
 
         let chains = self.find_predicate_chains(2)?;
         all_patterns.extend(chains);
