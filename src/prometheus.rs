@@ -1614,6 +1614,10 @@ impl<'a> Prometheus<'a> {
         let hub_hyps = self.generate_hypotheses_from_hubs()?;
         all_hypotheses.extend(hub_hyps);
 
+        // 2d. Community bridge hypotheses
+        let bridge_hyps = self.generate_hypotheses_from_community_bridges()?;
+        all_hypotheses.extend(bridge_hyps);
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -1665,6 +1669,9 @@ impl<'a> Prometheus<'a> {
 
         // Decay old hypotheses (meta-learning)
         let decayed = self.decay_old_hypotheses(7).unwrap_or(0);
+
+        // Prune stale low-confidence hypotheses (>14 days old)
+        let pruned = self.prune_stale_hypotheses(14).unwrap_or(0);
 
         // Auto-resolve existing testing hypotheses
         let (auto_confirmed, auto_rejected) = self.auto_resolve_hypotheses().unwrap_or((0, 0));
@@ -1732,7 +1739,7 @@ impl<'a> Prometheus<'a> {
             "Discovered {} patterns, generated {} new hypotheses ({} confirmed, {} rejected), \
              auto-resolved {} existing ({}✓ {}✗), {} island entities, {} meaningful relations, \
              {} cross-domain gaps, {} knowledge frontiers, {} bridge entities, {} connectable islands, \
-             {} prioritized gaps, {} decayed, {} island clusters, \
+             {} prioritized gaps, {} decayed, {} pruned, {} island clusters, \
              predicate diversity: {}/{} ({:.0}% diverse), \
              {} fuzzy duplicates ({} auto-merge, {} auto-merged), {} sparse topic domains, \
              {} name subsumptions found, {} types fixed, {} noise entities purged, \
@@ -1755,6 +1762,7 @@ impl<'a> Prometheus<'a> {
             connectable.len(),
             gap_priorities.len(),
             decayed,
+            pruned,
             island_clusters.len(),
             diverse_rels,
             total_rels,
@@ -2217,9 +2225,7 @@ impl<'a> Prometheus<'a> {
 
             if let (Some(sid), Some(oid)) = (s_id, o_id) {
                 // Community co-membership boost
-                if let (Some(&cs), Some(&co)) =
-                    (communities.get(&sid), communities.get(&oid))
-                {
+                if let (Some(&cs), Some(&co)) = (communities.get(&sid), communities.get(&oid)) {
                     if cs == co {
                         h.confidence = (h.confidence + 0.15).min(1.0);
                         h.evidence_for.push(
@@ -3687,6 +3693,149 @@ impl<'a> Prometheus<'a> {
             }
         }
         Ok(merged)
+    }
+
+    /// Prune stale hypotheses: reject testing hypotheses older than `max_days`
+    /// whose confidence has decayed below the rejection threshold.
+    /// Returns count of hypotheses pruned.
+    pub fn prune_stale_hypotheses(&self, max_days: i64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::days(max_days))
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let count = self.brain.with_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE hypotheses SET status = 'rejected' \
+                 WHERE status IN ('proposed', 'testing') \
+                 AND discovered_at < ?1 \
+                 AND confidence < ?2",
+                params![cutoff, REJECTION_THRESHOLD],
+            )?;
+            Ok(updated)
+        })?;
+        Ok(count)
+    }
+
+    /// Generate hypotheses from Louvain community bridges: entities in different
+    /// communities but sharing a common neighbour likely have an indirect relationship.
+    /// More precise than structural_hole because it respects community boundaries.
+    pub fn generate_hypotheses_from_community_bridges(&self) -> Result<Vec<Hypothesis>> {
+        let communities = crate::graph::louvain_communities(self.brain)?;
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        // Build adjacency
+        let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+        for r in &relations {
+            if meaningful.contains(&r.subject_id) && meaningful.contains(&r.object_id) {
+                adj.entry(r.subject_id).or_default().insert(r.object_id);
+                adj.entry(r.object_id).or_default().insert(r.subject_id);
+            }
+        }
+
+        // Find pairs in different communities that share ≥2 common neighbours
+        let mut hypotheses = Vec::new();
+        let mut seen: HashSet<(i64, i64)> = HashSet::new();
+        let ids: Vec<i64> = adj.keys().copied().collect();
+
+        for &node in &ids {
+            let node_comm = communities.get(&node).copied().unwrap_or(usize::MAX);
+            let neighbours = match adj.get(&node) {
+                Some(n) => n,
+                None => continue,
+            };
+            // For each pair of this node's neighbours in different communities
+            let nb_list: Vec<i64> = neighbours.iter().copied().collect();
+            for i in 0..nb_list.len() {
+                for j in (i + 1)..nb_list.len() {
+                    let a = nb_list[i];
+                    let b = nb_list[j];
+                    let ca = communities.get(&a).copied().unwrap_or(usize::MAX);
+                    let cb = communities.get(&b).copied().unwrap_or(usize::MAX);
+                    if ca == cb {
+                        continue; // same community, already well-connected
+                    }
+                    // Check they're not directly connected
+                    if adj.get(&a).is_some_and(|s| s.contains(&b)) {
+                        continue;
+                    }
+                    let key = if a < b { (a, b) } else { (b, a) };
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let a_name = self.entity_name(a)?;
+                    let b_name = self.entity_name(b)?;
+                    let bridge_name = self.entity_name(node)?;
+                    hypotheses.push(Hypothesis {
+                        id: 0,
+                        subject: a_name.clone(),
+                        predicate: "related_to".to_string(),
+                        object: b_name.clone(),
+                        confidence: 0.45,
+                        evidence_for: vec![format!(
+                            "Both connected to bridge entity '{}' but in different communities ({}≠{})",
+                            bridge_name, ca, cb
+                        )],
+                        evidence_against: vec![],
+                        reasoning_chain: vec![
+                            format!("{} and {} share neighbour {}", a_name, b_name, bridge_name),
+                            format!("They belong to different communities ({} vs {})", ca, cb),
+                            "Cross-community bridge pattern suggests potential relation".to_string(),
+                        ],
+                        status: HypothesisStatus::Proposed,
+                        discovered_at: now_str(),
+                        pattern_source: "community_bridge".to_string(),
+                    });
+                    if hypotheses.len() >= 50 {
+                        return Ok(hypotheses);
+                    }
+                }
+            }
+        }
+        Ok(hypotheses)
+    }
+
+    /// Compute hypothesis quality metrics: distribution of confidence scores,
+    /// pattern source effectiveness, and staleness analysis.
+    pub fn hypothesis_quality_report(&self) -> Result<HashMap<String, f64>> {
+        let all = self.list_hypotheses(None)?;
+        let mut metrics: HashMap<String, f64> = HashMap::new();
+        let total = all.len() as f64;
+        if total == 0.0 {
+            return Ok(metrics);
+        }
+
+        // Status distribution
+        let mut status_counts: HashMap<String, usize> = HashMap::new();
+        let mut source_counts: HashMap<String, (usize, f64)> = HashMap::new();
+        let mut conf_sum = 0.0_f64;
+
+        for h in &all {
+            *status_counts
+                .entry(h.status.as_str().to_string())
+                .or_insert(0) += 1;
+            let entry = source_counts
+                .entry(h.pattern_source.clone())
+                .or_insert((0, 0.0));
+            entry.0 += 1;
+            entry.1 += h.confidence;
+            conf_sum += h.confidence;
+        }
+
+        metrics.insert("total_hypotheses".into(), total);
+        metrics.insert("avg_confidence".into(), conf_sum / total);
+
+        for (status, count) in &status_counts {
+            metrics.insert(format!("status_{}", status), *count as f64);
+        }
+
+        // Average confidence per source
+        for (source, (count, sum)) in &source_counts {
+            metrics.insert(format!("source_{}_count", source), *count as f64);
+            metrics.insert(format!("source_{}_avg_conf", source), sum / *count as f64);
+        }
+
+        Ok(metrics)
     }
 
     fn entity_name(&self, id: i64) -> Result<String> {
