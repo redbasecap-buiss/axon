@@ -2551,6 +2551,89 @@ impl<'a> Prometheus<'a> {
         Ok(report)
     }
 
+    /// Strategy ROI analysis: computes confirmations-per-hypothesis-generated ratio
+    /// and identifies strategies with diminishing returns (high volume, low confirmation).
+    /// Returns Vec of (strategy, total_generated, confirmed, rejected, roi, recommendation).
+    pub fn strategy_roi(&self) -> Result<Vec<(String, i64, i64, i64, f64, String)>> {
+        let weights = self.get_pattern_weights()?;
+        // Count total hypotheses per strategy
+        let strategy_counts: HashMap<String, (i64, i64, i64)> = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT pattern_source,
+                        COUNT(*),
+                        SUM(CASE WHEN status = 'confirmed' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END)
+                 FROM hypotheses GROUP BY pattern_source",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            let mut map = HashMap::new();
+            for row in rows {
+                let (src, total, conf, rej) = row?;
+                map.insert(src, (total, conf, rej));
+            }
+            Ok(map)
+        })?;
+
+        let mut report = Vec::new();
+        for w in &weights {
+            let (total, confirmed, rejected) = strategy_counts
+                .get(&w.pattern_type)
+                .copied()
+                .unwrap_or((0, 0, 0));
+            let roi = if total > 0 {
+                confirmed as f64 / total as f64
+            } else {
+                0.0
+            };
+            let rec = if total < 5 {
+                "needs more data".to_string()
+            } else if roi >= 0.5 {
+                "excellent ROI — increase exploration".to_string()
+            } else if roi >= 0.2 {
+                "good ROI".to_string()
+            } else if roi >= 0.05 {
+                "low ROI — consider tightening thresholds".to_string()
+            } else if total > 50 && roi < 0.02 {
+                "diminishing returns — reduce volume or disable".to_string()
+            } else {
+                "poor ROI — review strategy logic".to_string()
+            };
+            report.push((w.pattern_type.clone(), total, confirmed, rejected, roi, rec));
+        }
+        report.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(report)
+    }
+
+    /// Adaptive strategy thresholds: returns recommended minimum confidence threshold
+    /// per strategy based on historical ROI. Strategies with low ROI get higher thresholds
+    /// (more selective), high-ROI strategies get lower thresholds (more exploratory).
+    pub fn adaptive_thresholds(&self) -> Result<HashMap<String, f64>> {
+        let roi = self.strategy_roi()?;
+        let mut thresholds = HashMap::new();
+        for (strategy, total, _confirmed, _rejected, roi_val, _) in &roi {
+            let threshold = if *total < 10 {
+                0.3 // Default: moderate threshold for new strategies
+            } else if *roi_val >= 0.3 {
+                0.2 // Low threshold: explore more for high-ROI strategies
+            } else if *roi_val >= 0.1 {
+                0.35 // Standard threshold
+            } else if *roi_val >= 0.02 {
+                0.5 // Higher threshold: be more selective
+            } else {
+                0.65 // Very selective: only keep high-confidence hypotheses
+            };
+            thresholds.insert(strategy.clone(), threshold);
+        }
+        Ok(thresholds)
+    }
+
     /// Get total discovery count (confirmed hypotheses that were recorded).
     pub fn discovery_count(&self) -> Result<i64> {
         self.brain.with_conn(|conn| {
@@ -2982,6 +3065,24 @@ impl<'a> Prometheus<'a> {
             if let Ok(cal) = self.calibrated_confidence(&h.pattern_source, h.confidence) {
                 h.confidence = cal;
             }
+        }
+
+        // Apply adaptive thresholds: filter out hypotheses below per-strategy threshold
+        let adaptive_thresholds = self.adaptive_thresholds().unwrap_or_default();
+        let pre_adaptive = all_hypotheses.len();
+        all_hypotheses.retain(|h| {
+            let threshold = adaptive_thresholds
+                .get(&h.pattern_source)
+                .copied()
+                .unwrap_or(0.3);
+            h.confidence >= threshold
+        });
+        let adaptive_filtered = pre_adaptive - all_hypotheses.len();
+        if adaptive_filtered > 0 {
+            eprintln!(
+                "[PROMETHEUS] Adaptive threshold filtered {} low-ROI hypotheses",
+                adaptive_filtered
+            );
         }
 
         // Decay old hypotheses (meta-learning)
@@ -4279,6 +4380,50 @@ impl<'a> Prometheus<'a> {
                     h.evidence_for.push(format!(
                         "Both entities in {}-core (deeply embedded)",
                         min_core
+                    ));
+                }
+
+                // Cross-community bridge boost: hypotheses connecting DIFFERENT communities
+                // are more valuable for knowledge integration than same-community ones.
+                if let (Some(&cs), Some(&co)) = (communities.get(&sid), communities.get(&oid)) {
+                    if cs != co {
+                        // Compute connectivity value — how much would this edge reduce fragmentation?
+                        if let Ok(cv) = crate::graph::edge_connectivity_value(self.brain, sid, oid)
+                        {
+                            if cv > 0.0 {
+                                let bridge_boost = (cv * 50.0).min(0.25); // scale: max +0.25
+                                h.confidence = (h.confidence + bridge_boost).min(1.0);
+                                h.evidence_for.push(format!(
+                                    "Bridges different communities (connectivity value: {:.4})",
+                                    cv
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // PageRank importance boost: hypotheses about important entities are more valuable
+                // (computed lazily — only if entities have high degree, which correlates with PR)
+                let s_rels = self
+                    .brain
+                    .get_relations_for(sid)
+                    .ok()
+                    .map(|r| r.len())
+                    .unwrap_or(0);
+                let o_rels = self
+                    .brain
+                    .get_relations_for(oid)
+                    .ok()
+                    .map(|r| r.len())
+                    .unwrap_or(0);
+                let min_rels = s_rels.min(o_rels);
+                if min_rels >= 5 {
+                    // Both entities are well-connected — hypothesis is about important entities
+                    let importance_boost = (min_rels as f64 * 0.01).min(0.15);
+                    h.confidence = (h.confidence + importance_boost).min(1.0);
+                    h.evidence_for.push(format!(
+                        "Both entities well-connected ({}/{} relations)",
+                        s_rels, o_rels
                     ));
                 }
             }

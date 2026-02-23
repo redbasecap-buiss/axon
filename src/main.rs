@@ -471,6 +471,25 @@ async fn main() -> anyhow::Result<()> {
                             println!();
                         }
                     }
+                    // Strategy ROI
+                    if let Ok(roi) = p.strategy_roi() {
+                        if !roi.is_empty() {
+                            println!("Strategy ROI (confirmations / total generated):");
+                            for (strategy, total, confirmed, _rejected, roi_val, rec) in
+                                roi.iter().take(10)
+                            {
+                                println!(
+                                    "  📈 {} — {}/{} ({:.0}%): {}",
+                                    strategy,
+                                    confirmed,
+                                    total,
+                                    roi_val * 100.0,
+                                    rec
+                                );
+                            }
+                            println!();
+                        }
+                    }
                     // Crawl suggestions
                     let suggestions = p.suggest_crawl_topics().unwrap_or_default();
                     if !suggestions.is_empty() {
