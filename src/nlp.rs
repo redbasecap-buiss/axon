@@ -1508,11 +1508,91 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
 const TRAILING_JUNK: &[&str] = &[
-    "if", "in", "the", "a", "of", "and", "or", "at", "to", "for", "by", "from", "with", "on", "is",
-    "are", "was", "were", "its", "his", "her", "their", "an", "as", "but", "not", "out", "since",
-    "has", "had", "have", "been", "be", "will", "would", "could", "should", "may", "might", "into",
-    "than", "then", "also", "that", "this", "these", "those", "which", "who", "whom", "when",
-    "where", "how", "why", "what", "both", "such", "some", "all", "each", "every",
+    "if",
+    "in",
+    "the",
+    "a",
+    "of",
+    "and",
+    "or",
+    "at",
+    "to",
+    "for",
+    "by",
+    "from",
+    "with",
+    "on",
+    "is",
+    "are",
+    "was",
+    "were",
+    "its",
+    "his",
+    "her",
+    "their",
+    "an",
+    "as",
+    "but",
+    "not",
+    "out",
+    "since",
+    "has",
+    "had",
+    "have",
+    "been",
+    "be",
+    "will",
+    "would",
+    "could",
+    "should",
+    "may",
+    "might",
+    "into",
+    "than",
+    "then",
+    "also",
+    "that",
+    "this",
+    "these",
+    "those",
+    "which",
+    "who",
+    "whom",
+    "when",
+    "where",
+    "how",
+    "why",
+    "what",
+    "both",
+    "such",
+    "some",
+    "all",
+    "each",
+    "every",
+    // Month names — prevent "Person January" style entities
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "jan",
+    "feb",
+    "mar",
+    "apr",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "oct",
+    "nov",
+    "dec",
 ];
 
 fn is_valid_entity(name: &str, etype: &str) -> bool {
@@ -1554,9 +1634,51 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         }
     }
 
-    // Reject entities starting with trailing junk (leftover fragments)
+    // Reject entities starting with trailing junk or verb/participle prefixes (leftover fragments)
     if let Some(first_word) = lower.split_whitespace().next() {
         if lower.contains(' ') && TRAILING_JUNK.contains(&first_word) {
+            return false;
+        }
+        // Reject entities starting with past participles, gerunds, or verbs
+        let leading_verbs: &[&str] = &[
+            "born",
+            "died",
+            "introducing",
+            "making",
+            "creating",
+            "building",
+            "showing",
+            "acquiring",
+            "dissolving",
+            "discovering",
+            "combining",
+            "starting",
+            "ending",
+            "increasing",
+            "decreasing",
+            "becoming",
+            "getting",
+            "having",
+            "being",
+            "doing",
+            "going",
+            "coming",
+            "taking",
+            "giving",
+            "finding",
+            "telling",
+            "asking",
+            "hidden",
+            "broken",
+            "forgotten",
+            "chosen",
+            "proven",
+            "driven",
+            "written",
+            "radioactive",
+            "geeks",
+        ];
+        if lower.contains(' ') && leading_verbs.contains(&first_word) {
             return false;
         }
     }
@@ -1589,6 +1711,61 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject single long CamelCase words (code identifiers, not knowledge entities)
+    if !lower.contains(' ') && trimmed.len() > 20 {
+        return false;
+    }
+
+    // Reject nationality-adjective phrases that aren't real entities
+    // e.g. "Dutch American", "Austrian Netherlands" as person names
+    let nationality_adjectives: &[&str] = &[
+        "dutch",
+        "austrian",
+        "canadian",
+        "serbian",
+        "croatian",
+        "russian",
+        "french",
+        "british",
+        "german",
+        "italian",
+        "spanish",
+        "portuguese",
+        "swedish",
+        "norwegian",
+        "danish",
+        "finnish",
+        "polish",
+        "czech",
+        "hungarian",
+        "romanian",
+        "bulgarian",
+        "greek",
+        "turkish",
+        "chinese",
+        "japanese",
+        "korean",
+        "indian",
+        "brazilian",
+        "mexican",
+        "american",
+        "african",
+        "asian",
+        "european",
+        "soviet",
+    ];
+    if lower.contains(' ') {
+        let first_word = lower.split_whitespace().next().unwrap_or("");
+        let last_word = lower.split_whitespace().last().unwrap_or("");
+        // Reject "Nationality Nationality" or "Nationality Adjective" patterns
+        if nationality_adjectives.contains(&first_word)
+            && (nationality_adjectives.contains(&last_word)
+                || GENERIC_SINGLE_WORDS.contains(&last_word))
+        {
+            return false;
+        }
+    }
+
     // Reject entities containing Wikipedia reference/citation fragments
     if lower.contains("archived")
         || lower.contains("isbn")
@@ -1610,6 +1787,24 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         || lower == "published"
     {
         return false;
+    }
+
+    // Reject entities with words concatenated without space (parsing errors like "TelescopeThis")
+    if trimmed.len() > 5 {
+        let chars: Vec<char> = trimmed.chars().collect();
+        for i in 1..chars.len() {
+            if chars[i].is_uppercase() && chars[i - 1].is_lowercase() {
+                // Check if the suffix after the uppercase is a common word like "This", "The", "And"
+                let suffix: String = chars[i..].iter().collect();
+                let suffix_lower = suffix.to_lowercase();
+                if matches!(
+                    suffix_lower.as_str(),
+                    "this" | "the" | "and" | "that" | "here" | "there" | "from" | "with"
+                ) {
+                    return false;
+                }
+            }
+        }
     }
 
     // Reject entities that look like sentence fragments (contain common verbs/prepositions sequences)
