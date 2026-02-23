@@ -1391,6 +1391,69 @@ pub fn format_trend(
     )
 }
 
+/// Actionable graph health recommendations based on current metrics.
+/// Returns a list of (priority, recommendation) pairs sorted by importance.
+pub fn graph_recommendations(brain: &Brain) -> Result<Vec<(u8, String)>, rusqlite::Error> {
+    let health = graph_health(brain)?;
+    let mut recs: Vec<(u8, String)> = Vec::new();
+
+    let entities = health.get("entities").copied().unwrap_or(0.0) as usize;
+    let isolated = health.get("isolated_entities").copied().unwrap_or(0.0) as usize;
+    let components = health.get("components").copied().unwrap_or(0.0) as usize;
+    let largest_pct = health.get("largest_component_pct").copied().unwrap_or(0.0);
+    let avg_deg = health.get("avg_degree").copied().unwrap_or(0.0);
+
+    if entities > 0 {
+        let isolation_pct = 100.0 * isolated as f64 / entities as f64;
+        if isolation_pct > 50.0 {
+            recs.push((1, format!(
+                "CRITICAL: {:.0}% of entities are isolated ({}/{}). Run aggressive entity merging and crawl enrichment.",
+                isolation_pct, isolated, entities
+            )));
+        } else if isolation_pct > 20.0 {
+            recs.push((2, format!(
+                "HIGH: {:.0}% isolated entities ({}/{}). Consider entity deduplication and targeted crawling.",
+                isolation_pct, isolated, entities
+            )));
+        }
+    }
+
+    if components > 50 && largest_pct < 50.0 {
+        recs.push((
+            2,
+            format!(
+            "Graph is fragmented: {} components, largest only {:.1}%. Need cross-topic bridging.",
+            components, largest_pct
+        ),
+        ));
+    }
+
+    if avg_deg < 2.0 && entities > 100 {
+        recs.push((2, format!(
+            "Sparse graph: avg degree {:.2}. Most entities have ≤1 connection. Crawl more content for existing topics.",
+            avg_deg
+        )));
+    }
+
+    let density_val = graph_density(brain)?;
+    if density_val < 0.0001 && entities > 500 {
+        recs.push((3, format!(
+            "Very low density ({:.6}). Graph has {} entities but few connections. Focus on depth over breadth.",
+            density_val, entities
+        )));
+    }
+
+    if largest_pct > 90.0 && components < 5 {
+        recs.push((
+            4,
+            "Graph is well-connected! Consider exploring new topic domains.".to_string(),
+        ));
+    }
+
+    recs.sort_by_key(|r| r.0);
+    Ok(recs)
+}
+
 /// Graph fragmentation score: 0.0 = perfectly connected, 1.0 = completely fragmented.
 /// Based on fraction of node pairs that are unreachable from each other.
 pub fn fragmentation_score(brain: &Brain) -> Result<f64, rusqlite::Error> {

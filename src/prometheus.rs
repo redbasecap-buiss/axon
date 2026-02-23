@@ -2081,6 +2081,10 @@ impl<'a> Prometheus<'a> {
         // Prefix-strip island merge ("Christy Grace Hopper" → "Grace Hopper" by stripping leading words)
         let prefix_strip_merged = self.prefix_strip_island_merge().unwrap_or(0);
 
+        // Name variant merge: merge titled/suffixed variants into canonical forms
+        // ("Professor Claude Shannon" → "Claude Shannon", "Claude Shannon Time" → "Claude Shannon")
+        let name_variants_merged = self.merge_name_variants().unwrap_or(0);
+
         // Auto-consolidation: merge high-scoring entity pairs from consolidation analysis
         let auto_consolidated = self.auto_consolidate_entities(0.65).unwrap_or(0);
 
@@ -2095,6 +2099,7 @@ impl<'a> Prometheus<'a> {
             pass_merges += self.reverse_containment_island_merge().unwrap_or(0);
             pass_merges += self.purge_fragment_islands().unwrap_or(0);
             pass_merges += self.prefix_strip_island_merge().unwrap_or(0);
+            pass_merges += self.merge_name_variants().unwrap_or(0);
             if pass_merges == 0 {
                 break;
             }
@@ -2153,7 +2158,7 @@ impl<'a> Prometheus<'a> {
              {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected, \
              {} fact-inferred relations, {} name cross-references, \
              {} compound relations + {} compound merged, {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
-             {} fragment-purged, {} prefix-strip merged, {} auto-consolidated, \
+             {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} convergence-pass merges, \
              {} generic islands purged, {} predicates refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
@@ -2200,6 +2205,7 @@ impl<'a> Prometheus<'a> {
             word_merged,
             fragment_purged,
             prefix_strip_merged,
+            name_variants_merged,
             auto_consolidated,
             convergence_merges,
             generic_purged,
@@ -4386,6 +4392,184 @@ impl<'a> Prometheus<'a> {
                 self.brain.merge_entities(remove.id, keep.id)?;
                 absorbed.insert(remove.name.clone());
                 merged += 1;
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Merge name variants: merge entities whose names are title-prefixed or
+    /// noise-suffixed versions of other entities. Works on ALL entities (not just
+    /// islands), targeting patterns like:
+    /// - "Professor Claude Shannon" → "Claude Shannon"
+    /// - "Claude Shannon Time" → "Claude Shannon"
+    /// - "Grace Hopper Admiral" → "Grace Hopper"
+    /// - "Caliph Selim I" → "Selim I"
+    /// Always merges into the entity with higher degree (more connections).
+    /// Returns count of merges performed.
+    pub fn merge_name_variants(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Build name→(id, degree) index
+        let mut name_to_info: HashMap<String, (i64, usize)> = HashMap::new();
+        for e in &entities {
+            if !is_noise_type(&e.entity_type) {
+                let deg = degree.get(&e.id).copied().unwrap_or(0);
+                let lower = e.name.to_lowercase();
+                let existing_deg = name_to_info.get(&lower).map(|(_, d)| *d).unwrap_or(0);
+                if deg > existing_deg || !name_to_info.contains_key(&lower) {
+                    name_to_info.insert(lower, (e.id, deg));
+                }
+            }
+        }
+
+        // Title prefixes that should be stripped
+        let title_prefixes: &[&str] = &[
+            "professor",
+            "prof",
+            "dr",
+            "sir",
+            "lord",
+            "lady",
+            "king",
+            "queen",
+            "prince",
+            "princess",
+            "duke",
+            "count",
+            "countess",
+            "baron",
+            "admiral",
+            "general",
+            "colonel",
+            "captain",
+            "sultan",
+            "caliph",
+            "emperor",
+            "empress",
+            "president",
+            "premier",
+            "chancellor",
+            "minister",
+            "saint",
+            "pope",
+        ];
+
+        // Trailing noise words that NLP extractors commonly append
+        let trailing_noise: &[&str] = &[
+            "time",
+            "created",
+            "admiral",
+            "original",
+            "wired",
+            "founder",
+            "bits",
+            "focus",
+            "dead",
+            "mass",
+            "chairs",
+            "accompagnées",
+            "pensées",
+            "even",
+            "post",
+            "hall",
+            "suite",
+            "center",
+            "centre",
+            "house",
+            "building",
+            "institute",
+            "biography",
+            "award",
+            "day",
+        ];
+
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<i64> = HashSet::new();
+
+        for e in &entities {
+            if e.name == "Claude Shannon Time" {
+                eprintln!(
+                    "NAME_VARIANT_DEBUG: found entity '{}' type='{}' is_noise_type={}",
+                    e.name,
+                    e.entity_type,
+                    is_noise_type(&e.entity_type)
+                );
+            }
+            if absorbed.contains(&e.id) || is_noise_type(&e.entity_type) {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 {
+                continue;
+            }
+            let my_deg = degree.get(&e.id).copied().unwrap_or(0);
+
+            // 1. Strip title prefix
+            if words.len() >= 2 {
+                let first_lower = words[0].to_lowercase();
+                if title_prefixes.contains(&first_lower.as_str()) {
+                    let suffix: String = words[1..].join(" ");
+                    let lower_suffix = suffix.to_lowercase();
+                    if let Some(&(target_id, target_deg)) = name_to_info.get(&lower_suffix) {
+                        if target_id != e.id && target_deg >= my_deg {
+                            self.brain.merge_entities(e.id, target_id)?;
+                            absorbed.insert(e.id);
+                            merged += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // 2. Strip trailing noise word
+            if words.len() >= 2 {
+                let last_lower = words.last().unwrap().to_lowercase();
+                if trailing_noise.contains(&last_lower.as_str()) {
+                    let prefix: String = words[..words.len() - 1].join(" ");
+                    let lower_prefix = prefix.to_lowercase();
+                    if let Some(&(target_id, target_deg)) = name_to_info.get(&lower_prefix) {
+                        if target_id != e.id && target_deg >= my_deg {
+                            self.brain.merge_entities(e.id, target_id)?;
+                            absorbed.insert(e.id);
+                            merged += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // 3. Strip both leading AND trailing word for 4+ word entities
+            if words.len() >= 4 {
+                for lead in 1..=2 {
+                    for trail in 1..=2 {
+                        if lead + trail >= words.len() {
+                            continue;
+                        }
+                        let core: String = words[lead..words.len() - trail].join(" ");
+                        if core.split_whitespace().count() < 2 {
+                            continue;
+                        }
+                        let lower_core = core.to_lowercase();
+                        if let Some(&(target_id, target_deg)) = name_to_info.get(&lower_core) {
+                            if target_id != e.id && target_deg > my_deg {
+                                self.brain.merge_entities(e.id, target_id)?;
+                                absorbed.insert(e.id);
+                                merged += 1;
+                                break;
+                            }
+                        }
+                    }
+                    if absorbed.contains(&e.id) {
+                        break;
+                    }
+                }
             }
         }
         Ok(merged)

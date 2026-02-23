@@ -2020,6 +2020,40 @@ fn classify_entity_type(name: &str) -> &'static str {
     let lower = name.to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
 
+    // Known company/brand prefixes — "Google Translate", "Apple Music" etc. are products, not people
+    const PRODUCT_PREFIXES: &[&str] = &[
+        "google",
+        "apple",
+        "microsoft",
+        "amazon",
+        "meta",
+        "nvidia",
+        "intel",
+        "samsung",
+        "adobe",
+        "oracle",
+        "ibm",
+        "cisco",
+        "dell",
+        "hp",
+        "sony",
+        "tesla",
+        "openai",
+        "anthropic",
+    ];
+    if let Some(first) = words.first() {
+        if words.len() >= 2 && PRODUCT_PREFIXES.contains(first) {
+            // Check if last word is an org indicator
+            if let Some(last) = words.last() {
+                let clean = last.trim_matches(|c: char| !c.is_alphanumeric());
+                if ORG_INDICATORS.contains(&clean) {
+                    return "organization";
+                }
+            }
+            return "concept";
+        }
+    }
+
     // Check for person title prefix (e.g. "Dr. Smith", "President Obama")
     if let Some(first) = words.first() {
         let clean = first.trim_matches('.');
