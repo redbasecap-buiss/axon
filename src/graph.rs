@@ -2377,6 +2377,86 @@ pub fn type_assortativity(brain: &Brain) -> Result<(f64, HashMap<String, f64>), 
     Ok((global, per_type))
 }
 
+/// Personalized PageRank (PPR): measures relevance of all entities to a seed entity.
+/// Unlike global PageRank, PPR teleports back to the seed node, revealing which
+/// entities are most contextually relevant to it. Useful for "what else should I
+/// know about X?" queries and targeted crawl suggestions.
+/// Returns entity scores sorted descending (excludes the seed itself).
+pub fn personalized_pagerank(
+    brain: &Brain,
+    seed_id: i64,
+    damping: f64,
+    iterations: usize,
+) -> Result<HashMap<i64, f64>, rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let relations = brain.all_relations()?;
+    let n = entities.len();
+    if n == 0 {
+        return Ok(HashMap::new());
+    }
+    let ids: Vec<i64> = entities.iter().map(|e| e.id).collect();
+    let id_set: HashSet<i64> = ids.iter().copied().collect();
+
+    if !id_set.contains(&seed_id) {
+        return Ok(HashMap::new());
+    }
+
+    let mut out_links: HashMap<i64, Vec<i64>> = HashMap::new();
+    for r in &relations {
+        if id_set.contains(&r.subject_id) && id_set.contains(&r.object_id) {
+            out_links.entry(r.subject_id).or_default().push(r.object_id);
+        }
+    }
+
+    let mut scores: HashMap<i64, f64> = ids
+        .iter()
+        .map(|&id| (id, if id == seed_id { 1.0 } else { 0.0 }))
+        .collect();
+
+    for _ in 0..iterations {
+        let mut dangling_sum = 0.0_f64;
+        // Teleport goes to seed only (not uniform)
+        let mut new_scores: HashMap<i64, f64> = ids
+            .iter()
+            .map(|&id| (id, if id == seed_id { 1.0 - damping } else { 0.0 }))
+            .collect();
+        for &id in &ids {
+            if let Some(out) = out_links.get(&id) {
+                let share = scores[&id] / out.len() as f64;
+                for &target in out {
+                    *new_scores.entry(target).or_insert(0.0) += damping * share;
+                }
+            } else {
+                dangling_sum += scores[&id];
+            }
+        }
+        // Dangling mass goes to seed (personalized)
+        *new_scores.get_mut(&seed_id).unwrap() += damping * dangling_sum;
+        scores = new_scores;
+    }
+    scores.remove(&seed_id);
+    Ok(scores)
+}
+
+/// Find the top-N most relevant entities to a given seed entity using PPR.
+/// Returns (entity_id, score) pairs sorted by relevance.
+pub fn top_relevant(
+    brain: &Brain,
+    seed_name: &str,
+    limit: usize,
+) -> Result<Vec<(i64, f64)>, rusqlite::Error> {
+    let seed = brain.get_entity_by_name(seed_name)?;
+    let seed_id = match seed {
+        Some(e) => e.id,
+        None => return Ok(vec![]),
+    };
+    let scores = personalized_pagerank(brain, seed_id, 0.85, 30)?;
+    let mut ranked: Vec<(i64, f64)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(limit);
+    Ok(ranked)
+}
+
 pub fn neighborhood_overlap(
     brain: &Brain,
     min_score: f64,

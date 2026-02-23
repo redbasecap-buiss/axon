@@ -283,6 +283,25 @@ fn is_noise_name(name: &str) -> bool {
             "following",
             "resulting",
             "subscribe",
+            "devastated",
+            "introducing",
+            "presenting",
+            "featuring",
+            "announcing",
+            "celebrating",
+            "exploring",
+            "examining",
+            "investigating",
+            "analyzing",
+            "discovering",
+            "revealing",
+            "surviving",
+            "conquering",
+            "defeating",
+            "invading",
+            "occupying",
+            "liberating",
+            "capturing",
             "completing",
             "completions",
             "completeness",
@@ -576,6 +595,15 @@ fn is_noise_name(name: &str) -> bool {
     }
     // Names containing academic publication patterns
     if lower_trimmed.contains("monthly notices") || lower_trimmed.contains("physical review") {
+        return true;
+    }
+    // Names containing 4-digit years (citation/reference fragments like "Ramanujan Journal 1997 1")
+    let year_re = lower_trimmed.split_whitespace().any(|w| {
+        w.len() == 4
+            && w.chars().all(|c| c.is_ascii_digit())
+            && w.starts_with(['1', '2'])
+    });
+    if year_re && word_count >= 3 {
         return true;
     }
     // Roman numeral suffixes without real content (e.g. "Michael V", "Morgan I")
@@ -2632,6 +2660,9 @@ impl<'a> Prometheus<'a> {
         // Fix country-concatenation entities (e.g., "Netherlands Oskar Klein" → merge into "Oskar Klein")
         let country_concat_fixed = self.fix_country_concatenation_entities().unwrap_or(0);
 
+        // Merge prefix-noise entities (e.g., "Devastated Tim Berners-Lee" → "Tim Berners-Lee")
+        let prefix_noise_merged = self.merge_prefix_noise_entities().unwrap_or(0);
+
         // Token-based island reconnection (TF-IDF shared token matching)
         let token_reconnected = self.reconnect_islands_by_tokens().unwrap_or(0);
 
@@ -2692,7 +2723,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} token-reconnected, {} name-containment reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} token-reconnected, {} name-containment reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -2754,6 +2785,7 @@ impl<'a> Prometheus<'a> {
             concept_islands_purged,
             mistyped_person_purged,
             country_concat_fixed,
+            prefix_noise_merged,
             token_reconnected,
             name_containment_reconnected,
             predicates_refined,
@@ -4015,6 +4047,19 @@ impl<'a> Prometheus<'a> {
                         && full_lower.len() > short_lower.len() + 1
                     {
                         let conf = 0.6 + (short_words.len() as f64 * 0.1).min(0.3);
+                        subsumptions.push((
+                            short.name.clone(),
+                            full.name.clone(),
+                            short.entity_type.clone(),
+                            conf,
+                        ));
+                    }
+                    // Also check suffix match: "Elwood Shannon" ends "Claude Elwood Shannon"
+                    else if full_lower.ends_with(&short_lower)
+                        && full_lower.len() > short_lower.len() + 1
+                        && short_words.len() >= 2
+                    {
+                        let conf = 0.55 + (short_words.len() as f64 * 0.1).min(0.3);
                         subsumptions.push((
                             short.name.clone(),
                             full.name.clone(),
@@ -8710,12 +8755,13 @@ impl<'a> Prometheus<'a> {
             let has_place_word = lower_words.iter().any(|w| place_words.contains(w.as_str()));
 
             // Names with non-ASCII characters that look like non-English phrases (not person names)
+            // Check original-case words (not lower_words!) so "André Weil" passes the uppercase check
             let has_non_english_phrase = e
                 .name
                 .chars()
                 .any(|c| matches!(c, 'ü' | 'ö' | 'ä' | 'é' | 'è' | 'ñ' | 'í'))
-                && lower_words.len() >= 2
-                && !lower_words.iter().all(|w| {
+                && words.len() >= 3  // 2-word names with diacritics are usually real people
+                && !words.iter().all(|w| {
                     w.chars()
                         .next()
                         .is_some_and(|c| c.is_uppercase() || w.len() <= 3)
@@ -8901,6 +8947,94 @@ impl<'a> Prometheus<'a> {
             }
         }
         Ok(fixed)
+    }
+
+    /// Merge prefix-noise entities: longer entity names that end with a known shorter
+    /// entity name, where the prefix is noise (e.g., "Devastated Tim Berners-Lee" → "Tim Berners-Lee",
+    /// "Cannes Dev Patel" → "Dev Patel", "Moscow East Berlin" → "East Berlin").
+    /// Only merges when the shorter name exists as a separate entity of the same type
+    /// and the longer entity has low connectivity (likely an NLP extraction error).
+    pub fn merge_prefix_noise_entities(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Build name → (id, degree) lookup
+        let mut name_lookup: HashMap<String, (i64, usize)> = HashMap::new();
+        for e in &entities {
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            let lower = e.name.to_lowercase();
+            let entry = name_lookup.entry(lower).or_insert((e.id, deg));
+            if deg > entry.1 {
+                *entry = (e.id, deg);
+            }
+        }
+
+        let mut merged = 0usize;
+        for e in &entities {
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 3 {
+                continue;
+            }
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            if deg > 10 {
+                continue; // skip highly connected entities
+            }
+
+            // Try dropping 1 or 2 prefix words and check if remainder exists
+            for skip in 1..=(words.len() - 2).min(2) {
+                let remainder = words[skip..].join(" ");
+                let remainder_lower = remainder.to_lowercase();
+                let remainder_words = words.len() - skip;
+
+                // Remainder must be at least 2 words (to avoid false positives)
+                if remainder_words < 2 {
+                    continue;
+                }
+
+                if let Some(&(target_id, target_deg)) = name_lookup.get(&remainder_lower) {
+                    if target_id == e.id {
+                        continue;
+                    }
+                    // Target must have same type or be more connected
+                    let target_entity = entities.iter().find(|x| x.id == target_id);
+                    if let Some(target) = target_entity {
+                        if target.entity_type != e.entity_type {
+                            continue;
+                        }
+                    }
+                    // Merge if the prefix word(s) look like noise (place names, adjectives, verbs)
+                    // but not if they're genuine name parts (e.g., "Charles" in "Charles James Fox")
+                    let prefix_words: Vec<String> =
+                        words[..skip].iter().map(|w| w.to_lowercase()).collect();
+                    let prefix_looks_noisy = prefix_words.iter().all(|pw| {
+                        // Verb forms are always noise prefixes
+                        let is_verb_form = (pw.ends_with("ed") && pw.len() > 5)
+                            || (pw.ends_with("ing") && pw.len() > 5);
+                        let is_demonym = pw.ends_with("man") && pw.len() > 5;
+                        // If the prefix word exists as its own entity, it's likely
+                        // a place/person name that got concatenated (NLP error)
+                        let is_known_entity = name_lookup.contains_key(pw.as_str());
+                        is_verb_form || is_demonym || (is_known_entity && e.entity_type == "person")
+                    });
+                    if prefix_looks_noisy {
+                        eprintln!(
+                            "  [prefix-noise] merging '{}' (id={}, deg={}) → '{}' (id={}, deg={})",
+                            e.name, e.id, deg, remainder, target_id, target_deg
+                        );
+                        self.brain.merge_entities(e.id, target_id)?;
+                        merged += 1;
+                        break; // don't try more skips for this entity
+                    }
+                }
+            }
+        }
+        Ok(merged)
     }
 
     /// Cross-type token bridge: find pairs of entities of different types that share
