@@ -2678,6 +2678,11 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject "List of" patterns (Wikipedia list article titles)
+    if lower.starts_with("list of ") {
+        return false;
+    }
+
     // Reject "-language" suffix entries (Wikipedia language metadata like "French-language")
     if lower.ends_with("-language") {
         return false;
@@ -3862,6 +3867,15 @@ fn classify_entity_type(name: &str) -> &'static str {
                 "corridor",
                 "frontier",
                 "border",
+                "map",
+                "maps",
+                "plate",
+                "plates",
+                "newspaper",
+                "sciences",
+                "effects",
+                "models",
+                "mapper",
                 "dynasty",
                 "empire",
                 "kingdom",
