@@ -1646,6 +1646,160 @@ pub fn fragmentation_score(brain: &Brain) -> Result<f64, rusqlite::Error> {
     Ok(unreachable_pairs / (n * (n - 1.0)))
 }
 
+/// HITS (Hyperlink-Induced Topic Search) algorithm.
+/// Computes hub and authority scores for each entity.
+/// Authorities = entities pointed to by many good hubs.
+/// Hubs = entities pointing to many good authorities.
+/// Returns (hub_scores, authority_scores).
+pub fn hits(
+    brain: &Brain,
+    iterations: usize,
+) -> Result<(HashMap<i64, f64>, HashMap<i64, f64>), rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let relations = brain.all_relations()?;
+    let n = entities.len();
+    if n == 0 {
+        return Ok((HashMap::new(), HashMap::new()));
+    }
+    let ids: Vec<i64> = entities.iter().map(|e| e.id).collect();
+    let id_set: HashSet<i64> = ids.iter().copied().collect();
+
+    let mut out_links: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut in_links: HashMap<i64, Vec<i64>> = HashMap::new();
+    for r in &relations {
+        if id_set.contains(&r.subject_id) && id_set.contains(&r.object_id) {
+            out_links.entry(r.subject_id).or_default().push(r.object_id);
+            in_links.entry(r.object_id).or_default().push(r.subject_id);
+        }
+    }
+
+    let mut hub: HashMap<i64, f64> = ids.iter().map(|&id| (id, 1.0)).collect();
+    let mut auth: HashMap<i64, f64> = ids.iter().map(|&id| (id, 1.0)).collect();
+
+    for _ in 0..iterations {
+        let mut new_auth: HashMap<i64, f64> = ids.iter().map(|&id| (id, 0.0)).collect();
+        for &v in &ids {
+            if let Some(sources) = in_links.get(&v) {
+                for &u in sources {
+                    *new_auth.get_mut(&v).unwrap() += hub[&u];
+                }
+            }
+        }
+        let mut new_hub: HashMap<i64, f64> = ids.iter().map(|&id| (id, 0.0)).collect();
+        for &v in &ids {
+            if let Some(targets) = out_links.get(&v) {
+                for &u in targets {
+                    *new_hub.get_mut(&v).unwrap() += new_auth[&u];
+                }
+            }
+        }
+        let auth_norm: f64 = new_auth
+            .values()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt()
+            .max(1e-10);
+        let hub_norm: f64 = new_hub
+            .values()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt()
+            .max(1e-10);
+        for v in new_auth.values_mut() {
+            *v /= auth_norm;
+        }
+        for v in new_hub.values_mut() {
+            *v /= hub_norm;
+        }
+        auth = new_auth;
+        hub = new_hub;
+    }
+
+    Ok((hub, auth))
+}
+
+/// Graph cohesion score: combines clustering coefficient, compaction ratio,
+/// and inverse fragmentation into a single 0-1 metric.
+/// Higher = more cohesive knowledge graph.
+pub fn cohesion_score(brain: &Brain) -> Result<f64, rusqlite::Error> {
+    let compaction = compaction_ratio(brain)?;
+    let clustering = global_clustering(brain)?;
+    let frag = fragmentation_score(brain)?;
+    let score = 0.5 * compaction + 0.3 * (1.0 - frag) + 0.2 * clustering;
+    Ok(score.clamp(0.0, 1.0))
+}
+
+/// Find the best entity pairs to bridge disconnected communities.
+/// Returns (component_a_rep, component_b_rep, entity_a_name, entity_b_name, combined_size)
+/// sorted by combined component size (connecting larger components is more impactful).
+pub fn suggest_community_bridges(
+    brain: &Brain,
+    limit: usize,
+) -> Result<Vec<(String, String, usize)>, rusqlite::Error> {
+    let components = connected_components(brain)?;
+    if components.len() < 2 {
+        return Ok(vec![]);
+    }
+    let entities = brain.all_entities()?;
+    let id_to_name: HashMap<i64, &str> = entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+    let id_to_type: HashMap<i64, &str> = entities
+        .iter()
+        .map(|e| (e.id, e.entity_type.as_str()))
+        .collect();
+
+    // For each component, find its best representative (highest-quality entity name)
+    let noise_types: HashSet<&str> = ["phrase", "source", "url", "relative_date", "number_unit"]
+        .into_iter()
+        .collect();
+
+    let mut comp_reps: Vec<(String, usize)> = Vec::new();
+    for comp in &components {
+        if comp.len() < 2 {
+            continue; // skip singletons
+        }
+        // Find best representative: prefer multi-word names of high-value types
+        let mut best_name = String::new();
+        let mut best_score = 0i32;
+        for &id in comp {
+            let etype = id_to_type.get(&id).copied().unwrap_or("unknown");
+            if noise_types.contains(etype) {
+                continue;
+            }
+            let name = id_to_name.get(&id).copied().unwrap_or("");
+            let score = match etype {
+                "person" | "organization" | "company" => 10,
+                "concept" | "technology" | "place" => 8,
+                "event" | "product" => 6,
+                _ => 3,
+            } + name.split_whitespace().count() as i32;
+            if score > best_score {
+                best_score = score;
+                best_name = name.to_string();
+            }
+        }
+        if !best_name.is_empty() {
+            comp_reps.push((best_name, comp.len()));
+        }
+    }
+
+    // Sort by size descending, suggest bridging pairs of large components
+    comp_reps.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut bridges = Vec::new();
+    for i in 0..comp_reps.len().min(limit * 2) {
+        for j in (i + 1)..comp_reps.len().min(limit * 2) {
+            bridges.push((
+                comp_reps[i].0.clone(),
+                comp_reps[j].0.clone(),
+                comp_reps[i].1 + comp_reps[j].1,
+            ));
+            if bridges.len() >= limit {
+                return Ok(bridges);
+            }
+        }
+    }
+    Ok(bridges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

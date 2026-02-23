@@ -551,6 +551,32 @@ impl Brain {
     }
 
     pub fn merge_entities(&self, from_id: i64, into_id: i64) -> Result<()> {
+        // Delete relations that would violate the UNIQUE constraint before updating
+        self.conn.execute(
+            "DELETE FROM relations WHERE subject_id = ?1
+             AND EXISTS (SELECT 1 FROM relations r2
+                         WHERE r2.subject_id = ?2
+                           AND r2.predicate = relations.predicate
+                           AND r2.object_id = relations.object_id)",
+            params![from_id, into_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM relations WHERE object_id = ?1
+             AND EXISTS (SELECT 1 FROM relations r2
+                         WHERE r2.object_id = ?2
+                           AND r2.predicate = relations.predicate
+                           AND r2.subject_id = relations.subject_id)",
+            params![from_id, into_id],
+        )?;
+        // Also delete self-referential relations that would result
+        self.conn.execute(
+            "DELETE FROM relations WHERE subject_id = ?1 AND object_id = ?2",
+            params![from_id, into_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM relations WHERE subject_id = ?2 AND object_id = ?1",
+            params![from_id, into_id],
+        )?;
         self.conn.execute(
             "UPDATE relations SET subject_id = ?2 WHERE subject_id = ?1",
             params![from_id, into_id],
@@ -560,9 +586,11 @@ impl Brain {
             params![from_id, into_id],
         )?;
         self.conn.execute(
-            "UPDATE facts SET entity_id = ?2 WHERE entity_id = ?1",
+            "UPDATE OR IGNORE facts SET entity_id = ?2 WHERE entity_id = ?1",
             params![from_id, into_id],
         )?;
+        self.conn
+            .execute("DELETE FROM facts WHERE entity_id = ?1", params![from_id])?;
         self.conn
             .execute("DELETE FROM entities WHERE id = ?1", params![from_id])?;
         Ok(())

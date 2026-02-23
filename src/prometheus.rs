@@ -1375,14 +1375,30 @@ impl<'a> Prometheus<'a> {
 
     /// Generate hypotheses from shared-object patterns: if A→pred→X and B→pred→X,
     /// maybe A and B are related.
+    /// Filters out generic predicates and caps per-entity generation to avoid hub explosion.
     pub fn generate_hypotheses_from_shared_objects(&self) -> Result<Vec<Hypothesis>> {
         let relations = self.brain.all_relations()?;
         let meaningful = meaningful_ids(self.brain)?;
         // Group by (predicate, object_id) → list of subject_ids
         // Only require subjects to be meaningful (objects can be any type)
+        // Skip generic predicates that create too many spurious connections
+        let skip_preds: HashSet<&str> = [
+            "contributed_to",
+            "associated_with",
+            "references",
+            "related_concept",
+            "relevant_to",
+            "works_on",
+            "related_to",
+            "is",
+            "has",
+            "was",
+        ]
+        .into_iter()
+        .collect();
         let mut groups: HashMap<(String, i64), Vec<i64>> = HashMap::new();
         for r in &relations {
-            if meaningful.contains(&r.subject_id) {
+            if meaningful.contains(&r.subject_id) && !skip_preds.contains(r.predicate.as_str()) {
                 groups
                     .entry((r.predicate.clone(), r.object_id))
                     .or_default()
@@ -2061,6 +2077,64 @@ impl<'a> Prometheus<'a> {
             if h.subject.len() > 60 || h.object.len() > 60 {
                 return false;
             }
+            // Skip substring hypotheses — one name contains the other (merge candidates, not discoveries)
+            if h.object != "?" {
+                let sl = h.subject.to_lowercase();
+                let ol = h.object.to_lowercase();
+                if sl.contains(&ol) || ol.contains(&sl) {
+                    return false;
+                }
+            }
+            // Skip single-word generic entities as hypothesis subjects
+            if !h.subject.contains(' ') && h.subject.len() < 10 {
+                let lower = h.subject.to_lowercase();
+                let generics = [
+                    "church",
+                    "city",
+                    "court",
+                    "sea",
+                    "bay",
+                    "lake",
+                    "river",
+                    "bridge",
+                    "federal",
+                    "state",
+                    "power",
+                    "steam",
+                    "monster",
+                    "alice",
+                    "grace",
+                    "forest",
+                    "desert",
+                    "county",
+                    "district",
+                    "island",
+                    "port",
+                    "cape",
+                    "berkeley",
+                    "paris",
+                    "london",
+                    "berlin",
+                    "vienna",
+                    "zurich",
+                    "monthly",
+                    "reform",
+                    "precision",
+                    "regime",
+                    "ancient",
+                ];
+                if generics.contains(&lower.as_str()) {
+                    return false;
+                }
+            }
+            // Skip hypotheses where both entities share the same first word (likely noise variants)
+            if h.object != "?" {
+                let s_first = h.subject.split_whitespace().next().unwrap_or("");
+                let o_first = h.object.split_whitespace().next().unwrap_or("");
+                if !s_first.is_empty() && s_first == o_first && h.predicate == "related_to" {
+                    return false;
+                }
+            }
             !self
                 .hypothesis_exists(&h.subject, &h.predicate, &h.object)
                 .unwrap_or(true)
@@ -2215,6 +2289,8 @@ impl<'a> Prometheus<'a> {
             pass_merges += self.merge_name_variants().unwrap_or(0);
             pass_merges += self.aggressive_prefix_dedup().unwrap_or(0);
             pass_merges += self.merge_high_confidence_prefix_variants().unwrap_or(0);
+            pass_merges += self.dissolve_name_fragment_hubs().unwrap_or(0);
+            pass_merges += self.strip_leading_adjectives().unwrap_or(0);
             if pass_merges == 0 {
                 break;
             }
@@ -3003,11 +3079,27 @@ impl<'a> Prometheus<'a> {
         for h in hyps.iter_mut() {
             // Check if a path exists between subject and object (evidence of relation)
             if h.object != "?" {
+                // Skip substring pairs — these are merge candidates, not discoveries
+                let sl = h.subject.to_lowercase();
+                let ol = h.object.to_lowercase();
+                if sl.contains(&ol) || ol.contains(&sl) {
+                    self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                    self.record_outcome(&h.pattern_source, false)?;
+                    rejected += 1;
+                    continue;
+                }
+
                 let path = crate::graph::shortest_path(self.brain, &h.subject, &h.object)?;
                 if let Some(p) = &path {
-                    if p.len() <= 3 {
-                        // Close in graph — likely related
-                        let new_conf = (h.confidence + 0.2).min(1.0);
+                    // Only confirm via path if it's a direct connection (len=2) or
+                    // a 2-hop path (len=3) with high base confidence
+                    let path_boost = match p.len() {
+                        2 => 0.3,                         // direct connection is strong evidence
+                        3 if h.confidence >= 0.5 => 0.15, // 2-hop with existing confidence
+                        _ => 0.0,                         // longer paths are too weak
+                    };
+                    if path_boost > 0.0 {
+                        let new_conf = (h.confidence + path_boost).min(1.0);
                         if new_conf >= CONFIRMATION_THRESHOLD {
                             self.update_hypothesis_status(h.id, HypothesisStatus::Confirmed)?;
                             self.record_outcome(&h.pattern_source, true)?;
@@ -6600,6 +6692,141 @@ impl<'a> Prometheus<'a> {
             }
         }
         Ok(dissolved)
+    }
+
+    /// Strip leading adjectives/demonyms from entity names.
+    /// E.g., "American Eli Whitney" → merge into "Eli Whitney",
+    /// "French Marie Curie" → merge into "Marie Curie".
+    /// Only acts when the stripped version exists as a higher-degree entity.
+    pub fn strip_leading_adjectives(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Build name → (id, degree) lookup
+        let mut name_lookup: HashMap<String, (i64, usize)> = HashMap::new();
+        for e in &entities {
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            let lower = e.name.to_lowercase();
+            // Keep highest-degree version
+            let entry = name_lookup.entry(lower).or_insert((e.id, deg));
+            if deg > entry.1 {
+                *entry = (e.id, deg);
+            }
+        }
+
+        // Leading words that are likely adjectives/demonyms, not part of proper names
+        let leading_adjectives: HashSet<&str> = [
+            "american",
+            "british",
+            "french",
+            "german",
+            "italian",
+            "spanish",
+            "russian",
+            "chinese",
+            "japanese",
+            "indian",
+            "canadian",
+            "australian",
+            "dutch",
+            "swiss",
+            "swedish",
+            "norwegian",
+            "danish",
+            "finnish",
+            "polish",
+            "austrian",
+            "belgian",
+            "portuguese",
+            "hungarian",
+            "irish",
+            "scottish",
+            "english",
+            "welsh",
+            "greek",
+            "turkish",
+            "persian",
+            "arab",
+            "african",
+            "asian",
+            "european",
+            "latin",
+            "western",
+            "eastern",
+            "northern",
+            "southern",
+            "central",
+            "ancient",
+            "modern",
+            "medieval",
+            "classical",
+            "early",
+            "late",
+            "young",
+            "old",
+            "great",
+            "little",
+            "big",
+            "new",
+            "former",
+            "professor",
+            "dr",
+            "sir",
+            "lord",
+            "king",
+            "queen",
+            "emperor",
+            "admiral",
+            "general",
+            "colonel",
+            "captain",
+            "saint",
+            "san",
+            "scientific",
+            "royal",
+            "imperial",
+            "national",
+            "international",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let mut merged = 0usize;
+        for e in &entities {
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 3 {
+                continue; // Need at least adj + 2-word name
+            }
+            let first_lower = words[0].to_lowercase();
+            if !leading_adjectives.contains(first_lower.as_str()) {
+                continue;
+            }
+            // Try stripping the first word
+            let stripped = words[1..].join(" ");
+            let stripped_lower = stripped.to_lowercase();
+            if let Some(&(target_id, _target_deg)) = name_lookup.get(&stripped_lower) {
+                if target_id == e.id {
+                    continue;
+                }
+                let _my_deg = degree.get(&e.id).copied().unwrap_or(0);
+                // Merge the adjective-prefixed form into the canonical stripped form.
+                // The stripped form is the correct name regardless of degree.
+                eprintln!(
+                    "  [adj-strip] merging '{}' (id={}) → '{}' (id={})",
+                    e.name, e.id, stripped, target_id
+                );
+                self.brain.merge_entities(e.id, target_id)?;
+                merged += 1;
+            }
+        }
+        Ok(merged)
     }
 
     /// Information-theoretic entity scoring: rank entities by how much they contribute

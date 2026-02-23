@@ -2072,7 +2072,7 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         ];
         let marker_count = words
             .iter()
-            .filter(|w| sentence_markers.contains(&w.as_ref()))
+            .filter(|w| sentence_markers.contains(&w))
             .count();
         if marker_count >= 2 {
             return false;
@@ -2080,10 +2080,11 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     }
 
     // Reject multi-word phrases starting with lowercase (not proper nouns)
-    if trimmed.contains(' ') && trimmed.len() > 20 {
-        if trimmed.chars().next().is_some_and(|c| c.is_lowercase()) {
-            return false;
-        }
+    if trimmed.contains(' ')
+        && trimmed.len() > 20
+        && trimmed.chars().next().is_some_and(|c| c.is_lowercase())
+    {
+        return false;
     }
 
     // Reject entities with ISBN, citation markers, or caret references
