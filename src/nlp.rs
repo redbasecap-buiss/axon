@@ -2092,6 +2092,25 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject "Edition" fragments (book metadata, not entities)
+    if lower.contains("edition") {
+        return false;
+    }
+
+    // Reject entities containing Big-O / Theta notation fragments
+    if lower.contains("θ(")
+        || lower.contains("o(")
+        || trimmed.ends_with('Θ')
+        || trimmed.ends_with('θ')
+    {
+        return false;
+    }
+
+    // Reject URLs that somehow get classified as entities
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return false;
+    }
+
     // Reject single long words (code identifiers, not knowledge entities)
     if !lower.contains(' ') && trimmed.len() > 20 {
         return false;

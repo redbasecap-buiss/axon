@@ -2219,6 +2219,9 @@ impl<'a> Prometheus<'a> {
         // Fix misclassified entity types
         let types_fixed = self.fix_entity_types().unwrap_or(0);
 
+        // Infer entity types from neighborhood context
+        let types_inferred = self.infer_types_from_neighborhood().unwrap_or(0);
+
         // Purge noise entities (cleanup)
         let purged = self.purge_noise_entities().unwrap_or(0);
 
@@ -2357,7 +2360,7 @@ impl<'a> Prometheus<'a> {
              predicate diversity: {}/{} ({:.0}% diverse), \
              {} exact-name deduped, {} reverse-containment merged, {} bulk-rejected stale, \
              {} fuzzy duplicates ({} auto-merge, {} auto-merged), {} sparse topic domains, \
-             {} name subsumptions found, {} types fixed, {} noise entities purged, \
+             {} name subsumptions found, {} types fixed, {} types inferred from neighborhood, {} noise entities purged, \
              {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected, \
              {} fact-inferred relations, {} name cross-references, \
              {} compound relations + {} compound merged, {} concat split ({}r/{}c), {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
@@ -2395,6 +2398,7 @@ impl<'a> Prometheus<'a> {
             sparse_topics,
             subsumptions.len(),
             types_fixed,
+            types_inferred,
             purged,
             bulk_cleaned,
             deep_cleaned,
@@ -3925,6 +3929,177 @@ impl<'a> Prometheus<'a> {
             }
         }
         Ok(fixed)
+    }
+
+    /// Infer entity types from neighborhood: if an "unknown" entity is connected
+    /// primarily to entities of a known type via specific predicates, we can infer its type.
+    /// E.g., if X →born_in→ Y and Y is "unknown" but connected to persons, Y is likely a place.
+    /// Returns count of types inferred.
+    pub fn infer_types_from_neighborhood(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let id_to_type: HashMap<i64, String> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.clone()))
+            .collect();
+
+        // Build per-entity: {neighbor_type → count} and {predicate_role → count}
+        // predicate_role = "object_of:<pred>" or "subject_of:<pred>"
+        let mut neighbor_types: HashMap<i64, HashMap<String, usize>> = HashMap::new();
+        let mut pred_roles: HashMap<i64, HashMap<String, usize>> = HashMap::new();
+        for r in &relations {
+            if let Some(obj_type) = id_to_type.get(&r.object_id) {
+                if obj_type != "unknown" {
+                    *neighbor_types
+                        .entry(r.subject_id)
+                        .or_default()
+                        .entry(obj_type.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+            if let Some(subj_type) = id_to_type.get(&r.subject_id) {
+                if subj_type != "unknown" {
+                    *neighbor_types
+                        .entry(r.object_id)
+                        .or_default()
+                        .entry(subj_type.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+            *pred_roles
+                .entry(r.subject_id)
+                .or_default()
+                .entry(format!("subj:{}", r.predicate))
+                .or_insert(0) += 1;
+            *pred_roles
+                .entry(r.object_id)
+                .or_default()
+                .entry(format!("obj:{}", r.predicate))
+                .or_insert(0) += 1;
+        }
+
+        // Predicate-based type inference rules
+        let pred_type_rules: &[(&str, &str)] = &[
+            ("obj:born_in", "place"),
+            ("obj:located_in", "place"),
+            ("obj:headquartered_in", "place"),
+            ("obj:died_in", "place"),
+            ("obj:capital_of", "place"),
+            ("subj:born_in", "person"),
+            ("subj:died_in", "person"),
+            ("subj:authored", "person"),
+            ("subj:invented", "person"),
+            ("subj:discovered", "person"),
+            ("subj:founded", "person"),
+            ("obj:founded_by", "person"),
+            ("obj:invented_by", "person"),
+            ("obj:discovered_by", "person"),
+            ("obj:developed_by", "person"),
+            ("subj:subsidiary_of", "organization"),
+            ("subj:member_of", "person"),
+            ("obj:member_of", "organization"),
+            ("subj:employs", "organization"),
+            ("obj:instance_of", "concept"),
+        ];
+
+        let mut inferred = 0usize;
+        for e in &entities {
+            if e.entity_type != "unknown" {
+                continue;
+            }
+            // Try predicate-based rules first
+            let mut inferred_type: Option<&str> = None;
+            if let Some(roles) = pred_roles.get(&e.id) {
+                for &(role_pattern, target_type) in pred_type_rules {
+                    if roles.get(role_pattern).copied().unwrap_or(0) >= 1 {
+                        inferred_type = Some(target_type);
+                        break;
+                    }
+                }
+            }
+
+            // Fall back to majority neighbor type if ≥3 neighbors of same type
+            if inferred_type.is_none() {
+                if let Some(ntypes) = neighbor_types.get(&e.id) {
+                    if let Some((best_type, &count)) = ntypes.iter().max_by_key(|(_, &c)| c) {
+                        if count >= 3 && !is_noise_type(best_type) {
+                            // If mostly connected to persons, this might be a place/org/concept
+                            // (persons cluster around shared contexts)
+                            if best_type == "person" {
+                                inferred_type = Some("concept"); // conservative
+                            } else {
+                                // Adopt the dominant neighbor type
+                                inferred_type = Some(Box::leak(best_type.clone().into_boxed_str()));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(new_type) = inferred_type {
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE entities SET entity_type = ?1 WHERE id = ?2",
+                        params![new_type, e.id],
+                    )?;
+                    Ok(())
+                })?;
+                inferred += 1;
+            }
+        }
+        Ok(inferred)
+    }
+
+    /// Compute entity quality scores: higher score = more valuable for discovery.
+    /// Score based on: degree, type quality, name quality, fact count, community membership.
+    /// Returns (entity_id, score) sorted descending.
+    pub fn entity_quality_scores(&self, limit: usize) -> Result<Vec<(i64, String, f64)>> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        let mut scores: Vec<(i64, String, f64)> = Vec::new();
+        for e in &entities {
+            let mut score = 0.0_f64;
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+
+            // Degree contribution (log scale to avoid hub domination)
+            score += (1.0 + deg as f64).ln() * 0.3;
+
+            // Type quality
+            if HIGH_VALUE_TYPES.contains(&e.entity_type.as_str()) {
+                score += 0.3;
+            } else if e.entity_type == "unknown" {
+                score -= 0.2;
+            } else if is_noise_type(&e.entity_type) {
+                score -= 0.5;
+            }
+
+            // Name quality
+            if is_noise_name(&e.name) {
+                score -= 1.0;
+            }
+            if e.name.contains(' ') && e.name.len() >= 5 && e.name.len() <= 40 {
+                score += 0.2; // multi-word, reasonable length
+            }
+
+            // Confidence
+            score += e.confidence * 0.2;
+
+            // Isolated penalty
+            if deg == 0 {
+                score -= 0.3;
+            }
+
+            scores.push((e.id, e.name.clone(), score));
+        }
+        scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        scores.truncate(limit);
+        Ok(scores)
     }
 
     /// Deep island cleanup: remove isolated entities that provide no discovery value.
@@ -7241,6 +7416,99 @@ fn is_extraction_noise(name: &str, entity_type: &str) -> bool {
         if noise_endings.contains(&last) {
             return true;
         }
+    }
+
+    // Sentence fragments disguised as entities: "unknown" type with verb-laden text.
+    // Real entities are noun phrases; sentence fragments contain verbs, pronouns, determiners.
+    if entity_type == "unknown" && word_count >= 3 {
+        let words: Vec<&str> = lower.split_whitespace().collect();
+        let sentence_verbs = [
+            "is",
+            "was",
+            "were",
+            "are",
+            "will",
+            "would",
+            "could",
+            "should",
+            "can",
+            "may",
+            "might",
+            "has",
+            "had",
+            "have",
+            "did",
+            "does",
+            "do",
+            "been",
+            "being",
+            "became",
+            "become",
+            "came",
+            "went",
+            "said",
+            "made",
+            "found",
+            "gave",
+            "took",
+            "got",
+            "proved",
+            "lost",
+            "destroyed",
+            "decided",
+            "published",
+            "continued",
+            "controlled",
+            "succeeded",
+            "predicted",
+            "conquered",
+            "invaded",
+            "defeated",
+            "established",
+            "discovered",
+            "built",
+            "wrote",
+            "studied",
+            "increased",
+            "decreased",
+            "produced",
+            "created",
+            "remained",
+            "returned",
+            "appeared",
+            "contained",
+            "included",
+            "involved",
+            "began",
+            "started",
+            "ended",
+            "died",
+            "born",
+            "lived",
+        ];
+        let pronouns = [
+            "he", "she", "it", "his", "her", "its", "their", "they", "them", "him", "who", "whom",
+            "whose", "which", "what", "that", "this", "these", "those",
+        ];
+        let verb_count = words.iter().filter(|w| sentence_verbs.contains(w)).count();
+        let pronoun_count = words.iter().filter(|w| pronouns.contains(w)).count();
+        // 2+ verbs/pronouns in a 3+ word "entity" = sentence fragment
+        if verb_count + pronoun_count >= 2 {
+            return true;
+        }
+        // Even 1 verb + starting with lowercase = sentence fragment
+        if verb_count >= 1 {
+            if let Some(first_char) = name.chars().next() {
+                if first_char.is_lowercase() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // "unknown" type entities over 40 chars are almost always extraction errors
+    if entity_type == "unknown" && name.len() > 40 {
+        return true;
     }
 
     false
