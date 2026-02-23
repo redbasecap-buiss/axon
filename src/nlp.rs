@@ -2776,6 +2776,22 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject 3+-word entities ending with a single uppercase letter (citation fragments like "Berndt Bruce C")
+    // but allow Roman numerals (I, V, X, L, C, D, M) for historical figures like "Charles V"
+    {
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        if words.len() >= 3 {
+            if let Some(last) = words.last() {
+                if last.len() == 1 && last.chars().next().is_some_and(|c| c.is_uppercase()) {
+                    let ch = last.chars().next().unwrap();
+                    if !matches!(ch, 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M') {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
     // Reject journal/encyclopedia citation fragments
     if lower.contains("journal of")
         || lower.contains("researchgate")
@@ -3080,6 +3096,67 @@ fn classify_entity_type(name: &str) -> &'static str {
         "lucerne",
         "lugano",
         "winterthur",
+        // Countries often misclassified as concepts
+        "tajikistan",
+        "turkmenistan",
+        "uzbekistan",
+        "kyrgyzstan",
+        "kazakhstan",
+        "afghanistan",
+        "bangladesh",
+        "madagascar",
+        "mozambique",
+        "zimbabwe",
+        "botswana",
+        "namibia",
+        "ethiopia",
+        "tanzania",
+        "morocco",
+        "tunisia",
+        "algeria",
+        "somalia",
+        "cameroon",
+        "senegal",
+        "mauritania",
+        "guatemala",
+        "honduras",
+        "nicaragua",
+        "paraguay",
+        "uruguay",
+        "venezuela",
+        "suriname",
+        "reykjavik",
+        "bratislava",
+        "bucharest",
+        "budapest",
+        "helsinki",
+        "tallinn",
+        "vilnius",
+        "pristina",
+        "tirana",
+        "podgorica",
+        "skopje",
+        "chisinau",
+        "minsk",
+        "sarajevo",
+        "zagreb",
+        "belfast",
+        "edinburgh",
+        "cardiff",
+        "lisbon",
+        "madrid",
+        "warsaw",
+        "prague",
+        "copenhagen",
+        "stockholm",
+        "oslo",
+        "amsterdam",
+        "brussels",
+        "dublin",
+        "london",
+        "paris",
+        "moscow",
+        "kyiv",
     ];
     if !lower.contains(' ') && KNOWN_PLACES.contains(&lower.as_str()) {
         return "place";
