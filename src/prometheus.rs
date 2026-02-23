@@ -2062,6 +2062,20 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(aa_hyps);
         }
 
+        // 2h. Resource Allocation link prediction (better for sparse graphs)
+        let ra_weight = self.get_pattern_weight("resource_allocation")?;
+        if ra_weight >= 0.05 {
+            let ra_hyps = self.generate_hypotheses_from_resource_allocation()?;
+            all_hypotheses.extend(ra_hyps);
+        }
+
+        // 2i. Type-aware link prediction (boosts same-type entity pairs)
+        let ta_weight = self.get_pattern_weight("type_affinity")?;
+        if ta_weight >= 0.05 {
+            let ta_hyps = self.generate_hypotheses_from_type_affinity()?;
+            all_hypotheses.extend(ta_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -2315,6 +2329,9 @@ impl<'a> Prometheus<'a> {
         // Purge fragment island entities (NLP extraction errors)
         let fragment_islands_purged = self.purge_fragment_island_entities().unwrap_or(0);
 
+        // Purge single-word concept islands (adjectives, common nouns, non-English stubs)
+        let concept_islands_purged = self.purge_single_word_concept_islands().unwrap_or(0);
+
         // Refine associated_with predicates using entity type pairs
         let predicates_refined = self.refine_associated_with().unwrap_or(0);
 
@@ -2367,7 +2384,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} predicates refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} predicates refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -2426,6 +2443,7 @@ impl<'a> Prometheus<'a> {
             generic_purged,
             multiword_purged,
             fragment_islands_purged,
+            concept_islands_purged,
             predicates_refined,
             promoted,
             pair_deduped,
@@ -2890,6 +2908,84 @@ impl<'a> Prometheus<'a> {
                 || (words.len() >= 4 && words[0].len() <= 6 && e.entity_type == "person"
                     && !words[0].chars().next().unwrap_or('a').is_uppercase()
                     && e.name.chars().next().unwrap_or('a').is_lowercase());
+
+            if should_purge {
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                    Ok(())
+                })?;
+                purged += 1;
+            }
+        }
+        Ok(purged)
+    }
+
+    /// Purge single-word concept/unknown islands that are clearly noise (adjectives, common nouns,
+    /// non-English words without context). These are NLP extraction artifacts that add no knowledge.
+    /// Returns count of entities purged.
+    pub fn purge_single_word_concept_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        let mut purged = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+            let name = e.name.trim();
+            let words: Vec<&str> = name.split_whitespace().collect();
+            let lower = name.to_lowercase();
+
+            let should_purge = match words.len() {
+                1 => {
+                    // Single-word concepts/unknowns that are just adjectives or common nouns
+                    let is_concept_or_unknown =
+                        e.entity_type == "concept" || e.entity_type == "unknown";
+                    let too_generic = lower.len() <= 12
+                        && (lower.ends_with("ic")
+                            || lower.ends_with("al")
+                            || lower.ends_with("ous")
+                            || lower.ends_with("ive")
+                            || lower.ends_with("ment")
+                            || lower.ends_with("tion")
+                            || lower.ends_with("ness")
+                            || lower.ends_with("ung") // German suffix
+                            || lower.ends_with("keit") // German suffix
+                            || lower.ends_with("schaft")); // German suffix
+                                                           // Only purge generic-looking single words for concepts
+                    is_concept_or_unknown && too_generic && lower.len() < 15
+                }
+                2 | 3 => {
+                    // Multi-word fragments: "Seventh Through", "Open Zihintpause Pause"
+                    let has_ordinal = words[0].to_lowercase().ends_with("th")
+                        && [
+                            "four", "fif", "six", "seven", "eigh", "nin", "ten", "eleven", "twelf",
+                        ]
+                        .iter()
+                        .any(|p| words[0].to_lowercase().starts_with(p));
+                    let has_prep_end = ["through", "about", "during", "within", "between"]
+                        .contains(&words.last().unwrap_or(&"").to_lowercase().as_str());
+                    // "Scholarship Est", "Golden Peaches" for non-place types
+                    let ends_with_noise = ["est", "pause", "peaches"]
+                        .contains(&words.last().unwrap_or(&"").to_lowercase().as_str());
+                    (has_ordinal && has_prep_end)
+                        || ends_with_noise
+                        || (e.entity_type == "person"
+                            && words.len() == 2
+                            && ["arts", "open", "scholarship"]
+                                .contains(&words[0].to_lowercase().as_str()))
+                }
+                _ => false,
+            };
 
             if should_purge {
                 self.brain.with_conn(|conn| {
@@ -6181,6 +6277,95 @@ impl<'a> Prometheus<'a> {
                 status: HypothesisStatus::Proposed,
                 discovered_at: now_str(),
                 pattern_source: "adamic_adar".to_string(),
+            });
+        }
+        Ok(hypotheses)
+    }
+
+    /// Generate hypotheses using Resource Allocation Index — better for sparse graphs.
+    /// RA uses 1/degree instead of 1/ln(degree), giving more weight to exclusive shared neighbors.
+    pub fn generate_hypotheses_from_resource_allocation(&self) -> Result<Vec<Hypothesis>> {
+        let predictions = crate::graph::resource_allocation_predict(self.brain, 30)?;
+        let mut hypotheses = Vec::new();
+        for (a_id, b_id, score) in &predictions {
+            let a_name = self.entity_name(*a_id)?;
+            let b_name = self.entity_name(*b_id)?;
+            if is_noise_name(&a_name) || is_noise_name(&b_name) {
+                continue;
+            }
+            let confidence = (0.4 + score * 0.15).min(0.85);
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.clone(),
+                predicate: "related_to".to_string(),
+                object: b_name.clone(),
+                confidence,
+                evidence_for: vec![format!(
+                    "Resource Allocation score {:.3}: shared neighbors weighted by inverse degree",
+                    score
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!(
+                        "{} and {} share neighbors with low degree (exclusive connections)",
+                        a_name, b_name
+                    ),
+                    format!("RA link prediction score: {:.3}", score),
+                    "RA outperforms Adamic-Adar in sparse knowledge graphs".to_string(),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "resource_allocation".to_string(),
+            });
+        }
+        Ok(hypotheses)
+    }
+
+    /// Generate hypotheses using type-aware link prediction — boosts same-type entity pairs.
+    pub fn generate_hypotheses_from_type_affinity(&self) -> Result<Vec<Hypothesis>> {
+        let predictions = crate::graph::type_aware_link_predict(self.brain, 30)?;
+        let mut hypotheses = Vec::new();
+        for (a_id, b_id, score) in &predictions {
+            let a_name = self.entity_name(*a_id)?;
+            let b_name = self.entity_name(*b_id)?;
+            if is_noise_name(&a_name) || is_noise_name(&b_name) {
+                continue;
+            }
+            let a_type = self
+                .brain
+                .get_entity_by_id(*a_id)?
+                .map(|e| e.entity_type)
+                .unwrap_or_default();
+            let b_type = self
+                .brain
+                .get_entity_by_id(*b_id)?
+                .map(|e| e.entity_type)
+                .unwrap_or_default();
+            let type_info = if a_type == b_type {
+                format!("both {} type", a_type)
+            } else {
+                format!("{} + {} types", a_type, b_type)
+            };
+            let confidence = (0.4 + score * 0.08).min(0.85);
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.clone(),
+                predicate: "related_to".to_string(),
+                object: b_name.clone(),
+                confidence,
+                evidence_for: vec![format!(
+                    "Type-aware CN score {:.3} ({}) — same-type entities sharing neighbors",
+                    score, type_info
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!("{} and {} share common neighbors", a_name, b_name),
+                    format!("Type affinity: {}", type_info),
+                    "Same-type entities with shared neighbors are strongly correlated".to_string(),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "type_affinity".to_string(),
             });
         }
         Ok(hypotheses)

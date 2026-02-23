@@ -1527,6 +1527,162 @@ pub fn adamic_adar_predict(
     Ok(scores)
 }
 
+/// Resource Allocation Index for link prediction — better than Adamic-Adar for sparse graphs.
+/// RA(x,y) = Σ_{z ∈ Γ(x) ∩ Γ(y)} 1/|Γ(z)| (uses inverse degree, not inverse log-degree).
+/// In sparse graphs where most nodes have degree 1-3, RA discriminates better because
+/// 1/k decays faster than 1/ln(k) for small k, giving more weight to exclusive shared neighbors.
+/// Returns top `limit` predicted links as (entity_a, entity_b, score).
+pub fn resource_allocation_predict(
+    brain: &Brain,
+    limit: usize,
+) -> Result<Vec<(i64, i64, f64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let degree: HashMap<i64, usize> = adj
+        .iter()
+        .map(|(&id, neighbors)| (id, neighbors.len()))
+        .collect();
+
+    let relations = brain.all_relations()?;
+    let mut connected: HashSet<(i64, i64)> = HashSet::new();
+    for r in &relations {
+        let key = if r.subject_id < r.object_id {
+            (r.subject_id, r.object_id)
+        } else {
+            (r.object_id, r.subject_id)
+        };
+        connected.insert(key);
+    }
+
+    let candidates: Vec<i64> = degree
+        .iter()
+        .filter(|(_, &d)| d >= 2)
+        .map(|(&id, _)| id)
+        .collect();
+
+    let nb_sets: HashMap<i64, HashSet<i64>> = candidates
+        .iter()
+        .map(|&id| {
+            let set: HashSet<i64> = adj
+                .get(&id)
+                .map(|v| v.iter().copied().collect())
+                .unwrap_or_default();
+            (id, set)
+        })
+        .collect();
+
+    let mut scores: Vec<(i64, i64, f64)> = Vec::new();
+    for i in 0..candidates.len().min(500) {
+        let a = candidates[i];
+        let na = &nb_sets[&a];
+        for j in (i + 1)..candidates.len().min(500) {
+            let b = candidates[j];
+            let key = if a < b { (a, b) } else { (b, a) };
+            if connected.contains(&key) {
+                continue;
+            }
+            let nb = &nb_sets[&b];
+            let score: f64 = na
+                .intersection(nb)
+                .map(|&z| {
+                    let dz = degree.get(&z).copied().unwrap_or(1).max(1);
+                    1.0 / dz as f64
+                })
+                .sum();
+            if score > 0.0 {
+                scores.push((a, b, score));
+            }
+        }
+    }
+    scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    scores.truncate(limit);
+    Ok(scores)
+}
+
+/// Common Neighbors with Type Affinity (CNTA) link prediction.
+/// Extends common-neighbor scoring by boosting pairs that share the same entity type.
+/// In knowledge graphs, same-type entities that share neighbors are more likely to be related
+/// (e.g., two "person" entities who share "organization" neighbors likely collaborate).
+/// Returns top `limit` predicted links as (entity_a, entity_b, score).
+pub fn type_aware_link_predict(
+    brain: &Brain,
+    limit: usize,
+) -> Result<Vec<(i64, i64, f64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let entities = brain.all_entities()?;
+    let id_to_type: HashMap<i64, String> = entities
+        .iter()
+        .map(|e| (e.id, e.entity_type.clone()))
+        .collect();
+    let degree: HashMap<i64, usize> = adj
+        .iter()
+        .map(|(&id, neighbors)| (id, neighbors.len()))
+        .collect();
+
+    let relations = brain.all_relations()?;
+    let mut connected: HashSet<(i64, i64)> = HashSet::new();
+    for r in &relations {
+        let key = if r.subject_id < r.object_id {
+            (r.subject_id, r.object_id)
+        } else {
+            (r.object_id, r.subject_id)
+        };
+        connected.insert(key);
+    }
+
+    let candidates: Vec<i64> = degree
+        .iter()
+        .filter(|(_, &d)| d >= 2)
+        .map(|(&id, _)| id)
+        .collect();
+
+    let nb_sets: HashMap<i64, HashSet<i64>> = candidates
+        .iter()
+        .map(|&id| {
+            let set: HashSet<i64> = adj
+                .get(&id)
+                .map(|v| v.iter().copied().collect())
+                .unwrap_or_default();
+            (id, set)
+        })
+        .collect();
+
+    let mut scores: Vec<(i64, i64, f64)> = Vec::new();
+    for i in 0..candidates.len().min(500) {
+        let a = candidates[i];
+        let na = &nb_sets[&a];
+        let type_a = id_to_type.get(&a).cloned().unwrap_or_default();
+        for j in (i + 1)..candidates.len().min(500) {
+            let b = candidates[j];
+            let key = if a < b { (a, b) } else { (b, a) };
+            if connected.contains(&key) {
+                continue;
+            }
+            let nb = &nb_sets[&b];
+            let cn = na.intersection(nb).count() as f64;
+            if cn == 0.0 {
+                continue;
+            }
+            let type_b = id_to_type.get(&b).cloned().unwrap_or_default();
+            // Type affinity boost: same high-value type gets 1.5x, same type gets 1.2x
+            let type_boost = if type_a == type_b {
+                let high_value = ["person", "organization", "concept", "technology", "place"];
+                if high_value.contains(&type_a.as_str()) {
+                    1.5
+                } else {
+                    1.2
+                }
+            } else {
+                1.0
+            };
+            let score = cn * type_boost;
+            scores.push((a, b, score));
+        }
+    }
+    scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    scores.truncate(limit);
+    Ok(scores)
+}
+
 /// Predicate entropy: measures the information content / diversity of predicate usage.
 /// Higher entropy = more diverse predicate vocabulary = richer semantic graph.
 /// Low entropy = over-reliance on a few generic predicates.
@@ -2006,6 +2162,44 @@ mod tests {
         assert!(sigma >= 0.0);
         assert!(c >= 0.0);
         assert!(l >= 0.0);
+    }
+
+    #[test]
+    fn test_resource_allocation_predict() {
+        let brain = Brain::open_in_memory().unwrap();
+        let a = brain.upsert_entity("A", "person").unwrap();
+        let b = brain.upsert_entity("B", "person").unwrap();
+        let c = brain.upsert_entity("C", "person").unwrap();
+        let d = brain.upsert_entity("D", "person").unwrap();
+        brain.upsert_relation(a, "knows", c, "test").unwrap();
+        brain.upsert_relation(b, "knows", c, "test").unwrap();
+        brain.upsert_relation(a, "knows", d, "test").unwrap();
+        brain.upsert_relation(b, "knows", d, "test").unwrap();
+        let preds = resource_allocation_predict(&brain, 10).unwrap();
+        // A and B share neighbors C and D but aren't directly connected
+        assert!(!preds.is_empty());
+        // Top prediction should involve the unconnected pair
+        let top = &preds[0];
+        let ids: HashSet<i64> = [top.0, top.1].into_iter().collect();
+        assert!(ids.contains(&a) || ids.contains(&b));
+        assert!(top.2 > 0.0);
+    }
+
+    #[test]
+    fn test_type_aware_link_predict() {
+        let brain = Brain::open_in_memory().unwrap();
+        let a = brain.upsert_entity("Alice", "person").unwrap();
+        let b = brain.upsert_entity("Bob", "person").unwrap();
+        let c = brain.upsert_entity("Org1", "organization").unwrap();
+        let d = brain.upsert_entity("Org2", "organization").unwrap();
+        brain.upsert_relation(a, "works_at", c, "test").unwrap();
+        brain.upsert_relation(b, "works_at", c, "test").unwrap();
+        brain.upsert_relation(a, "member_of", d, "test").unwrap();
+        brain.upsert_relation(b, "member_of", d, "test").unwrap();
+        let preds = type_aware_link_predict(&brain, 10).unwrap();
+        assert!(!preds.is_empty());
+        // Should predict a link (score > 0)
+        assert!(preds[0].2 > 0.0);
     }
 
     #[test]
