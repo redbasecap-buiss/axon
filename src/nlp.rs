@@ -2547,6 +2547,16 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Multi-word concepts over 50 chars are almost always citation/article title fragments
+    if etype == "concept" && trimmed.contains(' ') && trimmed.len() > 50 {
+        return false;
+    }
+
+    // Person names over 40 chars are typically citation fragments
+    if etype == "person" && trimmed.len() > 40 {
+        return false;
+    }
+
     // Reject fragments where any word is a single letter (e.g. "B It", "K It", "Q Pa")
     {
         let words: Vec<&str> = trimmed.split_whitespace().collect();
@@ -2982,6 +2992,8 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         "birkhäuser",
         "vieweg",
         "teubner",
+        "race point publishing",
+        "packt publishing",
     ];
     for pub_name in PUBLISHER_NAMES {
         if lower == *pub_name

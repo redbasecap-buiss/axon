@@ -3445,6 +3445,9 @@ impl<'a> Prometheus<'a> {
         let contextual_refined = self.refine_associated_with_contextual().unwrap_or(0);
         let contributed_refined = self.refine_contributed_to().unwrap_or(0);
 
+        // Refine contemporary_of using shared-neighbor evidence
+        let contemporary_refined = self.refine_contemporary_of().unwrap_or(0);
+
         // Promote mature testing hypotheses (>3 days, confidence >= 0.65)
         let promoted = self.promote_mature_hypotheses(3, 0.65).unwrap_or(0);
 
@@ -3506,7 +3509,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} contemporary_of refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, \
              {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
              motifs: {}△ {}ff {}ch {}↔{}",
@@ -3581,6 +3584,7 @@ impl<'a> Prometheus<'a> {
             predicates_refined,
             contextual_refined,
             contributed_refined,
+            contemporary_refined,
             promoted,
             fragment_cleaned,
             pair_deduped,
@@ -9297,6 +9301,121 @@ impl<'a> Prometheus<'a> {
         Ok(updated)
     }
 
+    /// Refine `contemporary_of` predicates into more specific relationships
+    /// by analyzing shared neighbors. If two persons share an organization → "colleagues_at",
+    /// share a concept → "co_researchers", share a place → "co_located_in", etc.
+    /// Only refines when evidence is clear (≥1 shared typed neighbor).
+    pub fn refine_contemporary_of(&self) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let id_to_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Build neighbor-by-type map for each entity
+        let mut neighbors_by_type: HashMap<i64, HashMap<&str, usize>> = HashMap::new();
+        for r in &relations {
+            if r.predicate == "contemporary_of" {
+                continue; // Don't count contemporary_of as evidence
+            }
+            if let Some(&otype) = id_to_type.get(&r.object_id) {
+                *neighbors_by_type
+                    .entry(r.subject_id)
+                    .or_default()
+                    .entry(otype)
+                    .or_insert(0) += 1;
+            }
+            if let Some(&stype) = id_to_type.get(&r.subject_id) {
+                *neighbors_by_type
+                    .entry(r.object_id)
+                    .or_default()
+                    .entry(stype)
+                    .or_insert(0) += 1;
+            }
+        }
+
+        // Build shared-neighbor sets for contemporary_of pairs
+        let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+        for r in &relations {
+            if r.predicate == "contemporary_of" {
+                continue;
+            }
+            adj.entry(r.subject_id).or_default().insert(r.object_id);
+            adj.entry(r.object_id).or_default().insert(r.subject_id);
+        }
+
+        let contemporary_rels: Vec<_> = relations
+            .iter()
+            .filter(|r| r.predicate == "contemporary_of")
+            .collect();
+
+        let mut updated = 0usize;
+        for r in &contemporary_rels {
+            let s_type = id_to_type.get(&r.subject_id).copied().unwrap_or("unknown");
+            let o_type = id_to_type.get(&r.object_id).copied().unwrap_or("unknown");
+
+            // Only refine person-person contemporary_of
+            if s_type != "person" || o_type != "person" {
+                continue;
+            }
+
+            let s_adj = adj.get(&r.subject_id);
+            let o_adj = adj.get(&r.object_id);
+            let shared: Vec<i64> = match (s_adj, o_adj) {
+                (Some(a), Some(b)) => a.intersection(b).copied().collect(),
+                _ => continue,
+            };
+            if shared.is_empty() {
+                continue;
+            }
+
+            // Count shared neighbor types
+            let mut shared_types: HashMap<&str, usize> = HashMap::new();
+            for &nid in &shared {
+                if let Some(&ntype) = id_to_type.get(&nid) {
+                    *shared_types.entry(ntype).or_insert(0) += 1;
+                }
+            }
+
+            // Pick the most specific predicate based on shared neighbor types
+            let new_pred = if shared_types.get("organization").copied().unwrap_or(0) > 0 {
+                "colleagues_at"
+            } else if shared_types.get("concept").copied().unwrap_or(0) >= 2 {
+                "co_researchers"
+            } else if shared_types.get("event").copied().unwrap_or(0) > 0 {
+                "co_participants"
+            } else if shared_types.get("place").copied().unwrap_or(0) > 0
+                && shared_types.len() == 1
+            {
+                "co_located_in"
+            } else {
+                continue; // Not enough evidence to refine
+            };
+
+            let ok = self.brain.with_conn(|conn| {
+                let res = conn.execute(
+                    "UPDATE relations SET predicate = ?1 WHERE id = ?2",
+                    params![new_pred, r.id],
+                );
+                match res {
+                    Ok(_) => Ok(true),
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                }
+            })?;
+            if ok {
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
     /// Promote high-confidence testing hypotheses to confirmed if they've been
     /// testing for over `min_days` and confidence is above `min_conf`.
     /// This prevents hypothesis limbo — if nothing contradicts a plausible hypothesis
@@ -11242,6 +11361,40 @@ impl<'a> Prometheus<'a> {
                 })
                 && e.confidence < 0.7;
 
+            // 6. Organization-like suffixes ("Firefly Aerospace", "Circolo Matematico", "Matematica Italiana")
+            let org_suffixes: HashSet<&str> = [
+                "aerospace", "airlines", "airways", "associates", "automotive",
+                "bank", "brewing", "brothers", "capital", "chemicals", "clinic",
+                "club", "co", "college", "comics", "commission", "committee",
+                "communications", "company", "consortium", "consulting", "corp",
+                "corporation", "council", "dynamics", "electronics", "energy",
+                "engineering", "ensemble", "entertainment", "enterprises", "factory",
+                "federation", "films", "foundation", "fund", "gallery", "games",
+                "group", "healthcare", "holdings", "hospital", "inc", "incorporated",
+                "industries", "initiative", "instruments", "insurance", "international",
+                "italiana", "italiano", "laboratoire", "laboratorio", "laboratories",
+                "laboratory", "labs", "league", "library", "limited", "llc", "ltd",
+                "manufacturing", "matematica", "matematico", "media", "microsystems",
+                "motors", "museum", "nacional", "network", "networks", "observatory",
+                "orchestra", "organization", "partnership", "pharmaceuticals", "pharmacy",
+                "pictures", "plc", "press", "productions", "programs", "project",
+                "publishing", "records", "research", "restaurant", "robotics", "school",
+                "sciences", "semiconductor", "seminary", "services", "shipping",
+                "software", "solutions", "society", "squadron", "stadium", "station",
+                "studios", "systems", "teatro", "tech", "technologies", "technology",
+                "telecom", "therapeutics", "trust", "union", "university", "ventures",
+                "werkstatt",
+            ].into_iter().collect();
+            let ends_org_suffix = words.last().is_some_and(|w| {
+                org_suffixes.contains(w.to_lowercase().as_str())
+            }) && words.len() >= 2;
+
+            // 7. Starts with "St" / "San" / "Santa" / "Nea" / "Syr" — likely place names
+            let place_prefixes = ["st", "san", "santa", "nea", "syr", "fort", "mount", "cape", "port", "lago", "isla"];
+            let starts_place_prefix = words.first().is_some_and(|w| {
+                place_prefixes.contains(&w.to_lowercase().as_str())
+            }) && words.len() >= 2;
+
             if has_concept_word
                 || has_place_word
                 || (has_non_english_phrase && e.confidence < 0.8)
@@ -11251,6 +11404,8 @@ impl<'a> Prometheus<'a> {
                 || (plural_last && !has_place_word && words.len() <= 3)
                 || has_nonname_hyphen
                 || looks_non_name_phrase
+                || ends_org_suffix
+                || starts_place_prefix
             {
                 eprintln!(
                     "  [mistyped-person-purge] deleting island '{}' (id={})",
