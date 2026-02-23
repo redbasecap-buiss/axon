@@ -5474,6 +5474,33 @@ mod tests {
     }
 
     #[test]
+    fn test_predicate_chains() {
+        let brain = test_brain();
+        let a = brain.upsert_entity("Einstein", "person").unwrap();
+        let b = brain.upsert_entity("Germany", "place").unwrap();
+        let c = brain.upsert_entity("Europe", "place").unwrap();
+        let d = brain.upsert_entity("Curie", "person").unwrap();
+        brain.upsert_relation(a, "born_in", b, "test").unwrap();
+        brain.upsert_relation(b, "located_in", c, "test").unwrap();
+        brain.upsert_relation(d, "born_in", b, "test").unwrap();
+        let p = Prometheus::new(&brain).unwrap();
+        let chains = p.find_predicate_chains(2).unwrap();
+        assert!(
+            chains
+                .iter()
+                .any(|p| p.description.contains("born_in") && p.description.contains("located_in")),
+            "chains: {:?}",
+            chains
+        );
+        let hyps = p.generate_hypotheses_from_chains().unwrap();
+        assert!(
+            hyps.iter().any(|h| h.pattern_source == "predicate_chain"),
+            "hyps: {:?}",
+            hyps
+        );
+    }
+
+    #[test]
     fn test_predicates_similar() {
         assert!(predicates_similar("created", "built"));
         assert!(predicates_similar("is", "is_a"));

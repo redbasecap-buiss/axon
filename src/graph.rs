@@ -1179,6 +1179,41 @@ pub fn graph_summary(brain: &Brain) -> Result<String, rusqlite::Error> {
     ))
 }
 
+/// Small-world coefficient: σ = (C/C_rand) / (L/L_rand)
+/// where C = clustering coefficient, L = avg path length,
+/// C_rand = k/n, L_rand = ln(n)/ln(k) for random graph with same n,k.
+/// σ >> 1 indicates small-world network. Returns (sigma, C, L).
+pub fn small_world_coefficient(brain: &Brain) -> Result<(f64, f64, f64), rusqlite::Error> {
+    let health = graph_health(brain)?;
+    let n = health.get("entities").copied().unwrap_or(0.0);
+    let avg_k = health.get("avg_degree").copied().unwrap_or(0.0);
+
+    if n < 10.0 || avg_k < 1.0 {
+        return Ok((0.0, 0.0, 0.0));
+    }
+
+    let c = global_clustering(brain)?;
+    let (_, avg_l, _) = estimated_diameter(brain, 50)?;
+
+    if avg_l <= 0.0 {
+        return Ok((0.0, c, avg_l));
+    }
+
+    // Random graph equivalents
+    let c_rand = avg_k / n;
+    let l_rand = if avg_k > 1.0 {
+        n.ln() / avg_k.ln()
+    } else {
+        n // degenerate
+    };
+
+    let gamma = if c_rand > 0.0 { c / c_rand } else { 0.0 };
+    let lambda = if l_rand > 0.0 { avg_l / l_rand } else { 1.0 };
+    let sigma = if lambda > 0.0 { gamma / lambda } else { 0.0 };
+
+    Ok((sigma, c, avg_l))
+}
+
 /// Inter-community edge density: ratio of edges between communities vs within.
 /// Higher ratio suggests the graph needs more bridging connections.
 /// Returns (intra_edges, inter_edges, ratio).
@@ -1409,6 +1444,25 @@ mod tests {
         let (k, members) = densest_core(&brain, 3).unwrap();
         assert_eq!(k, 2);
         assert_eq!(members.len(), 3);
+    }
+
+    #[test]
+    fn test_estimated_diameter() {
+        let brain = setup();
+        let (diam, avg, samples) = estimated_diameter(&brain, 10).unwrap();
+        assert!(diam >= 3, "diameter should be at least 3 for A-B-C-D chain");
+        assert!(avg > 0.0);
+        assert!(samples > 0);
+    }
+
+    #[test]
+    fn test_small_world() {
+        let brain = setup();
+        let (sigma, c, l) = small_world_coefficient(&brain).unwrap();
+        // Small graph, just check it doesn't panic and returns valid values
+        assert!(sigma >= 0.0);
+        assert!(c >= 0.0);
+        assert!(l >= 0.0);
     }
 
     #[test]
