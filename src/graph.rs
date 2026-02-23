@@ -2697,3 +2697,31 @@ pub fn structural_diversity(brain: &Brain) -> Result<f64, rusqlite::Error> {
 
     Ok(deg_entropy + comp_entropy)
 }
+
+/// Topic-aware gap detection: for each community, find entities that have
+/// high betweenness centrality within the community but low connections to other communities.
+/// These are "local hubs" that could serve as bridges if connected cross-community.
+/// Returns (entity_id, community_id, internal_degree, external_degree).
+pub fn community_boundary_nodes(
+    brain: &Brain,
+    min_internal_degree: usize,
+) -> Result<Vec<(i64, usize, usize, usize)>, rusqlite::Error> {
+    let communities = louvain_communities(brain)?;
+    let adj = build_adjacency(brain)?;
+
+    let mut results = Vec::new();
+    for (&node, &comm) in &communities {
+        if let Some(neighbors) = adj.get(&node) {
+            let internal = neighbors
+                .iter()
+                .filter(|&&nb| communities.get(&nb) == Some(&comm))
+                .count();
+            let external = neighbors.len() - internal;
+            if internal >= min_internal_degree && external == 0 {
+                results.push((node, comm, internal, external));
+            }
+        }
+    }
+    results.sort_by(|a, b| b.2.cmp(&a.2));
+    Ok(results)
+}

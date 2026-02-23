@@ -2600,6 +2600,9 @@ impl<'a> Prometheus<'a> {
         // Bulk reject stale testing hypotheses (>5 days, confidence < 0.5)
         let bulk_rejected = self.bulk_reject_stale_testing(5, 0.5).unwrap_or(0);
 
+        // Clean up fragment hypotheses (single-word subject+object = NLP noise, not discoveries)
+        let fragment_cleaned = self.cleanup_fragment_hypotheses().unwrap_or(0);
+
         // Fuzzy duplicate detection + auto-merge high-confidence dupes
         let fuzzy_dupes = self.find_fuzzy_duplicates().unwrap_or_default();
         let merge_candidates = fuzzy_dupes.iter().filter(|d| d.3 == "merge").count();
@@ -2787,6 +2790,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
              {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
+             {} fragment hypotheses cleaned, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -2855,6 +2859,7 @@ impl<'a> Prometheus<'a> {
             predicates_refined,
             contributed_refined,
             promoted,
+            fragment_cleaned,
             pair_deduped,
             max_k,
             core_members.len(),
@@ -3699,6 +3704,18 @@ impl<'a> Prometheus<'a> {
         for h in hyps.iter_mut() {
             // Check if a path exists between subject and object (evidence of relation)
             if h.object != "?" {
+                // Reject single-word fragment pairs (NLP noise like "Grace" → "Hopper")
+                if !h.subject.contains(' ')
+                    && h.subject.len() <= 12
+                    && !h.object.contains(' ')
+                    && h.object.len() <= 12
+                {
+                    self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                    self.record_outcome(&h.pattern_source, false)?;
+                    rejected += 1;
+                    continue;
+                }
+
                 // Skip substring pairs — these are merge candidates, not discoveries
                 let sl = h.subject.to_lowercase();
                 let ol = h.object.to_lowercase();
@@ -5979,6 +5996,24 @@ impl<'a> Prometheus<'a> {
     /// with confidence below `max_confidence`, regardless of the normal rejection threshold.
     /// This prevents the testing queue from growing unboundedly.
     /// Returns count of hypotheses rejected.
+    /// Clean up fragment hypotheses: reject confirmed/testing hypotheses where both
+    /// subject and object are single-word short strings (likely NLP extraction fragments
+    /// like "Grace" → "Hopper" rather than real discoveries).
+    pub fn cleanup_fragment_hypotheses(&self) -> Result<usize> {
+        let count = self.brain.with_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE hypotheses SET status = 'rejected' \
+                 WHERE status IN ('confirmed', 'testing') \
+                 AND subject NOT LIKE '% %' AND length(subject) <= 12 \
+                 AND object NOT LIKE '% %' AND length(object) <= 12 \
+                 AND object != '?'",
+                [],
+            )?;
+            Ok(updated)
+        })?;
+        Ok(count)
+    }
+
     pub fn bulk_reject_stale_testing(&self, max_days: i64, max_confidence: f64) -> Result<usize> {
         let cutoff = (Utc::now() - chrono::Duration::days(max_days))
             .naive_utc()

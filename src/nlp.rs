@@ -2965,6 +2965,31 @@ fn classify_entity_type(name: &str) -> &'static str {
         return "place";
     }
 
+    // "Mount X", "Lake X", "Cape X", "Fort X" → place
+    const PLACE_PREFIXES: &[&str] = &[
+        "mount",
+        "lake",
+        "cape",
+        "fort",
+        "port",
+        "isle",
+        "gulf",
+        "bay",
+        "rio",
+        "san",
+        "santa",
+        "saint",
+        "st",
+        "sea of",
+        "strait of",
+        "isle of",
+    ];
+    if let Some(first) = words.first() {
+        if words.len() >= 2 && PLACE_PREFIXES.contains(first) {
+            return "place";
+        }
+    }
+
     // Check for person title prefix (e.g. "Dr. Smith", "President Obama")
     if let Some(first) = words.first() {
         let clean = first.trim_matches('.');
@@ -3140,12 +3165,59 @@ fn classify_entity_type(name: &str) -> &'static str {
                     || PLACE_INDICATORS.contains(&clean)
                     || ORG_INDICATORS.contains(&clean)
             });
+            // Common words that indicate concept, not person
+            const NOT_PERSON_WORDS: &[&str] = &[
+                "summary",
+                "control",
+                "profile",
+                "demise",
+                "review",
+                "analysis",
+                "report",
+                "system",
+                "theory",
+                "model",
+                "process",
+                "method",
+                "design",
+                "network",
+                "protocol",
+                "standard",
+                "format",
+                "module",
+                "engine",
+                "platform",
+                "automatic",
+                "executive",
+                "general",
+                "special",
+                "primary",
+                "advanced",
+                "basic",
+                "applied",
+                "abstract",
+                "digital",
+                "dynamic",
+                "static",
+                "global",
+                "local",
+                "virtual",
+                "pulsar",
+                "stellar",
+                "atomic",
+                "quantum",
+                "neural",
+                "nubian",
+                "mitteilungen",
+                "pacific",
+            ];
             // Also reject if any word is a common English word (not a name)
             let has_common_word = words.iter().any(|w| {
                 let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
                 GENERIC_SINGLE_WORDS.contains(&clean)
                     || ENTITY_BLACKLIST.contains(&clean)
                     || TRAILING_JUNK.contains(&clean)
+                    || NOT_PERSON_WORDS.contains(&clean)
             });
             if !has_noun_suffix && !has_indicator && !has_common_word {
                 return "person";
