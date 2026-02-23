@@ -1500,11 +1500,19 @@ pub fn adamic_adar_predict(
         })
         .collect();
 
-    for i in 0..candidates.len().min(500) {
-        let a = candidates[i];
+    // Sort candidates by degree descending for better coverage of high-value nodes
+    let mut sorted_candidates = candidates.clone();
+    sorted_candidates.sort_by(|a, b| {
+        degree
+            .get(b)
+            .unwrap_or(&0)
+            .cmp(&degree.get(a).unwrap_or(&0))
+    });
+    for i in 0..sorted_candidates.len().min(500) {
+        let a = sorted_candidates[i];
         let na = &nb_sets[&a];
-        for j in (i + 1)..candidates.len().min(500) {
-            let b = candidates[j];
+        for j in (i + 1)..sorted_candidates.len().min(500) {
+            let b = sorted_candidates[j];
             let key = if a < b { (a, b) } else { (b, a) };
             if connected.contains(&key) {
                 continue;

@@ -599,9 +599,7 @@ fn is_noise_name(name: &str) -> bool {
     }
     // Names containing 4-digit years (citation/reference fragments like "Ramanujan Journal 1997 1")
     let year_re = lower_trimmed.split_whitespace().any(|w| {
-        w.len() == 4
-            && w.chars().all(|c| c.is_ascii_digit())
-            && w.starts_with(['1', '2'])
+        w.len() == 4 && w.chars().all(|c| c.is_ascii_digit()) && w.starts_with(['1', '2'])
     });
     if year_re && word_count >= 3 {
         return true;
@@ -2342,8 +2340,11 @@ impl<'a> Prometheus<'a> {
         all_hypotheses.extend(analogy_hyps);
 
         // 2c. Hub-spoke hypotheses: hubs should connect to nearby same-type entities
-        let hub_hyps = self.generate_hypotheses_from_hubs()?;
-        all_hypotheses.extend(hub_hyps);
+        let hub_weight = self.get_pattern_weight("hub_spoke")?;
+        if hub_weight >= 0.10 {
+            let hub_hyps = self.generate_hypotheses_from_hubs()?;
+            all_hypotheses.extend(hub_hyps);
+        }
 
         // 2d. Community bridge hypotheses
         let bridge_hyps = self.generate_hypotheses_from_community_bridges()?;
@@ -2464,10 +2465,11 @@ impl<'a> Prometheus<'a> {
                 }
             }
             // Skip hypotheses where both entities share the same first word (likely noise variants)
+            // e.g., "French Army" ↔ "French Revolution" — these share a prefix, not a discovery
             if h.object != "?" {
                 let s_first = h.subject.split_whitespace().next().unwrap_or("");
                 let o_first = h.object.split_whitespace().next().unwrap_or("");
-                if !s_first.is_empty() && s_first == o_first && h.predicate == "related_to" {
+                if !s_first.is_empty() && s_first == o_first {
                     return false;
                 }
             }
@@ -2670,6 +2672,9 @@ impl<'a> Prometheus<'a> {
         let name_containment_reconnected =
             self.reconnect_islands_by_name_containment().unwrap_or(0);
 
+        // Single-word island reconnection (match isolated single-word entities to connected multi-word entities)
+        let single_word_reconnected = self.reconnect_single_word_islands().unwrap_or(0);
+
         // Refine generic predicates using entity type pairs
         let predicates_refined = self.refine_associated_with().unwrap_or(0);
         let contributed_refined = self.refine_contributed_to().unwrap_or(0);
@@ -2723,7 +2728,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} token-reconnected, {} name-containment reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -2788,6 +2793,7 @@ impl<'a> Prometheus<'a> {
             prefix_noise_merged,
             token_reconnected,
             name_containment_reconnected,
+            single_word_reconnected,
             predicates_refined,
             contributed_refined,
             promoted,
@@ -3323,8 +3329,102 @@ impl<'a> Prometheus<'a> {
                         && !lower.ends_with("ss")
                         && lower.len() <= 10
                         && lower.chars().next().is_some_and(|c| c.is_lowercase());
+                    // Common English words that are clearly not standalone entities
+                    let common_non_entities = [
+                        "inside",
+                        "outside",
+                        "suppose",
+                        "choose",
+                        "twelve",
+                        "tribute",
+                        "spirit",
+                        "prior",
+                        "interest",
+                        "denote",
+                        "wisdom",
+                        "resting",
+                        "highest-ever",
+                        "prevent",
+                        "protect",
+                        "produce",
+                        "promote",
+                        "propose",
+                        "promise",
+                        "provide",
+                        "pursue",
+                        "receive",
+                        "reduce",
+                        "remain",
+                        "remove",
+                        "repeat",
+                        "replace",
+                        "require",
+                        "resolve",
+                        "respond",
+                        "restore",
+                        "reveal",
+                        "select",
+                        "separate",
+                        "suggest",
+                        "support",
+                        "survive",
+                        "threat",
+                        "toward",
+                        "unlike",
+                        "within",
+                        "without",
+                        "among",
+                        "beneath",
+                        "beside",
+                        "beyond",
+                        "despite",
+                        "except",
+                        "thought",
+                        "enough",
+                        "perhaps",
+                        "rather",
+                        "though",
+                        "unless",
+                        "whether",
+                        "almost",
+                        "simply",
+                        "indeed",
+                        "merely",
+                        "hardly",
+                        "likely",
+                        "mainly",
+                        "mostly",
+                        "nearly",
+                        "partly",
+                        "quite",
+                        "truly",
+                        "fully",
+                        "deeply",
+                        "highly",
+                        "widely",
+                        "closely",
+                        "directly",
+                        "exactly",
+                        "rapidly",
+                        "slowly",
+                        "roughly",
+                        "slightly",
+                        "somewhat",
+                        "largely",
+                        "entirely",
+                        "possibly",
+                        "hole",
+                        "sign",
+                        "myth",
+                        "tell",
+                        "swin",
+                    ];
+                    let is_common_non_entity =
+                        is_concept_or_unknown && common_non_entities.contains(&lower.as_str());
                     // Only purge generic-looking single words for concepts
-                    (is_concept_or_unknown && too_generic && lower.len() < 15) || is_plural_common
+                    (is_concept_or_unknown && too_generic && lower.len() < 15)
+                        || is_plural_common
+                        || is_common_non_entity
                 }
                 2 | 3 => {
                     // Multi-word fragments: "Seventh Through", "Open Zihintpause Pause"
@@ -8336,6 +8436,50 @@ impl<'a> Prometheus<'a> {
                     if !shares_surname {
                         continue;
                     }
+                    // Require ≥2 shared tokens for person-person (avoid "John X" ↔ "John Y")
+                    if shared_toks.len() < 2 && island_toks.len() >= 2 {
+                        continue;
+                    }
+                }
+
+                // Skip connections where one entity name contains noise words suggesting
+                // it's a sentence fragment, not a real entity (e.g., "Stalin Carpet",
+                // "Dead Christ", "Good-bye David Bowie")
+                let noise_context_words = [
+                    "carpet",
+                    "dead",
+                    "goodbye",
+                    "good-bye",
+                    "let",
+                    "wealth",
+                    "textbooks",
+                    "traces",
+                    "fever",
+                    "goddamn",
+                    "god",
+                    "particle",
+                    "wall",
+                    "came",
+                    "goes",
+                    "down",
+                    "preceded",
+                    "succeeded",
+                    "mint",
+                    "re-explained",
+                    "piled",
+                    "higher",
+                    "next-level",
+                ];
+                let island_lower = island_name.to_lowercase();
+                let target_lower = target_name.to_lowercase();
+                let has_noise_context = island_lower
+                    .split_whitespace()
+                    .any(|w| noise_context_words.contains(&w))
+                    || target_lower
+                        .split_whitespace()
+                        .any(|w| noise_context_words.contains(&w));
+                if has_noise_context {
+                    continue;
                 }
 
                 // Determine predicate based on types
@@ -8479,6 +8623,166 @@ impl<'a> Prometheus<'a> {
                         break;
                     }
                 }
+            }
+        }
+        Ok(reconnected)
+    }
+
+    /// Reconnect single-word island entities to connected entities whose name contains
+    /// that word as a significant token. E.g., island "Entropy" → connected "Shannon Entropy".
+    /// Uses type-aware scoring: same-type matches are preferred, and high-value types
+    /// (person, place, concept, technology) get a boost.
+    /// Only reconnects when the match is unambiguous (one clearly best candidate).
+    pub fn reconnect_single_word_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        let mut connected: HashSet<i64> = HashSet::new();
+        let mut edges: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+            let key = if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            };
+            edges.insert(key);
+        }
+
+        // Build inverted index: lowercase token → list of connected entity IDs
+        let entity_map: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+        let mut token_to_connected: HashMap<String, Vec<i64>> = HashMap::new();
+        for e in &entities {
+            if !meaningful.contains(&e.id)
+                || !connected.contains(&e.id)
+                || is_noise_type(&e.entity_type)
+                || is_noise_name(&e.name)
+            {
+                continue;
+            }
+            // Index each significant word token
+            for word in e.name.split_whitespace() {
+                let lower = word.to_lowercase();
+                if lower.len() >= 3 {
+                    token_to_connected.entry(lower).or_default().push(e.id);
+                }
+            }
+        }
+
+        // Collect single-word island entities that are meaningful
+        let islands: Vec<&crate::db::Entity> = entities
+            .iter()
+            .filter(|e| {
+                meaningful.contains(&e.id)
+                    && !connected.contains(&e.id)
+                    && !is_noise_type(&e.entity_type)
+                    && !is_noise_name(&e.name)
+                    && e.name.split_whitespace().count() == 1
+                    && e.name.len() >= 3
+            })
+            .collect();
+
+        let mut reconnected = 0usize;
+        for island in &islands {
+            let island_lower = island.name.to_lowercase();
+
+            // Find connected entities containing this word
+            let candidates = match token_to_connected.get(&island_lower) {
+                Some(c) if !c.is_empty() => c,
+                _ => continue,
+            };
+
+            // Too many matches = too generic, skip
+            if candidates.len() > 20 {
+                continue;
+            }
+
+            // Score candidates: prefer same type, prefer shorter names (more specific match)
+            let mut scored: Vec<(i64, f64)> = Vec::new();
+            for &cid in candidates {
+                let key = if island.id < cid {
+                    (island.id, cid)
+                } else {
+                    (cid, island.id)
+                };
+                if edges.contains(&key) {
+                    continue;
+                }
+                let cand = match entity_map.get(&cid) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                let mut score = 1.0_f64;
+                // Same type bonus
+                if cand.entity_type == island.entity_type {
+                    score += 2.0;
+                }
+                // High-value type bonus
+                if HIGH_VALUE_TYPES.contains(&cand.entity_type.as_str()) {
+                    score += 0.5;
+                }
+                // Shorter name = more specific match (word is bigger fraction of name)
+                let name_words = cand.name.split_whitespace().count().max(1) as f64;
+                score += 1.0 / name_words;
+                // Exact word-boundary match bonus (not just substring)
+                let cand_tokens: Vec<String> = cand
+                    .name
+                    .split_whitespace()
+                    .map(|w| w.to_lowercase())
+                    .collect();
+                if cand_tokens.contains(&island_lower) {
+                    score += 1.0;
+                }
+                scored.push((cid, score));
+            }
+
+            if scored.is_empty() {
+                continue;
+            }
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Only reconnect if best candidate is clearly better than runner-up
+            let best_score = scored[0].1;
+            let runner_up = scored.get(1).map(|s| s.1).unwrap_or(0.0);
+            if scored.len() > 1 && best_score < runner_up * 1.3 {
+                continue; // Ambiguous — skip
+            }
+
+            let target_id = scored[0].0;
+            let target_name = entity_map
+                .get(&target_id)
+                .map(|e| e.name.as_str())
+                .unwrap_or("?");
+            let predicate = match (
+                island.entity_type.as_str(),
+                entity_map
+                    .get(&target_id)
+                    .map(|e| e.entity_type.as_str())
+                    .unwrap_or("?"),
+            ) {
+                ("person", "person") => "related_person",
+                ("place", "place") => "associated_with",
+                ("concept", "concept") => "related_concept",
+                ("technology", "technology") => "related_technology",
+                _ => "associated_with",
+            };
+
+            eprintln!(
+                "  [single-word-reconnect] {} ({}) → {} (score: {:.2}, pred: {})",
+                island.name, island.entity_type, target_name, best_score, predicate
+            );
+            self.brain.upsert_relation(
+                island.id,
+                predicate,
+                target_id,
+                "prometheus:single_word_reconnect",
+            )?;
+            reconnected += 1;
+            if reconnected >= 300 {
+                break;
             }
         }
         Ok(reconnected)
