@@ -3067,3 +3067,84 @@ pub fn type_bridge_authority(
     results.truncate(limit);
     Ok(results)
 }
+
+/// Structural similarity between two entities based on Adamic-Adar index,
+/// normalized by geometric mean of degrees. Returns [0, 1].
+pub fn structural_similarity(
+    brain: &Brain,
+    entity_a: i64,
+    entity_b: i64,
+) -> Result<f64, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let na = adj.get(&entity_a).cloned().unwrap_or_default();
+    let nb: HashSet<i64> = adj
+        .get(&entity_b)
+        .map(|v| v.iter().copied().collect())
+        .unwrap_or_default();
+
+    if na.is_empty() || nb.is_empty() {
+        return Ok(0.0);
+    }
+
+    let mut aa_sum = 0.0_f64;
+    for &n in &na {
+        if nb.contains(&n) {
+            let deg = adj.get(&n).map(|v| v.len()).unwrap_or(1);
+            aa_sum += 1.0 / (deg as f64).ln().max(1.0);
+        }
+    }
+
+    let norm = (na.len() as f64 * nb.len() as f64).sqrt();
+    Ok(if norm > 0.0 { aa_sum / norm } else { 0.0 })
+}
+
+/// Graph fragmentation index: 1 - (largest_component / total_entities).
+/// 0 = fully connected, close to 1 = highly fragmented.
+pub fn fragmentation_index(brain: &Brain) -> Result<f64, rusqlite::Error> {
+    let n = brain.all_entities()?.len();
+    if n == 0 {
+        return Ok(0.0);
+    }
+    let components = connected_components(brain)?;
+    let largest = components.first().map(|c| c.len()).unwrap_or(0);
+    Ok(1.0 - (largest as f64 / n as f64))
+}
+
+/// Identify the most central entity per community (Louvain + PageRank).
+/// Returns (community_id, leader_entity_id, leader_name, community_size, leader_pagerank).
+pub fn community_leaders(
+    brain: &Brain,
+    limit: usize,
+) -> Result<Vec<(usize, i64, String, usize, f64)>, rusqlite::Error> {
+    let communities = louvain_communities(brain)?;
+    let pr = pagerank(brain, 0.85, 30)?;
+    let entities = brain.all_entities()?;
+    let id_to_name: HashMap<i64, &str> = entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+
+    let mut comm_members: HashMap<usize, Vec<(i64, f64)>> = HashMap::new();
+    for (&eid, &cid) in &communities {
+        let score = pr.get(&eid).copied().unwrap_or(0.0);
+        comm_members.entry(cid).or_default().push((eid, score));
+    }
+
+    let mut results: Vec<(usize, i64, String, usize, f64)> = Vec::new();
+    for (cid, members) in &comm_members {
+        let size = members.len();
+        if size < 3 {
+            continue;
+        }
+        if let Some(&(leader_id, leader_pr)) = members
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            let name = id_to_name
+                .get(&leader_id)
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            results.push((*cid, leader_id, name, size, leader_pr));
+        }
+    }
+    results.sort_by(|a, b| b.3.cmp(&a.3));
+    results.truncate(limit);
+    Ok(results)
+}

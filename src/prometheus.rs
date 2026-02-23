@@ -5560,20 +5560,21 @@ impl<'a> Prometheus<'a> {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Generate hypotheses from hub entities: if a high-degree entity of type T exists,
-    /// suggest it should connect to nearby isolated entities of the same type or related types.
+    /// Generate hypotheses from hub entities using type-aware Jaccard link prediction.
+    /// Instead of blindly connecting hubs to all 2-hop neighbors, this strategy:
+    /// 1. Only considers candidates of compatible types (same or related)
+    /// 2. Uses Jaccard coefficient with a high threshold for quality
+    /// 3. Infers predicates from the specific shared neighbors' edge labels
+    /// 4. Requires shared neighbors to be meaningful (not noise)
     pub fn generate_hypotheses_from_hubs(&self) -> Result<Vec<Hypothesis>> {
-        let hubs = crate::graph::find_hubs(self.brain, 10)?;
+        let hubs = crate::graph::find_hubs(self.brain, 20)?;
         let entities = self.brain.all_entities()?;
         let relations = self.brain.all_relations()?;
         let meaningful = meaningful_ids(self.brain)?;
 
-        // Build adjacency for quick lookup
-        let mut adj: HashSet<(i64, i64)> = HashSet::new();
+        // Build neighbor sets
         let mut neighbors: HashMap<i64, HashSet<i64>> = HashMap::new();
         for r in &relations {
-            adj.insert((r.subject_id, r.object_id));
-            adj.insert((r.object_id, r.subject_id));
             neighbors
                 .entry(r.subject_id)
                 .or_default()
@@ -5584,11 +5585,44 @@ impl<'a> Prometheus<'a> {
                 .insert(r.subject_id);
         }
 
+        // Build predicate index: (subject_id, object_id) → predicate
+        let mut edge_pred: HashMap<(i64, i64), String> = HashMap::new();
+        for r in &relations {
+            if !is_generic_predicate(&r.predicate) {
+                edge_pred.insert((r.subject_id, r.object_id), r.predicate.clone());
+                edge_pred.insert((r.object_id, r.subject_id), r.predicate.clone());
+            }
+        }
+
         let id_to_entity: HashMap<i64, &crate::db::Entity> =
             entities.iter().map(|e| (e.id, e)).collect();
 
+        // Type compatibility: which types can meaningfully link?
+        let compatible_types: HashMap<&str, &[&str]> = [
+            (
+                "person",
+                &["person", "organization", "concept", "place"][..],
+            ),
+            (
+                "organization",
+                &["person", "organization", "place", "concept"][..],
+            ),
+            ("place", &["place", "organization", "person"][..]),
+            ("concept", &["concept", "person", "technology"][..]),
+            (
+                "technology",
+                &["technology", "concept", "person", "organization"][..],
+            ),
+        ]
+        .into_iter()
+        .collect();
+
         let mut hypotheses = Vec::new();
         for (hub_id, hub_degree) in &hubs {
+            // Skip very high degree hubs (too generic, e.g. "Zurich", "France")
+            if *hub_degree > 30 {
+                continue;
+            }
             let hub = match id_to_entity.get(hub_id) {
                 Some(e) => e,
                 None => continue,
@@ -5601,26 +5635,31 @@ impl<'a> Prometheus<'a> {
                 None => continue,
             };
 
-            // Strategy: find 2-hop neighbors of the hub that share many neighbors
-            // with the hub but aren't directly connected — triadic closure via hubs
-            let mut two_hop: HashMap<i64, usize> = HashMap::new();
+            // Get compatible types for this hub
+            let compat = compatible_types
+                .get(hub.entity_type.as_str())
+                .copied()
+                .unwrap_or(&["concept"]);
+
+            // Find 2-hop candidates with Jaccard scoring
+            let mut two_hop: HashMap<i64, HashSet<i64>> = HashMap::new(); // cand → set of shared neighbors
             for &nbr in hub_nbrs {
+                if !meaningful.contains(&nbr) {
+                    continue;
+                }
                 if let Some(nbr_nbrs) = neighbors.get(&nbr) {
                     for &nn in nbr_nbrs {
                         if nn != *hub_id && !hub_nbrs.contains(&nn) && meaningful.contains(&nn) {
-                            *two_hop.entry(nn).or_insert(0) += 1;
+                            two_hop.entry(nn).or_default().insert(nbr);
                         }
                     }
                 }
             }
 
-            // Sort by shared neighbor count (descending)
-            let mut candidates: Vec<(i64, usize)> = two_hop.into_iter().collect();
-            candidates.sort_by(|a, b| b.1.cmp(&a.1));
-
-            for (cand_id, shared_count) in candidates.iter().take(10) {
-                if *shared_count < 2 {
-                    break;
+            for (cand_id, shared_set) in &two_hop {
+                let shared_count = shared_set.len();
+                if shared_count < 3 {
+                    continue; // Require at least 3 shared meaningful neighbors
                 }
                 let cand = match id_to_entity.get(cand_id) {
                     Some(e) => e,
@@ -5629,13 +5668,31 @@ impl<'a> Prometheus<'a> {
                 if is_noise_name(&cand.name) || is_noise_type(&cand.entity_type) {
                     continue;
                 }
-                // Determine likely predicate from shared neighbors' predicates
+                // Type compatibility check
+                if !compat.contains(&cand.entity_type.as_str()) {
+                    continue;
+                }
+
+                // Jaccard coefficient: |shared| / |union|
+                let cand_nbrs = neighbors.get(cand_id).map(|n| n.len()).unwrap_or(0);
+                let union_size = hub_nbrs.len() + cand_nbrs - shared_count;
+                let jaccard = if union_size > 0 {
+                    shared_count as f64 / union_size as f64
+                } else {
+                    0.0
+                };
+                if jaccard < 0.15 {
+                    continue; // Require meaningful overlap ratio
+                }
+
+                // Infer predicate from shared neighbors' edge labels
                 let mut pred_counts: HashMap<String, usize> = HashMap::new();
-                for r in &relations {
-                    if r.subject_id == *hub_id || r.object_id == *hub_id {
-                        if !is_generic_predicate(&r.predicate) {
-                            *pred_counts.entry(r.predicate.clone()).or_insert(0) += 1;
-                        }
+                for &shared_nbr in shared_set {
+                    if let Some(p) = edge_pred.get(&(*hub_id, shared_nbr)) {
+                        *pred_counts.entry(p.clone()).or_insert(0) += 1;
+                    }
+                    if let Some(p) = edge_pred.get(&(*cand_id, shared_nbr)) {
+                        *pred_counts.entry(p.clone()).or_insert(0) += 1;
                     }
                 }
                 let best_pred = pred_counts
@@ -5644,35 +5701,48 @@ impl<'a> Prometheus<'a> {
                     .map(|(p, _)| p)
                     .unwrap_or_else(|| "related_to".to_string());
 
-                let base_conf = 0.4 + (*shared_count as f64 * 0.1).min(0.4);
+                // Confidence based on Jaccard + shared count
+                let base_conf =
+                    0.6 + (jaccard * 0.3).min(0.3) + (shared_count as f64 * 0.02).min(0.1);
+                let shared_names: Vec<String> = shared_set
+                    .iter()
+                    .take(4)
+                    .filter_map(|id| id_to_entity.get(id).map(|e| e.name.clone()))
+                    .collect();
+
                 hypotheses.push(Hypothesis {
                     id: 0,
                     subject: hub.name.clone(),
                     predicate: best_pred,
                     object: cand.name.clone(),
-                    confidence: base_conf,
+                    confidence: base_conf.min(0.95),
                     evidence_for: vec![format!(
-                        "Hub '{}' (degree {}) shares {} neighbors with '{}' but no direct link",
-                        hub.name, hub_degree, shared_count, cand.name
+                        "Hub '{}' (degree {}) shares {} neighbors with '{}' (Jaccard: {:.2}): {}",
+                        hub.name,
+                        hub_degree,
+                        shared_count,
+                        cand.name,
+                        jaccard,
+                        shared_names.join(", ")
                     )],
                     evidence_against: vec![],
                     reasoning_chain: vec![
                         format!(
-                            "'{}' is a hub entity (degree {}) of type '{}'",
-                            hub.name, hub_degree, hub.entity_type
+                            "'{}' is a hub (degree {}, type '{}'); '{}' is type '{}'",
+                            hub.name, hub_degree, hub.entity_type, cand.name, cand.entity_type
                         ),
                         format!(
-                            "'{}' is 2 hops away with {} shared neighbors",
-                            cand.name, shared_count
+                            "Jaccard overlap: {:.2} ({} shared / {} union)",
+                            jaccard, shared_count, union_size
                         ),
-                        "High shared-neighbor count suggests missing direct link (triadic closure)"
+                        "Type-compatible entities with high neighborhood overlap → likely related"
                             .to_string(),
                     ],
                     status: HypothesisStatus::Proposed,
                     discovered_at: now_str(),
                     pattern_source: "hub_spoke".to_string(),
                 });
-                if hypotheses.len() >= 100 {
+                if hypotheses.len() >= 50 {
                     return Ok(hypotheses);
                 }
             }
@@ -10828,6 +10898,78 @@ impl<'a> Prometheus<'a> {
         .copied()
         .collect();
 
+        let city_names: HashSet<&str> = [
+            "athens",
+            "sparta",
+            "corinth",
+            "thebes",
+            "argos",
+            "aegina",
+            "mantinea",
+            "rome",
+            "paris",
+            "london",
+            "berlin",
+            "vienna",
+            "zurich",
+            "moscow",
+            "constantinople",
+            "antioch",
+            "alexandria",
+            "trebizond",
+            "jerusalem",
+            "baghdad",
+            "cairo",
+            "delhi",
+            "beijing",
+            "tokyo",
+            "florence",
+            "venice",
+            "naples",
+            "milan",
+            "geneva",
+            "basel",
+            "bern",
+            "lyon",
+            "marseille",
+            "madrid",
+            "lisbon",
+            "amsterdam",
+            "brussels",
+            "hamburg",
+            "munich",
+            "prague",
+            "budapest",
+            "warsaw",
+            "stockholm",
+            "copenhagen",
+            "oslo",
+            "baltimore",
+            "boston",
+            "philadelphia",
+            "washington",
+            "manhattan",
+            "maryland",
+            "pennsylvania",
+            "delaware",
+            "virginia",
+            "carolina",
+            "corfu",
+            "crete",
+            "rhodes",
+            "cyprus",
+            "sicily",
+            "sardinia",
+            "mycenae",
+            "bergen",
+            "dresden",
+            "leipzig",
+            "nuremberg",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
         // Build name → (id, degree) lookup for merge targets
         let mut name_lookup: HashMap<String, (i64, usize)> = HashMap::new();
         for e in &entities {
@@ -10849,10 +10991,11 @@ impl<'a> Prometheus<'a> {
 
             // Case 1: ALL words are country/place names → this is not a valid entity
             // E.g., "Switzerland Germany Italy", "Japan India", "Netherlands Switzerland"
+            // Also catches city concatenations mistyped as person: "Sparta Corinth Aegina"
             let all_countries = lower_words
                 .iter()
-                .all(|w| country_names.contains(w.as_str()));
-            if all_countries && e.entity_type == "person" {
+                .all(|w| country_names.contains(w.as_str()) || city_names.contains(w.as_str()));
+            if all_countries && (e.entity_type == "person" || e.entity_type == "concept") {
                 let deg = degree.get(&e.id).copied().unwrap_or(0);
                 if deg <= 2 {
                     // Low connectivity — safe to delete
