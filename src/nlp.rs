@@ -2650,7 +2650,7 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
-    // Reject "person" entities containing publishing/academic terms
+    // Reject "person" entities containing publishing/academic/concept terms
     if etype == "person" {
         let person_blacklist_words = [
             "publishers",
@@ -2670,6 +2670,28 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             "recurrent",
             "falcon",
             "mirror",
+            "foundry",
+            "battalion",
+            "regiment",
+            "brigade",
+            "squadron",
+            "flotilla",
+            "division",
+            "corps",
+            "particle",
+            "interview",
+            "textbook",
+            "progress",
+            "context",
+            "polities",
+            "chaos",
+            "premier",
+            "civilization",
+            "checkpoints",
+            "attractors",
+            "westerners",
+            "development board",
+            "authorization",
         ];
         if person_blacklist_words.iter().any(|w| lower.contains(w)) {
             return false;
@@ -2743,6 +2765,36 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             || lower.starts_with("called "))
     {
         return false;
+    }
+
+    // Reject multi-word entities starting with compound-adjective prefixes
+    // e.g. "Non-Euclidean Style", "Pre-British India", "Cross-Cultural Contacts"
+    if lower.contains(' ') {
+        let compound_prefixes = [
+            "non-", "pre-", "post-", "anti-", "multi-", "cross-", "semi-", "self-", "co-", "pan-",
+            "inter-", "intra-", "trans-", "sub-", "super-", "pseudo-", "quasi-", "counter-",
+            "over-", "under-", "re-", "de-", "un-",
+        ];
+        let first_word = lower.split_whitespace().next().unwrap_or("");
+        if compound_prefixes.iter().any(|p| first_word.starts_with(p)) {
+            // Allow if it's a well-known proper noun (e.g. "Non-Aligned Movement" is a concept anyway)
+            // but reject as person
+            if etype == "person" {
+                return false;
+            }
+        }
+    }
+
+    // Reject multi-word "person" entities where first word ends in common adjective suffixes
+    if etype == "person" && lower.contains(' ') {
+        let first_word = lower.split_whitespace().next().unwrap_or("");
+        let adj_suffixes = [
+            "ized", "ised", "ated", "ting", "ling", "ning", "ring", "ding", "ical", "ious", "eous",
+            "ular", "ular", "ible", "able",
+        ];
+        if adj_suffixes.iter().any(|s| first_word.ends_with(s)) {
+            return false;
+        }
     }
 
     true
