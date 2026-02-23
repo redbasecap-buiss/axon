@@ -195,12 +195,43 @@ fn is_noise_name(name: &str) -> bool {
             return true;
         }
     }
-    // Possessive forms as standalone entities (e.g. "Newton's") — noise
-    if lower_trimmed.ends_with("'s") && word_count == 1 {
-        return true;
+    // Possessive forms as standalone entities (e.g. "Newton's", "Switzerland's") — noise
+    if lower_trimmed.ends_with("'s") || lower_trimmed.ends_with("'s") {
+        if word_count <= 2 {
+            return true;
+        }
     }
     // Entities ending with common suffix noise
     if lower_trimmed.ends_with(" et al") || lower_trimmed.ends_with(" et al.") {
+        return true;
+    }
+    // Entities that are just adjectives/demonyms (e.g. "German-speaking", "British", "Jewish")
+    let demonym_suffixes = ["ish", "ian", "ese", "ean", "speaking"];
+    if word_count == 1
+        && demonym_suffixes.iter().any(|s| lower_trimmed.ends_with(s))
+        && lower_trimmed.len() < 20
+    {
+        return true;
+    }
+    // Entities that look like duplicated words (e.g. "Zurich Airport Zurich Airport")
+    if word_count >= 4 {
+        let words: Vec<&str> = lower_trimmed.split_whitespace().collect();
+        let half = words.len() / 2;
+        if words[..half] == words[half..half * 2] {
+            return true;
+        }
+    }
+    // Capitalized generic words that aren't real entities
+    let generic_caps = [
+        "history",
+        "theory",
+        "revolution",
+        "state",
+        "prize",
+        "meanwhile",
+        "buried",
+    ];
+    if word_count == 1 && generic_caps.contains(&lower_trimmed.as_ref()) {
         return true;
     }
     false
@@ -1496,9 +1527,10 @@ impl<'a> Prometheus<'a> {
         let (total_rels, _generic_rels, diverse_rels, div_ratio) =
             self.predicate_diversity().unwrap_or((0, 0, 0, 0.0));
 
-        // Fuzzy duplicate detection
+        // Fuzzy duplicate detection + auto-merge high-confidence dupes
         let fuzzy_dupes = self.find_fuzzy_duplicates().unwrap_or_default();
         let merge_candidates = fuzzy_dupes.iter().filter(|d| d.3 == "merge").count();
+        let auto_merged = self.auto_merge_duplicates(&fuzzy_dupes).unwrap_or(0);
 
         // Topic coverage
         let topic_coverage = self.topic_coverage_analysis().unwrap_or_default();
@@ -1516,7 +1548,7 @@ impl<'a> Prometheus<'a> {
              {} cross-domain gaps, {} knowledge frontiers, {} bridge entities, {} connectable islands, \
              {} prioritized gaps, {} decayed, {} island clusters, \
              predicate diversity: {}/{} ({:.0}% diverse), \
-             {} fuzzy duplicates ({} auto-merge), {} sparse topic domains, \
+             {} fuzzy duplicates ({} auto-merge, {} auto-merged), {} sparse topic domains, \
              {} name subsumptions found, {} noise entities purged",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -1539,6 +1571,7 @@ impl<'a> Prometheus<'a> {
             div_ratio * 100.0,
             fuzzy_dupes.len(),
             merge_candidates,
+            auto_merged,
             sparse_topics,
             subsumptions.len(),
             purged,
@@ -2124,6 +2157,30 @@ impl<'a> Prometheus<'a> {
         duplicates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         duplicates.truncate(100);
         Ok(duplicates)
+    }
+
+    /// Auto-merge fuzzy duplicates with high confidence.
+    /// Keeps the shorter/cleaner name, merges the longer/noisier one into it.
+    pub fn auto_merge_duplicates(&self, dupes: &[(String, String, f64, String)]) -> Result<usize> {
+        let mut merged = 0usize;
+        for (name_a, name_b, _sim, action) in dupes {
+            if action != "merge" {
+                continue;
+            }
+            let entity_a = self.brain.get_entity_by_name(name_a)?;
+            let entity_b = self.brain.get_entity_by_name(name_b)?;
+            if let (Some(a), Some(b)) = (entity_a, entity_b) {
+                // Keep the shorter name (usually cleaner)
+                let (keep, remove) = if a.name.len() <= b.name.len() {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                self.brain.merge_entities(remove.id, keep.id)?;
+                merged += 1;
+            }
+        }
+        Ok(merged)
     }
 
     /// Analyze topic coverage: group entities by source URL domain and measure
