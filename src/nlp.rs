@@ -1915,6 +1915,15 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "parallelogram",
     "semipalatinsk",
     "wiedervereinigung",
+    // Added 2026-02-23: more noise from DB analysis
+    "abundance",
+    "academia",
+    "accademia",
+    "admissibility",
+    "advances",
+    "transactions",
+    "zeitschrift",
+    "speculum",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -2308,6 +2317,42 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject publisher/journal names (citation noise, not knowledge entities)
+    const PUBLISHER_NAMES: &[&str] = &[
+        "routledge",
+        "addison-wesley",
+        "addison–wesley",
+        "springer",
+        "wiley",
+        "elsevier",
+        "mcgraw-hill",
+        "mcgraw–hill",
+        "prentice hall",
+        "prentice-hall",
+        "o'reilly",
+        "cambridge university press",
+        "oxford university press",
+        "mit press",
+        "princeton university press",
+        "academic press",
+        "john wiley",
+        "de gruyter",
+        "brill",
+        "kluwer",
+        "pergamon",
+        "birkhäuser",
+        "vieweg",
+        "teubner",
+    ];
+    for pub_name in PUBLISHER_NAMES {
+        if lower == *pub_name
+            || lower.starts_with(&format!("{} ", pub_name))
+            || lower.ends_with(&format!(" {}", pub_name))
+        {
+            return false;
+        }
+    }
+
     // Reject entities containing Big-O / Theta notation fragments
     if lower.contains("θ(")
         || lower.contains("o(")
@@ -2319,6 +2364,17 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
 
     // Reject URLs that somehow get classified as entities
     if lower.starts_with("http://") || lower.starts_with("https://") {
+        return false;
+    }
+
+    // Reject entities containing brackets or special parsing artifacts
+    if trimmed.contains('[')
+        || trimmed.contains(']')
+        || trimmed.contains('{')
+        || trimmed.contains('}')
+        || trimmed.contains('(')
+        || trimmed.contains(')')
+    {
         return false;
     }
 

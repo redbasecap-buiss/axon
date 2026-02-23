@@ -2312,7 +2312,7 @@ pub fn neighborhood_overlap(
     let mut seen: HashSet<(i64, i64)> = HashSet::new();
 
     // For each shared neighbor, consider all pairs of its "parents"
-    for (_shared, parents) in &inv_index {
+    for parents in inv_index.values() {
         if parents.len() < 2 || parents.len() > 200 {
             continue; // Skip super-hubs to avoid O(n²) blowup
         }

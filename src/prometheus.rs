@@ -2622,6 +2622,9 @@ impl<'a> Prometheus<'a> {
         // Purge mistyped person islands (multi-word "person" entities that aren't people)
         let mistyped_person_purged = self.purge_mistyped_person_islands().unwrap_or(0);
 
+        // Fix country-concatenation entities (e.g., "Netherlands Oskar Klein" → merge into "Oskar Klein")
+        let country_concat_fixed = self.fix_country_concatenation_entities().unwrap_or(0);
+
         // Token-based island reconnection (TF-IDF shared token matching)
         let token_reconnected = self.reconnect_islands_by_tokens().unwrap_or(0);
 
@@ -2682,7 +2685,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} token-reconnected, {} name-containment reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} token-reconnected, {} name-containment reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -2743,6 +2746,7 @@ impl<'a> Prometheus<'a> {
             fragment_islands_purged,
             concept_islands_purged,
             mistyped_person_purged,
+            country_concat_fixed,
             token_reconnected,
             name_containment_reconnected,
             predicates_refined,
@@ -4039,7 +4043,10 @@ impl<'a> Prometheus<'a> {
             let is_low_value = deg == 0 && e.confidence < 0.3 && e.name.len() < 4;
             // Aggressive: purge isolated entities that look like citation fragments
             let is_citation_fragment = deg == 0 && looks_like_citation(&e.name);
-            if (deg <= 1 && is_noise) || is_low_value || is_citation_fragment {
+            // For entities matching noise name patterns, purge up to degree 3
+            // (many noise entities accumulate relations through automated discovery)
+            let noise_threshold = if is_noise_name(&e.name) { 3 } else { 1 };
+            if (deg <= noise_threshold && is_noise) || is_low_value || is_citation_fragment {
                 self.brain.with_conn(|conn| {
                     conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
                     conn.execute(
@@ -7558,14 +7565,96 @@ impl<'a> Prometheus<'a> {
         .copied()
         .collect();
 
+        // Country/region names that appear as prefixes in NLP extraction errors
+        // e.g. "Netherlands Oskar Klein", "Switzerland CERN", "Japan Toyota"
+        let country_prefixes: HashSet<&str> = [
+            "netherlands",
+            "switzerland",
+            "germany",
+            "france",
+            "italy",
+            "spain",
+            "portugal",
+            "belgium",
+            "austria",
+            "sweden",
+            "norway",
+            "denmark",
+            "finland",
+            "poland",
+            "hungary",
+            "romania",
+            "bulgaria",
+            "serbia",
+            "croatia",
+            "greece",
+            "turkey",
+            "russia",
+            "ukraine",
+            "japan",
+            "korea",
+            "taiwan",
+            "thailand",
+            "vietnam",
+            "indonesia",
+            "malaysia",
+            "singapore",
+            "philippines",
+            "brazil",
+            "argentina",
+            "mexico",
+            "colombia",
+            "chile",
+            "peru",
+            "egypt",
+            "israel",
+            "iran",
+            "iraq",
+            "pakistan",
+            "bangladesh",
+            "nigeria",
+            "kenya",
+            "ethiopia",
+            "tanzania",
+            "australia",
+            "zealand",
+            "ireland",
+            "scotland",
+            "england",
+            "wales",
+            "canada",
+            "cuba",
+            "prussia",
+            "saxony",
+            "bavaria",
+            "bohemia",
+            "catalonia",
+            "lombardy",
+            "tuscany",
+            "andalusia",
+            "normandy",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        // Combine all strippable prefixes
+        let all_prefixes: HashSet<&str> = leading_adjectives
+            .union(&country_prefixes)
+            .copied()
+            .collect();
+
         let mut merged = 0usize;
         for e in &entities {
             let words: Vec<&str> = e.name.split_whitespace().collect();
-            if words.len() < 3 {
-                continue; // Need at least adj + 2-word name
+            // For person entities, allow stripping to 2-word result (e.g. "Netherlands Oskar Klein" → "Oskar Klein")
+            // For other types, still require 3+ words
+            let min_words = if e.entity_type == "person" { 2 } else { 3 };
+            if words.len() < min_words + 1 {
+                continue;
             }
             let first_lower = words[0].to_lowercase();
-            if !leading_adjectives.contains(first_lower.as_str()) {
+            if !all_prefixes.contains(first_lower.as_str()) {
                 continue;
             }
             // Try stripping the first word
@@ -8061,10 +8150,8 @@ impl<'a> Prometheus<'a> {
                     if longer.contains(shorter) {
                         // Overlap ratio: how much of the longer name is covered
                         let ratio = shorter.len() as f64 / longer.len().max(1) as f64;
-                        if ratio > 0.4 {
-                            if best.is_none() || ratio > best.unwrap().1 {
-                                best = Some((*cid, ratio));
-                            }
+                        if ratio > 0.4 && (best.is_none() || ratio > best.unwrap().1) {
+                            best = Some((*cid, ratio));
                         }
                     }
                 }
@@ -8356,6 +8443,165 @@ impl<'a> Prometheus<'a> {
             }
         }
         Ok(purged)
+    }
+
+    /// Fix entities that are concatenated country/place names mistyped as persons.
+    /// E.g., "Switzerland Germany Italy" (person) → delete or retype to "place".
+    /// Also merges connected country-prefixed person entities into their canonical form.
+    /// E.g., "Netherlands Oskar Klein" (11 rels) → merge into "Oskar Klein".
+    /// Returns count of entities fixed.
+    pub fn fix_country_concatenation_entities(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        let country_names: HashSet<&str> = [
+            "netherlands",
+            "switzerland",
+            "germany",
+            "france",
+            "italy",
+            "spain",
+            "portugal",
+            "belgium",
+            "austria",
+            "sweden",
+            "norway",
+            "denmark",
+            "finland",
+            "poland",
+            "hungary",
+            "romania",
+            "bulgaria",
+            "serbia",
+            "croatia",
+            "greece",
+            "turkey",
+            "russia",
+            "ukraine",
+            "japan",
+            "korea",
+            "taiwan",
+            "china",
+            "india",
+            "brazil",
+            "mexico",
+            "egypt",
+            "israel",
+            "iran",
+            "iraq",
+            "prussia",
+            "saxony",
+            "bavaria",
+            "bohemia",
+            "england",
+            "scotland",
+            "ireland",
+            "wales",
+            "canada",
+            "australia",
+            "europe",
+            "asia",
+            "africa",
+            "america",
+            "crimea",
+            "balkans",
+            "caucasus",
+            "mongolia",
+            "persia",
+            "arabia",
+            "ottoman",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        // Build name → (id, degree) lookup for merge targets
+        let mut name_lookup: HashMap<String, (i64, usize)> = HashMap::new();
+        for e in &entities {
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            let lower = e.name.to_lowercase();
+            let entry = name_lookup.entry(lower).or_insert((e.id, deg));
+            if deg > entry.1 {
+                *entry = (e.id, deg);
+            }
+        }
+
+        let mut fixed = 0usize;
+        for e in &entities {
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 {
+                continue;
+            }
+            let lower_words: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+
+            // Case 1: ALL words are country/place names → this is not a valid entity
+            // E.g., "Switzerland Germany Italy", "Japan India", "Netherlands Switzerland"
+            let all_countries = lower_words
+                .iter()
+                .all(|w| country_names.contains(w.as_str()));
+            if all_countries && e.entity_type == "person" {
+                let deg = degree.get(&e.id).copied().unwrap_or(0);
+                if deg <= 2 {
+                    // Low connectivity — safe to delete
+                    eprintln!(
+                        "  [country-concat] deleting all-country person '{}' (id={}, deg={})",
+                        e.name, e.id, deg
+                    );
+                    self.brain.with_conn(|conn| {
+                        conn.execute(
+                            "DELETE FROM relations WHERE subject_id = ?1 OR object_id = ?1",
+                            params![e.id],
+                        )?;
+                        conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                        Ok(())
+                    })?;
+                    fixed += 1;
+                } else {
+                    // Has many connections — retype to "place" instead of deleting
+                    eprintln!(
+                        "  [country-concat] retyping all-country person '{}' → place (id={}, deg={})",
+                        e.name, e.id, deg
+                    );
+                    self.brain.with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE entities SET entity_type = 'place' WHERE id = ?1",
+                            params![e.id],
+                        )?;
+                        Ok(())
+                    })?;
+                    fixed += 1;
+                }
+                continue;
+            }
+
+            // Case 2: First word is a country name, rest looks like a real person name
+            // E.g., "Netherlands Oskar Klein" → merge into "Oskar Klein"
+            if e.entity_type == "person"
+                && words.len() >= 3
+                && country_names.contains(lower_words[0].as_str())
+            {
+                // Check if the non-country remainder is a proper name (starts with uppercase)
+                let remainder = words[1..].join(" ");
+                let remainder_lower = remainder.to_lowercase();
+                if let Some(&(target_id, _)) = name_lookup.get(&remainder_lower) {
+                    if target_id != e.id {
+                        eprintln!(
+                            "  [country-prefix] merging '{}' (id={}) → '{}' (id={})",
+                            e.name, e.id, remainder, target_id
+                        );
+                        self.brain.merge_entities(e.id, target_id)?;
+                        fixed += 1;
+                    }
+                }
+            }
+        }
+        Ok(fixed)
     }
 
     /// Cross-type token bridge: find pairs of entities of different types that share
@@ -9835,10 +10081,11 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         "manchuria",
         "xinjiang",
     ];
-    if (current_type == "concept" || current_type == "person") && word_count == 1 {
-        if known_countries.contains(&lower) {
-            return Some("place");
-        }
+    if (current_type == "concept" || current_type == "person")
+        && word_count == 1
+        && known_countries.contains(&lower)
+    {
+        return Some("place");
     }
 
     // Multi-word place names misclassified as concept (e.g. "Spanish Netherlands", "Ottoman Empire")

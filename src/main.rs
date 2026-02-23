@@ -293,17 +293,39 @@ async fn main() -> anyhow::Result<()> {
             let scores = graph::pagerank(&brain, 0.85, 30)?;
             let mut ranked: Vec<_> = scores.into_iter().collect();
             ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            ranked.truncate(limit);
-            if ranked.is_empty() {
+            // Filter noise types from ranking display
+            let noise_types: std::collections::HashSet<&str> = [
+                "phrase",
+                "source",
+                "url",
+                "relative_date",
+                "number_unit",
+                "date",
+                "year",
+                "currency",
+                "email",
+                "compound_noun",
+            ]
+            .iter()
+            .copied()
+            .collect();
+            let mut filtered = Vec::new();
+            for (id, score) in &ranked {
+                if let Some(e) = brain.get_entity_by_id(*id)? {
+                    if !noise_types.contains(e.entity_type.as_str()) && e.name.len() >= 2 {
+                        filtered.push((*id, *score, e.name, e.entity_type));
+                    }
+                }
+                if filtered.len() >= limit {
+                    break;
+                }
+            }
+            if filtered.is_empty() {
                 println!("🤷 No entities to rank.");
             } else {
                 println!("📊 Top entities by PageRank:\n");
-                for (i, (id, score)) in ranked.iter().enumerate() {
-                    let name = brain
-                        .get_entity_by_id(*id)?
-                        .map(|e| e.name)
-                        .unwrap_or_else(|| format!("#{id}"));
-                    println!("  {}. {name} ({score:.4})", i + 1);
+                for (i, (_id, score, name, etype)) in filtered.iter().enumerate() {
+                    println!("  {}. {name} [{etype}] ({score:.4})", i + 1);
                 }
             }
         }
