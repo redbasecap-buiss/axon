@@ -1677,6 +1677,14 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             "written",
             "radioactive",
             "geeks",
+            "meanwhile",
+            "properties",
+            "environment",
+            "environmental",
+            "spaces",
+            "balanced",
+            "cosmic",
+            "march",
         ];
         if lower.contains(' ') && leading_verbs.contains(&first_word) {
             return false;
@@ -1753,11 +1761,35 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         "asian",
         "european",
         "soviet",
+        "western",
+        "eastern",
+        "northern",
+        "southern",
+        "central",
+        "modern",
+        "ancient",
+        "early",
+        "imperial",
+        "royal",
+        "upper",
+        "lower",
+        "holy",
+        "national",
+        "old",
+        "new",
+        "united",
+        "arab",
+        "irish",
+        "scottish",
+        "belgian",
+        "persian",
+        "ottoman",
+        "latin",
     ];
     if lower.contains(' ') {
         let first_word = lower.split_whitespace().next().unwrap_or("");
         let last_word = lower.split_whitespace().last().unwrap_or("");
-        // Reject "Nationality Nationality" or "Nationality Adjective" patterns
+        // Reject "Nationality/Adjective + Nationality/Generic" patterns
         if nationality_adjectives.contains(&first_word)
             && (nationality_adjectives.contains(&last_word)
                 || GENERIC_SINGLE_WORDS.contains(&last_word))
@@ -1870,6 +1902,65 @@ fn classify_entity_type(name: &str) -> &'static str {
         && name.chars().all(|c| c.is_uppercase() || !c.is_alphabetic())
     {
         return "organization";
+    }
+
+    // Reject nationality/direction-prefixed phrases as person names
+    let nationality_prefixes: &[&str] = &[
+        "french",
+        "british",
+        "german",
+        "italian",
+        "spanish",
+        "portuguese",
+        "swedish",
+        "russian",
+        "chinese",
+        "japanese",
+        "korean",
+        "indian",
+        "american",
+        "african",
+        "european",
+        "soviet",
+        "dutch",
+        "austrian",
+        "belgian",
+        "polish",
+        "greek",
+        "turkish",
+        "persian",
+        "ottoman",
+        "arab",
+        "irish",
+        "scottish",
+        "mexican",
+        "brazilian",
+        "canadian",
+        "serbian",
+        "croatian",
+        "western",
+        "eastern",
+        "northern",
+        "southern",
+        "central",
+        "modern",
+        "ancient",
+        "early",
+        "imperial",
+        "royal",
+        "upper",
+        "lower",
+        "holy",
+        "national",
+        "old",
+        "new",
+        "united",
+        "latin",
+    ];
+    if let Some(first) = words.first() {
+        if nationality_prefixes.contains(first) && words.len() >= 2 {
+            return "concept";
+        }
     }
 
     // Two or three capitalized words with no indicators → likely person name
