@@ -4552,6 +4552,385 @@ impl<'a> Prometheus<'a> {
             .map(|e| e.name)
             .unwrap_or_else(|| format!("#{}", id)))
     }
+
+    // -----------------------------------------------------------------------
+    // Predicate Specificity Analysis
+    // -----------------------------------------------------------------------
+
+    /// Analyze predicate quality: identify over-reliance on vague predicates
+    /// and suggest more specific alternatives based on entity types and context.
+    /// Returns (predicate, count, specificity_score, suggestion).
+    pub fn predicate_specificity_analysis(&self) -> Result<Vec<(String, usize, f64, String)>> {
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let id_to_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Count predicates and their subject/object type pairs
+        let mut pred_count: HashMap<String, usize> = HashMap::new();
+        let mut pred_type_pairs: HashMap<String, HashMap<(String, String), usize>> = HashMap::new();
+
+        for r in &relations {
+            *pred_count.entry(r.predicate.clone()).or_insert(0) += 1;
+            let stype = id_to_type
+                .get(&r.subject_id)
+                .copied()
+                .unwrap_or("unknown")
+                .to_string();
+            let otype = id_to_type
+                .get(&r.object_id)
+                .copied()
+                .unwrap_or("unknown")
+                .to_string();
+            *pred_type_pairs
+                .entry(r.predicate.clone())
+                .or_default()
+                .entry((stype, otype))
+                .or_insert(0) += 1;
+        }
+
+        let total = relations.len();
+        let mut results = Vec::new();
+
+        // Vague predicates that could be more specific
+        let vague_predicates: HashMap<&str, &[(&str, &str, &str)]> = HashMap::from([
+            (
+                "associated_with",
+                &[
+                    ("person", "place", "born_in / lived_in / worked_in"),
+                    ("person", "organization", "member_of / founded / worked_at"),
+                    (
+                        "person",
+                        "person",
+                        "collaborated_with / influenced / mentored",
+                    ),
+                    ("person", "concept", "developed / studied / contributed_to"),
+                    ("organization", "place", "headquartered_in / operates_in"),
+                    (
+                        "concept",
+                        "concept",
+                        "related_to / subclass_of / derived_from",
+                    ),
+                    ("technology", "person", "invented_by / developed_by"),
+                    ("technology", "concept", "implements / based_on"),
+                ][..],
+            ),
+            (
+                "related_to",
+                &[
+                    ("person", "person", "collaborated_with / influenced"),
+                    ("concept", "concept", "subclass_of / part_of / derived_from"),
+                    ("place", "place", "borders / located_in / part_of"),
+                ][..],
+            ),
+        ]);
+
+        for (pred, count) in &pred_count {
+            let dominance = *count as f64 / total.max(1) as f64;
+            let specificity = if vague_predicates.contains_key(pred.as_str()) {
+                // Vague predicate — lower specificity
+                (1.0 - dominance).max(0.0)
+            } else if is_generic_predicate(pred) {
+                0.1
+            } else {
+                // Specific predicate — high specificity
+                0.8 + (0.2 * (1.0 - dominance))
+            };
+
+            let suggestion = if let Some(suggestions) = vague_predicates.get(pred.as_str()) {
+                // Find most common type pairs for this predicate
+                if let Some(type_pairs) = pred_type_pairs.get(pred) {
+                    let mut pairs: Vec<_> = type_pairs.iter().collect();
+                    pairs.sort_by(|a, b| b.1.cmp(a.1));
+                    let top_pair = &pairs[0].0;
+                    // Find matching suggestion
+                    suggestions
+                        .iter()
+                        .find(|(st, ot, _)| *st == top_pair.0 && *ot == top_pair.1)
+                        .map(|(st, ot, sugg)| {
+                            format!(
+                                "For {}->{}: consider {} (affects {} rels)",
+                                st, ot, sugg, pairs[0].1
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            format!(
+                                "Top usage: {}->{} ({} times) — needs domain-specific predicate",
+                                top_pair.0, top_pair.1, pairs[0].1
+                            )
+                        })
+                } else {
+                    "No type pair data".to_string()
+                }
+            } else {
+                "OK — specific predicate".to_string()
+            };
+
+            results.push((pred.clone(), *count, specificity, suggestion));
+        }
+
+        results.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(results)
+    }
+
+    /// Compute a graph-wide predicate quality score (0-1).
+    /// 0 = all vague predicates, 1 = all specific predicates.
+    pub fn predicate_quality_score(&self) -> Result<f64> {
+        let analysis = self.predicate_specificity_analysis()?;
+        if analysis.is_empty() {
+            return Ok(0.0);
+        }
+        let total_weighted: f64 = analysis.iter().map(|(_, c, s, _)| *c as f64 * s).sum();
+        let total_count: f64 = analysis.iter().map(|(_, c, _, _)| *c as f64).sum();
+        Ok(if total_count > 0.0 {
+            total_weighted / total_count
+        } else {
+            0.0
+        })
+    }
+
+    /// Suggest predicate refinements for "associated_with" relations based on
+    /// the entity types of subject and object.
+    /// Returns Vec of (relation_subject, relation_object, current_pred, suggested_pred, confidence).
+    pub fn suggest_predicate_refinements(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String, String, f64)>> {
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let id_to_entity: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+
+        // Type-pair → suggested predicate mapping
+        let refinement_map: HashMap<(&str, &str), (&str, f64)> = HashMap::from([
+            (("person", "place"), ("born_in_or_lived_in", 0.5)),
+            (("person", "organization"), ("affiliated_with", 0.6)),
+            (("person", "person"), ("collaborated_with", 0.4)),
+            (("person", "concept"), ("contributed_to", 0.5)),
+            (("person", "technology"), ("developed", 0.5)),
+            (("organization", "place"), ("headquartered_in", 0.5)),
+            (("organization", "person"), ("employs_or_founded_by", 0.4)),
+            (("technology", "person"), ("invented_by", 0.6)),
+            (("technology", "concept"), ("implements", 0.5)),
+            (("concept", "person"), ("developed_by", 0.5)),
+            (("place", "place"), ("located_in", 0.6)),
+            (("event", "place"), ("occurred_in", 0.7)),
+            (("event", "person"), ("involved", 0.5)),
+        ]);
+
+        let mut suggestions = Vec::new();
+        for r in &relations {
+            if r.predicate != "associated_with" && r.predicate != "related_to" {
+                continue;
+            }
+            let stype = id_to_entity
+                .get(&r.subject_id)
+                .map(|e| e.entity_type.as_str())
+                .unwrap_or("unknown");
+            let otype = id_to_entity
+                .get(&r.object_id)
+                .map(|e| e.entity_type.as_str())
+                .unwrap_or("unknown");
+
+            if let Some(&(suggested, confidence)) = refinement_map.get(&(stype, otype)) {
+                let sname = id_to_entity
+                    .get(&r.subject_id)
+                    .map(|e| e.name.as_str())
+                    .unwrap_or("?");
+                let oname = id_to_entity
+                    .get(&r.object_id)
+                    .map(|e| e.name.as_str())
+                    .unwrap_or("?");
+                suggestions.push((
+                    sname.to_string(),
+                    oname.to_string(),
+                    r.predicate.clone(),
+                    suggested.to_string(),
+                    confidence,
+                ));
+            }
+            if suggestions.len() >= limit {
+                break;
+            }
+        }
+        Ok(suggestions)
+    }
+
+    // -----------------------------------------------------------------------
+    // Entity Consolidation Scoring
+    // -----------------------------------------------------------------------
+
+    /// Score entity pairs for consolidation potential using multiple signals:
+    /// name similarity, type match, shared neighbours, co-source frequency.
+    /// Returns sorted list of (entity_a, entity_b, consolidation_score, reason).
+    pub fn entity_consolidation_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, f64, String)>> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        // Build connected set and neighbour map
+        let mut connected: HashSet<i64> = HashSet::new();
+        let mut neighbours: HashMap<i64, HashSet<i64>> = HashMap::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+            neighbours
+                .entry(r.subject_id)
+                .or_default()
+                .insert(r.object_id);
+            neighbours
+                .entry(r.object_id)
+                .or_default()
+                .insert(r.subject_id);
+        }
+
+        // Source co-occurrence map
+        let mut source_entities: HashMap<String, HashSet<i64>> = HashMap::new();
+        for r in &relations {
+            if !r.source_url.is_empty() {
+                source_entities
+                    .entry(r.source_url.clone())
+                    .or_default()
+                    .insert(r.subject_id);
+                source_entities
+                    .entry(r.source_url.clone())
+                    .or_default()
+                    .insert(r.object_id);
+            }
+        }
+
+        // Focus on meaningful entities, preferring connected ones with island candidates
+        let meaningful_entities: Vec<&crate::db::Entity> = entities
+            .iter()
+            .filter(|e| meaningful.contains(&e.id) && !is_noise_name(&e.name))
+            .collect();
+
+        // Index by first significant word for blocking (avoid O(n²))
+        let mut word_index: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, e) in meaningful_entities.iter().enumerate() {
+            for word in e.name.to_lowercase().split_whitespace() {
+                if word.len() >= 4 {
+                    word_index.entry(word.to_string()).or_default().push(idx);
+                }
+            }
+        }
+
+        let mut candidates: Vec<(String, String, f64, String)> = Vec::new();
+        let mut seen_pairs: HashSet<(usize, usize)> = HashSet::new();
+
+        for (_word, indices) in &word_index {
+            if indices.len() > 200 {
+                continue; // Skip extremely common words
+            }
+            for i in 0..indices.len() {
+                for j in (i + 1)..indices.len() {
+                    let idx_a = indices[i];
+                    let idx_b = indices[j];
+                    let pair = if idx_a < idx_b {
+                        (idx_a, idx_b)
+                    } else {
+                        (idx_b, idx_a)
+                    };
+                    if !seen_pairs.insert(pair) {
+                        continue;
+                    }
+
+                    let ea = meaningful_entities[idx_a];
+                    let eb = meaningful_entities[idx_b];
+
+                    // Must be same type
+                    if ea.entity_type != eb.entity_type {
+                        continue;
+                    }
+
+                    let mut score = 0.0_f64;
+                    let mut reasons = Vec::new();
+
+                    // 1. Name word overlap (Jaccard)
+                    let words_a: HashSet<String> = ea
+                        .name
+                        .to_lowercase()
+                        .split_whitespace()
+                        .filter(|w| w.len() >= 3)
+                        .map(|s| s.to_string())
+                        .collect();
+                    let words_b: HashSet<String> = eb
+                        .name
+                        .to_lowercase()
+                        .split_whitespace()
+                        .filter(|w| w.len() >= 3)
+                        .map(|s| s.to_string())
+                        .collect();
+                    let intersection = words_a.intersection(&words_b).count();
+                    let union = words_a.union(&words_b).count();
+                    let jaccard = if union > 0 {
+                        intersection as f64 / union as f64
+                    } else {
+                        0.0
+                    };
+
+                    if jaccard < 0.3 {
+                        continue; // Not similar enough
+                    }
+                    score += jaccard * 0.4;
+                    reasons.push(format!("name overlap {:.0}%", jaccard * 100.0));
+
+                    // 2. Containment (one name is substring of the other)
+                    let a_lower = ea.name.to_lowercase();
+                    let b_lower = eb.name.to_lowercase();
+                    if a_lower.contains(&b_lower) || b_lower.contains(&a_lower) {
+                        score += 0.2;
+                        reasons.push("name containment".to_string());
+                    }
+
+                    // 3. Shared neighbours
+                    let na = neighbours.get(&ea.id).cloned().unwrap_or_default();
+                    let nb = neighbours.get(&eb.id).cloned().unwrap_or_default();
+                    let shared_nb = na.intersection(&nb).count();
+                    if shared_nb > 0 {
+                        score += (shared_nb as f64 * 0.1).min(0.2);
+                        reasons.push(format!("{} shared neighbours", shared_nb));
+                    }
+
+                    // 4. Island bonus (one or both disconnected)
+                    if !connected.contains(&ea.id) || !connected.contains(&eb.id) {
+                        score += 0.1;
+                        reasons.push("island entity".to_string());
+                    }
+
+                    // 5. Co-source frequency
+                    let mut co_sources = 0usize;
+                    for (_src, src_entities) in &source_entities {
+                        if src_entities.contains(&ea.id) && src_entities.contains(&eb.id) {
+                            co_sources += 1;
+                        }
+                    }
+                    if co_sources > 0 {
+                        score += (co_sources as f64 * 0.05).min(0.15);
+                        reasons.push(format!("{} co-sources", co_sources));
+                    }
+
+                    if score >= 0.4 {
+                        candidates.push((
+                            ea.name.clone(),
+                            eb.name.clone(),
+                            score,
+                            reasons.join(", "),
+                        ));
+                    }
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(limit);
+        Ok(candidates)
+    }
 }
 
 // ---------------------------------------------------------------------------
