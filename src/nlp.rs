@@ -184,6 +184,7 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "wikipedia",
     "wikimedia",
     "wikimedia foundation",
+    "wikisource",
     "jump",
     "navigation",
     "main page",
@@ -1909,6 +1910,11 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "reading",
     "vortrag",
     "iconoclasts",
+    "complicite",
+    "counterexamples",
+    "parallelogram",
+    "semipalatinsk",
+    "wiedervereinigung",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -2294,6 +2300,11 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
 
     // Reject "Edition" fragments (book metadata, not entities)
     if lower.contains("edition") {
+        return false;
+    }
+
+    // Reject citation title fragments ("X Research The Y", "Overview of the Z")
+    if lower.contains(" research the ") || lower.contains(" overview ") {
         return false;
     }
 

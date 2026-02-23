@@ -7451,11 +7451,137 @@ impl<'a> Prometheus<'a> {
 
         // Tokenize all entity names, compute document frequency per token
         let stopwords: HashSet<&str> = [
-            "the", "of", "and", "in", "on", "for", "to", "by", "from", "with", "at", "an", "or",
-            "a", "is", "was", "are", "were", "be", "been", "has", "had", "have", "do", "does",
-            "did", "not", "no", "but", "if", "as", "it", "its", "his", "her", "he", "she", "they",
-            "their", "this", "that", "which", "who", "whom", "de", "la", "le", "les", "du", "des",
-            "von", "van", "der", "den", "di", "el",
+            "the",
+            "of",
+            "and",
+            "in",
+            "on",
+            "for",
+            "to",
+            "by",
+            "from",
+            "with",
+            "at",
+            "an",
+            "or",
+            "a",
+            "is",
+            "was",
+            "are",
+            "were",
+            "be",
+            "been",
+            "has",
+            "had",
+            "have",
+            "do",
+            "does",
+            "did",
+            "not",
+            "no",
+            "but",
+            "if",
+            "as",
+            "it",
+            "its",
+            "his",
+            "her",
+            "he",
+            "she",
+            "they",
+            "their",
+            "this",
+            "that",
+            "which",
+            "who",
+            "whom",
+            "de",
+            "la",
+            "le",
+            "les",
+            "du",
+            "des",
+            "von",
+            "van",
+            "der",
+            "den",
+            "di",
+            "el",
+            // Geographic/descriptive terms that cause spurious token matches
+            "sea",
+            "basin",
+            "island",
+            "islands",
+            "cape",
+            "bay",
+            "gulf",
+            "strait",
+            "river",
+            "lake",
+            "mountain",
+            "mount",
+            "valley",
+            "desert",
+            "forest",
+            "park",
+            "port",
+            "north",
+            "south",
+            "east",
+            "west",
+            "northern",
+            "southern",
+            "eastern",
+            "western",
+            "new",
+            "old",
+            "great",
+            "big",
+            "little",
+            "upper",
+            "lower",
+            "central",
+            // Academic/publication terms
+            "university",
+            "college",
+            "institute",
+            "school",
+            "academy",
+            "society",
+            "journal",
+            "review",
+            "press",
+            "news",
+            "radio",
+            "time",
+            "standard",
+            // Common descriptors that link unrelated entities
+            "national",
+            "international",
+            "royal",
+            "imperial",
+            "federal",
+            "state",
+            "general",
+            "special",
+            "grand",
+            "holy",
+            "sacred",
+            "ancient",
+            "modern",
+            // Common surname-like words that cause false person matches
+            "deep",
+            "ridge",
+            "dover",
+            "london",
+            "paris",
+            "berlin",
+            "prize",
+            "award",
+            "medal",
+            "order",
+            "courier",
+            "herald",
         ]
         .into_iter()
         .collect();
@@ -7542,9 +7668,9 @@ impl<'a> Prometheus<'a> {
                 let min_score = if entity_map.get(&island_id).map(|e| e.entity_type.as_str())
                     == Some("person")
                 {
-                    2.0
+                    4.0
                 } else {
-                    3.0
+                    5.0
                 };
                 if best_score < min_score {
                     continue;
@@ -8713,6 +8839,24 @@ fn should_purge_single_word(name: &str, entity_type: &str) -> bool {
             "aims",
         ];
         if generic_concepts.contains(&lower.as_str()) {
+            return true;
+        }
+        // Single-word concept entities that look like surnames (capitalized, 5-12 chars,
+        // ending in common surname suffixes) are almost always citation artifacts
+        let surname_suffixes = [
+            "ier", "iere", "ski", "sky", "ley", "ley", "ner", "ger", "ler", "sen", "son", "man",
+            "men", "kov", "ova", "enko", "elli", "ini", "otti", "ardi", "ardy", "burg", "dorf",
+            "feld", "stein", "berg", "wald", "rff", "off", "eff", "ych", "vich", "wicz",
+        ];
+        let chars: Vec<char> = name.chars().collect();
+        if chars.len() >= 5
+            && chars.len() <= 14
+            && chars[0].is_uppercase()
+            && chars[1..]
+                .iter()
+                .all(|c| c.is_lowercase() || *c == '-' || *c == '\'')
+            && surname_suffixes.iter().any(|s| lower.ends_with(s))
+        {
             return true;
         }
         return false;
