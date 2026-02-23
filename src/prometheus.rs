@@ -210,6 +210,52 @@ const NOISE_NAMES: &[&str] = &[
     "collections",
     "publications",
     "editions",
+    "instead",
+    "similarly",
+    "finally",
+    "rather",
+    "simply",
+    "perhaps",
+    "certainly",
+    "probably",
+    "clearly",
+    "exactly",
+    "indeed",
+    "sometimes",
+    "always",
+    "almost",
+    "around",
+    "toward",
+    "towards",
+    "across",
+    "along",
+    "among",
+    "against",
+    "unless",
+    "until",
+    "while",
+    "since",
+    "despite",
+    "however",
+    "future",
+    "current",
+    "letters",
+    "foundations",
+    "number",
+    "internet",
+    "program",
+    "meanwhile",
+    "originally",
+    "reportedly",
+    "resting",
+    "buried",
+    "published",
+    "culture",
+    "cultures",
+    "charter",
+    "sport",
+    "delivered",
+    "shy",
 ];
 
 fn is_noise_type(t: &str) -> bool {
@@ -314,6 +360,66 @@ fn is_noise_name(name: &str) -> bool {
         ];
         if adverb_starts.contains(&first_word) {
             return true;
+        }
+        // Adjective prefixes that indicate NLP extraction noise (e.g. "Current French", "First Delivered", "Enlightened Europe")
+        let adjective_starts = [
+            "current",
+            "first",
+            "second",
+            "third",
+            "last",
+            "next",
+            "final",
+            "original",
+            "former",
+            "latter",
+            "new",
+            "old",
+            "modern",
+            "ancient",
+            "early",
+            "late",
+            "great",
+            "greater",
+            "lesser",
+            "upper",
+            "lower",
+            "inner",
+            "outer",
+            "enlightened",
+            "allied",
+            "total",
+            "main",
+            "major",
+            "minor",
+            "entire",
+            "brief",
+            "shy",
+        ];
+        if adjective_starts.contains(&first_word) {
+            // Exceptions: well-known multi-word proper nouns
+            let full = lower_trimmed;
+            let is_known_proper = full.starts_with("first world war")
+                || full.starts_with("great wall")
+                || full.starts_with("great barrier")
+                || full.starts_with("new york")
+                || full.starts_with("new zealand")
+                || full.starts_with("new england")
+                || full.starts_with("new jersey")
+                || full.starts_with("new south wales")
+                || full.starts_with("great britain")
+                || full.starts_with("allied powers")
+                || full.starts_with("first french")
+                || full.starts_with("first world")
+                || full.starts_with("old testament")
+                || full.starts_with("ancient egypt")
+                || full.starts_with("ancient rome")
+                || full.starts_with("ancient greece")
+                || full.starts_with("lower saxony")
+                || full.starts_with("upper austria");
+            if !is_known_proper {
+                return true;
+            }
         }
     }
     // Names starting with gerunds/verbs — NLP extraction errors (e.g. "Using Hilbert", "Subscribe Soviet")
@@ -639,6 +745,34 @@ fn is_noise_name(name: &str) -> bool {
     // Names containing academic publication patterns
     if lower_trimmed.contains("monthly notices") || lower_trimmed.contains("physical review") {
         return true;
+    }
+    // Multi-word names containing known noise words in non-first position (concatenation artifacts)
+    if word_count >= 3 {
+        let words: Vec<&str> = lower_trimmed.split_whitespace().collect();
+        let concat_noise = [
+            "examples",
+            "encounters",
+            "bits",
+            "papers",
+            "college",
+            "online",
+            "links",
+            "archives",
+            "images",
+            "media",
+            "articles",
+            "reports",
+            "documents",
+            "files",
+            "records",
+            "president",
+            "admiral",
+            "director",
+        ];
+        let noise_count = words.iter().filter(|w| concat_noise.contains(w)).count();
+        if noise_count >= 1 {
+            return true;
+        }
     }
     // Names containing 4-digit years (citation/reference fragments like "Ramanujan Journal 1997 1")
     let year_re = lower_trimmed.split_whitespace().any(|w| {
@@ -2629,7 +2763,7 @@ impl<'a> Prometheus<'a> {
         let bulk_cleaned = self.bulk_quality_cleanup().unwrap_or(0);
 
         // Deep island cleanup (remove low-confidence isolated entities without facts)
-        let deep_cleaned = self.deep_island_cleanup(0.6).unwrap_or(0);
+        let deep_cleaned = self.deep_island_cleanup(0.8).unwrap_or(0);
 
         // Predicate normalization (reduce "is" overuse)
         let normalized = self.normalize_predicates().unwrap_or(0);
@@ -6122,6 +6256,7 @@ impl<'a> Prometheus<'a> {
         // Words that signal NLP concatenation errors
         let concat_noise_words: HashSet<&str> = [
             "examples",
+            "encounters",
             "quiz",
             "featured",
             "archived",
@@ -6139,6 +6274,10 @@ impl<'a> Prometheus<'a> {
             "citation",
             "webarchive",
             "coord",
+            "newspapers",
+            "rabbits",
+            "bits",
+            "imdb",
         ]
         .iter()
         .copied()
@@ -6156,9 +6295,10 @@ impl<'a> Prometheus<'a> {
                     true
                 }
                 // Multi-word entities containing noise words
+                // Higher degree threshold for very strong noise signals
                 else if words.len() >= 2
                     && words.iter().any(|w| concat_noise_words.contains(w))
-                    && deg <= 5
+                    && deg <= 20
                 {
                     true
                 }
