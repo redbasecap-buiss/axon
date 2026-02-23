@@ -587,6 +587,45 @@ const CONCEPT_INDICATORS: &[&str] = &[
     "isomorphism",
     "homomorphism",
     "morphism",
+    "house",
+    "layer",
+    "net",
+    "effect",
+    "rule",
+    "problem",
+    "river",
+    "lake",
+    "mountain",
+    "valley",
+    "bridge",
+    "gate",
+    "square",
+    "street",
+    "road",
+    "avenue",
+    "park",
+    "garden",
+    "library",
+    "church",
+    "cathedral",
+    "temple",
+    "mosque",
+    "school",
+    "college",
+    "cup",
+    "league",
+    "championship",
+    "congress",
+    "council",
+    "committee",
+    "board",
+    "bureau",
+    "office",
+    "department",
+    "ministry",
+    "canal",
+    "cockade",
+    "cockades",
 ];
 
 /// Common organization suffixes for entity classification.
@@ -1003,7 +1042,7 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
 const TRAILING_JUNK: &[&str] = &[
-    "in", "the", "a", "of", "and", "or", "at", "to", "for", "by", "from", "with", "on", "is",
+    "if", "in", "the", "a", "of", "and", "or", "at", "to", "for", "by", "from", "with", "on", "is",
     "are", "was", "were", "its", "his", "her", "their", "an", "as", "but", "not", "out", "since",
     "has", "had", "have", "been", "be", "will", "would", "could", "should", "may", "might", "into",
     "than", "then", "also", "that", "this", "these", "those", "which", "who", "whom", "when",
@@ -1169,8 +1208,23 @@ fn classify_entity_type(name: &str) -> &'static str {
                     || clean.ends_with("ics")
                     || clean.ends_with("ogy")
                     || clean.ends_with("phy")
+                    || clean.ends_with("ence")
+                    || clean.ends_with("ance")
+                    || clean.ends_with("ure")
+                    || clean.ends_with("ery")
+                    || clean.ends_with("ory")
+                    || clean.ends_with("ary")
+                    || clean.ends_with("ous")
+                    || clean.ends_with("ive")
             });
-            if !has_noun_suffix {
+            // Also check if any word is a concept/place/org indicator
+            let has_indicator = words.iter().any(|w| {
+                let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
+                CONCEPT_INDICATORS.contains(&clean)
+                    || PLACE_INDICATORS.contains(&clean)
+                    || ORG_INDICATORS.contains(&clean)
+            });
+            if !has_noun_suffix && !has_indicator {
                 return "person";
             }
         }
