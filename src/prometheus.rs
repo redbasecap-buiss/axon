@@ -94,6 +94,30 @@ const NOISE_NAMES: &[&str] = &[
     "called",
     "named",
     "including",
+    "currently",
+    "recently",
+    "today",
+    "later",
+    "early",
+    "modern",
+    "several",
+    "various",
+    "certain",
+    "another",
+    "following",
+    "previous",
+    "former",
+    "latter",
+    "both",
+    "each",
+    "every",
+    "first",
+    "second",
+    "third",
+    "last",
+    "next",
+    "major",
+    "minor",
 ];
 
 fn is_noise_type(t: &str) -> bool {
@@ -170,6 +194,14 @@ fn is_noise_name(name: &str) -> bool {
         if first.is_lowercase() && word_count > 2 {
             return true;
         }
+    }
+    // Possessive forms as standalone entities (e.g. "Newton's") — noise
+    if lower_trimmed.ends_with("'s") && word_count == 1 {
+        return true;
+    }
+    // Entities ending with common suffix noise
+    if lower_trimmed.ends_with(" et al") || lower_trimmed.ends_with(" et al.") {
+        return true;
     }
     false
 }
@@ -1472,13 +1504,20 @@ impl<'a> Prometheus<'a> {
         let topic_coverage = self.topic_coverage_analysis().unwrap_or_default();
         let sparse_topics = topic_coverage.iter().filter(|t| t.3 < 0.01).count();
 
+        // Name subsumption detection (abbreviated entity forms)
+        let subsumptions = self.find_name_subsumptions().unwrap_or_default();
+
+        // Purge noise entities (cleanup)
+        let purged = self.purge_noise_entities().unwrap_or(0);
+
         let summary = format!(
             "Discovered {} patterns, generated {} new hypotheses ({} confirmed, {} rejected), \
              auto-resolved {} existing ({}✓ {}✗), {} island entities, {} meaningful relations, \
              {} cross-domain gaps, {} knowledge frontiers, {} bridge entities, {} connectable islands, \
              {} prioritized gaps, {} decayed, {} island clusters, \
              predicate diversity: {}/{} ({:.0}% diverse), \
-             {} fuzzy duplicates ({} auto-merge), {} sparse topic domains",
+             {} fuzzy duplicates ({} auto-merge), {} sparse topic domains, \
+             {} name subsumptions found, {} noise entities purged",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1501,6 +1540,8 @@ impl<'a> Prometheus<'a> {
             fuzzy_dupes.len(),
             merge_candidates,
             sparse_topics,
+            subsumptions.len(),
+            purged,
         );
 
         Ok(DiscoveryReport {
@@ -2240,6 +2281,97 @@ impl<'a> Prometheus<'a> {
         metrics.insert("meaningful_entities".into(), meaningful.len() as f64);
 
         Ok(metrics)
+    }
+
+    /// Find entities that are likely abbreviated forms of other entities.
+    /// E.g., "Ada" ↔ "Ada Lovelace", "RISC-V" ↔ "RISC-V Foundation".
+    /// Returns (short_name, full_name, entity_type, confidence).
+    pub fn find_name_subsumptions(&self) -> Result<Vec<(String, String, String, f64)>> {
+        let entities = self.brain.all_entities()?;
+        let meaningful: Vec<&crate::db::Entity> = entities
+            .iter()
+            .filter(|e| {
+                !is_noise_type(&e.entity_type) && !is_noise_name(&e.name) && e.name.len() >= 2
+            })
+            .collect();
+
+        // Group by type for efficient comparison
+        let mut by_type: HashMap<&str, Vec<&crate::db::Entity>> = HashMap::new();
+        for e in &meaningful {
+            by_type.entry(&e.entity_type).or_default().push(e);
+        }
+
+        let mut subsumptions = Vec::new();
+        for (_etype, group) in &by_type {
+            if group.len() > 3000 {
+                continue; // skip huge groups
+            }
+            for i in 0..group.len() {
+                let short = group[i];
+                let short_lower = short.name.to_lowercase();
+                let short_words: Vec<&str> = short_lower.split_whitespace().collect();
+                if short_words.len() > 3 {
+                    continue; // only look at short names as "abbreviations"
+                }
+                for j in 0..group.len() {
+                    if i == j {
+                        continue;
+                    }
+                    let full = group[j];
+                    let full_lower = full.name.to_lowercase();
+                    let full_words: Vec<&str> = full_lower.split_whitespace().collect();
+                    // Short name must be shorter
+                    if short_words.len() >= full_words.len() {
+                        continue;
+                    }
+                    // Check if short name starts full name (e.g. "Ada" starts "Ada Lovelace")
+                    if full_lower.starts_with(&short_lower)
+                        && full_lower.len() > short_lower.len() + 1
+                    {
+                        let conf = 0.6 + (short_words.len() as f64 * 0.1).min(0.3);
+                        subsumptions.push((
+                            short.name.clone(),
+                            full.name.clone(),
+                            short.entity_type.clone(),
+                            conf,
+                        ));
+                    }
+                }
+            }
+        }
+        subsumptions.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        subsumptions.truncate(100);
+        Ok(subsumptions)
+    }
+
+    /// Purge noise entities from the brain — entities matching noise filters
+    /// that have zero or very few relations. Returns count of purged entities.
+    pub fn purge_noise_entities(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        let mut purged = 0usize;
+        for e in &entities {
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            // Only purge isolated or near-isolated noise
+            if deg <= 1 && (is_noise_name(&e.name) || is_noise_type(&e.entity_type)) {
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                    conn.execute(
+                        "DELETE FROM relations WHERE subject_id = ?1 OR object_id = ?1",
+                        params![e.id],
+                    )?;
+                    Ok(())
+                })?;
+                purged += 1;
+            }
+        }
+        Ok(purged)
     }
 
     pub fn report_markdown(&self, report: &DiscoveryReport) -> String {

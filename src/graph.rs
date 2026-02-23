@@ -845,6 +845,78 @@ pub fn power_law_estimate(brain: &Brain) -> Result<(f64, f64), rusqlite::Error> 
     Ok((-slope, r2)) // Negate slope since power law has negative exponent
 }
 
+/// Find articulation points — entities whose removal disconnects the graph.
+pub fn find_articulation_points(brain: &Brain) -> Result<Vec<i64>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let ids: Vec<i64> = adj.keys().copied().collect();
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut disc: HashMap<i64, i64> = HashMap::new();
+    let mut low: HashMap<i64, i64> = HashMap::new();
+    let mut parent: HashMap<i64, i64> = HashMap::new();
+    let mut ap: HashSet<i64> = HashSet::new();
+    let mut timer: i64 = 0;
+
+    fn dfs_ap(
+        u: i64,
+        adj: &HashMap<i64, Vec<i64>>,
+        disc: &mut HashMap<i64, i64>,
+        low: &mut HashMap<i64, i64>,
+        parent: &mut HashMap<i64, i64>,
+        ap: &mut HashSet<i64>,
+        timer: &mut i64,
+    ) {
+        disc.insert(u, *timer);
+        low.insert(u, *timer);
+        *timer += 1;
+        let mut children = 0i64;
+        if let Some(neighbors) = adj.get(&u) {
+            for &v in neighbors {
+                if !disc.contains_key(&v) {
+                    children += 1;
+                    parent.insert(v, u);
+                    dfs_ap(v, adj, disc, low, parent, ap, timer);
+                    let lv = low[&v];
+                    let lu = low[&u];
+                    if lv < lu {
+                        low.insert(u, lv);
+                    }
+                    // u is AP if: (1) root with 2+ children, or (2) non-root with low[v] >= disc[u]
+                    let is_root = !parent.contains_key(&u);
+                    if is_root && children > 1 {
+                        ap.insert(u);
+                    }
+                    if !is_root && low[&v] >= disc[&u] {
+                        ap.insert(u);
+                    }
+                } else if parent.get(&u) != Some(&v) {
+                    let dv = disc[&v];
+                    let lu = low[&u];
+                    if dv < lu {
+                        low.insert(u, dv);
+                    }
+                }
+            }
+        }
+    }
+
+    for &id in &ids {
+        if !disc.contains_key(&id) {
+            dfs_ap(
+                id,
+                &adj,
+                &mut disc,
+                &mut low,
+                &mut parent,
+                &mut ap,
+                &mut timer,
+            );
+        }
+    }
+    Ok(ap.into_iter().collect())
+}
+
 /// Entity similarity: Jaccard similarity based on shared predicates.
 /// Returns top similar pairs above threshold.
 pub fn entity_similarity(
