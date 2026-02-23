@@ -2813,3 +2813,157 @@ pub fn community_boundary_nodes(
     results.sort_by(|a, b| b.2.cmp(&a.2));
     Ok(results)
 }
+
+/// Jaccard-based link prediction: for each pair of entities sharing at least
+/// `min_common` neighbors but NOT directly connected, compute Jaccard similarity.
+/// Returns top `limit` predictions sorted by score descending.
+pub fn jaccard_link_prediction(
+    brain: &Brain,
+    min_common: usize,
+    limit: usize,
+) -> Result<Vec<(i64, i64, f64, usize)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let entities = brain.all_entities()?;
+
+    // Only consider entities with at least 2 neighbors (otherwise no meaningful overlap)
+    let candidates: Vec<i64> = entities
+        .iter()
+        .filter(|e| adj.get(&e.id).map_or(false, |n| n.len() >= 2))
+        .map(|e| e.id)
+        .collect();
+
+    let edge_set: HashSet<(i64, i64)> = {
+        let rels = brain.all_relations()?;
+        let mut s = HashSet::new();
+        for r in &rels {
+            s.insert((r.subject_id, r.object_id));
+            s.insert((r.object_id, r.subject_id));
+        }
+        s
+    };
+
+    let neighbor_sets: HashMap<i64, HashSet<i64>> = candidates
+        .iter()
+        .filter_map(|&id| {
+            adj.get(&id)
+                .map(|ns| (id, ns.iter().copied().collect::<HashSet<i64>>()))
+        })
+        .collect();
+
+    let mut predictions: Vec<(i64, i64, f64, usize)> = Vec::new();
+
+    // For efficiency, iterate through shared-neighbor inverted index
+    let mut neighbor_to_entities: HashMap<i64, Vec<i64>> = HashMap::new();
+    for &eid in &candidates {
+        if let Some(ns) = neighbor_sets.get(&eid) {
+            for &n in ns {
+                neighbor_to_entities.entry(n).or_default().push(eid);
+            }
+        }
+    }
+
+    let mut seen: HashSet<(i64, i64)> = HashSet::new();
+    for entities_sharing in neighbor_to_entities.values() {
+        if entities_sharing.len() > 200 {
+            continue; // Skip overly-connected hubs
+        }
+        for i in 0..entities_sharing.len() {
+            for j in (i + 1)..entities_sharing.len() {
+                let a = entities_sharing[i];
+                let b = entities_sharing[j];
+                let key = if a < b { (a, b) } else { (b, a) };
+                if edge_set.contains(&(a, b)) || !seen.insert(key) {
+                    continue;
+                }
+                if let (Some(na), Some(nb)) = (neighbor_sets.get(&a), neighbor_sets.get(&b)) {
+                    let common = na.intersection(nb).count();
+                    if common >= min_common {
+                        let union = na.union(nb).count();
+                        let jaccard = if union > 0 {
+                            common as f64 / union as f64
+                        } else {
+                            0.0
+                        };
+                        predictions.push((a, b, jaccard, common));
+                    }
+                }
+            }
+        }
+    }
+
+    predictions.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    predictions.truncate(limit);
+    Ok(predictions)
+}
+
+/// Compute graph evolution metrics by comparing current state to the most recent snapshot.
+/// Returns a map of metric_name → (current_value, delta_from_last_snapshot).
+/// Snapshot tuple: (timestamp, entities, relations, components, largest_pct, avg_degree, isolated, density, fragmentation, health_score)
+pub fn graph_evolution(brain: &Brain) -> Result<HashMap<String, (f64, f64)>, rusqlite::Error> {
+    let current_health = graph_health(brain)?;
+    let snapshots = get_graph_snapshots(brain, 2)?;
+
+    let mut result: HashMap<String, (f64, f64)> = HashMap::new();
+    if snapshots.len() >= 2 {
+        let curr = &snapshots[0];
+        let prev = &snapshots[1];
+        // Map snapshot fields to named metrics
+        result.insert("entities".into(), (curr.1 as f64, (curr.1 - prev.1) as f64));
+        result.insert(
+            "relations".into(),
+            (curr.2 as f64, (curr.2 - prev.2) as f64),
+        );
+        result.insert(
+            "components".into(),
+            (curr.3 as f64, (curr.3 - prev.3) as f64),
+        );
+        result.insert("largest_pct".into(), (curr.4, curr.4 - prev.4));
+        result.insert("avg_degree".into(), (curr.5, curr.5 - prev.5));
+        result.insert("isolated".into(), (curr.6 as f64, (curr.6 - prev.6) as f64));
+        result.insert("density".into(), (curr.7, curr.7 - prev.7));
+        result.insert("fragmentation".into(), (curr.8, curr.8 - prev.8));
+    }
+    for (key, &current) in &current_health {
+        result.entry(key.clone()).or_insert((current, 0.0));
+    }
+    Ok(result)
+}
+
+/// Identify "knowledge deserts" — entity types with low average degree compared to the graph mean.
+/// Returns (type, count, avg_degree, graph_avg_degree) sorted by avg_degree ascending.
+pub fn knowledge_deserts(brain: &Brain) -> Result<Vec<(String, usize, f64, f64)>, rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let adj = build_adjacency(brain)?;
+
+    let mut type_degrees: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut total_degree = 0.0_f64;
+    let mut total_count = 0usize;
+
+    for e in &entities {
+        let deg = adj.get(&e.id).map_or(0, |n| n.len()) as f64;
+        type_degrees
+            .entry(e.entity_type.clone())
+            .or_default()
+            .push(deg);
+        total_degree += deg;
+        total_count += 1;
+    }
+
+    let graph_avg = if total_count > 0 {
+        total_degree / total_count as f64
+    } else {
+        0.0
+    };
+
+    let mut deserts: Vec<(String, usize, f64, f64)> = type_degrees
+        .iter()
+        .map(|(t, degs)| {
+            let avg = degs.iter().sum::<f64>() / degs.len() as f64;
+            (t.clone(), degs.len(), avg, graph_avg)
+        })
+        .filter(|(_, count, avg, _)| *count >= 5 && *avg < graph_avg * 0.5)
+        .collect();
+
+    deserts.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(deserts)
+}

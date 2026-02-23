@@ -3066,6 +3066,9 @@ impl<'a> Prometheus<'a> {
         // Cross-component merger: find entities in different components with matching names
         let cross_component_merged = self.merge_cross_component_duplicates().unwrap_or(0);
 
+        // TF-IDF weighted island reconnection (semantic token matching)
+        let tfidf_reconnected = self.tfidf_island_reconnect().unwrap_or(0);
+
         // Refine generic predicates using entity type pairs
         let predicates_refined = self.refine_associated_with().unwrap_or(0);
         let contributed_refined = self.refine_contributed_to().unwrap_or(0);
@@ -3128,7 +3131,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, \
              {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
@@ -3198,6 +3201,7 @@ impl<'a> Prometheus<'a> {
             name_containment_reconnected,
             single_word_reconnected,
             cross_component_merged,
+            tfidf_reconnected,
             predicates_refined,
             contributed_refined,
             promoted,
@@ -9451,7 +9455,7 @@ impl<'a> Prometheus<'a> {
                 // include the person's surname (last word), not just first name.
                 // Avoids "Don Backer" ↔ "Don River" (shares "don" = first name only).
                 if (island_type == "person") != (target_type == "person") {
-                    let (person_name, person_toks) = if island_type == "person" {
+                    let (person_name, _person_toks) = if island_type == "person" {
                         (island_name, island_toks.as_slice())
                     } else {
                         (target_name, best_toks.map(|t| t.as_slice()).unwrap_or(&[]))
@@ -10649,6 +10653,329 @@ impl<'a> Prometheus<'a> {
 
         bridges.truncate(50);
         Ok(bridges)
+    }
+
+    /// TF-IDF weighted island reconnection: compute token importance across the entire
+    /// entity corpus, then find islands whose name tokens have high TF-IDF overlap with
+    /// connected entities. Much smarter than simple token matching.
+    pub fn tfidf_island_reconnect(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        let meaningful = meaningful_ids(self.brain)?;
+
+        // Build document frequency: how many entities contain each token
+        let stopwords: HashSet<&str> = [
+            "the", "of", "and", "in", "on", "for", "to", "by", "from", "with", "at", "an", "or",
+            "a", "is", "was", "are", "were", "be", "been", "has", "had", "have",
+        ]
+        .into_iter()
+        .collect();
+
+        let mut doc_freq: HashMap<String, usize> = HashMap::new();
+        let total_docs = entities.len().max(1);
+
+        // Tokenize and track
+        struct TokenizedEntity {
+            id: i64,
+            name: String,
+            entity_type: String,
+            tokens: Vec<String>,
+        }
+
+        let mut tokenized: Vec<TokenizedEntity> = Vec::new();
+        for e in &entities {
+            if !meaningful.contains(&e.id) {
+                continue;
+            }
+            let tokens: Vec<String> = e
+                .name
+                .split_whitespace()
+                .map(|w| w.to_lowercase())
+                .filter(|w| w.len() >= 3 && !stopwords.contains(w.as_str()))
+                .collect();
+            if tokens.is_empty() {
+                continue;
+            }
+            let unique: HashSet<&String> = tokens.iter().collect();
+            for t in &unique {
+                *doc_freq.entry((*t).clone()).or_insert(0) += 1;
+            }
+            tokenized.push(TokenizedEntity {
+                id: e.id,
+                name: e.name.clone(),
+                entity_type: e.entity_type.clone(),
+                tokens,
+            });
+        }
+
+        // Compute IDF
+        let idf = |token: &str| -> f64 {
+            let df = doc_freq.get(token).copied().unwrap_or(1) as f64;
+            (total_docs as f64 / df).ln()
+        };
+
+        // Build TF-IDF vectors for connected entities (these are our "anchors")
+        let mut connected_entities: Vec<&TokenizedEntity> = Vec::new();
+        let mut island_entities: Vec<&TokenizedEntity> = Vec::new();
+
+        for te in &tokenized {
+            if connected.contains(&te.id) {
+                connected_entities.push(te);
+            } else {
+                island_entities.push(te);
+            }
+        }
+
+        // Build inverted index: token → connected entity indices
+        let mut token_index: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (idx, ce) in connected_entities.iter().enumerate() {
+            for t in &ce.tokens {
+                token_index.entry(t.as_str()).or_default().push(idx);
+            }
+        }
+
+        let mut reconnected = 0usize;
+        let mut seen_pairs: HashSet<(i64, i64)> = HashSet::new();
+
+        for island in &island_entities {
+            if island.tokens.is_empty() {
+                continue;
+            }
+
+            // Compute TF-IDF for island entity
+            let island_tfidf: HashMap<&str, f64> =
+                island.tokens.iter().map(|t| (t.as_str(), idf(t))).collect();
+            let island_norm: f64 = island_tfidf.values().map(|v| v * v).sum::<f64>().sqrt();
+            if island_norm < 0.01 {
+                continue;
+            }
+
+            // Find candidate connected entities via inverted index
+            let mut candidate_scores: HashMap<usize, f64> = HashMap::new();
+            for t in &island.tokens {
+                let t_idf = idf(t);
+                if let Some(indices) = token_index.get(t.as_str()) {
+                    for &idx in indices {
+                        *candidate_scores.entry(idx).or_insert(0.0) += t_idf;
+                    }
+                }
+            }
+
+            // Find best match with cosine similarity
+            let mut best: Option<(usize, f64)> = None;
+            for (&idx, &_dot_partial) in &candidate_scores {
+                let ce = connected_entities[idx];
+                let ce_tfidf: HashMap<&str, f64> =
+                    ce.tokens.iter().map(|t| (t.as_str(), idf(t))).collect();
+                let ce_norm: f64 = ce_tfidf.values().map(|v| v * v).sum::<f64>().sqrt();
+                if ce_norm < 0.01 {
+                    continue;
+                }
+                // Full cosine
+                let mut dot = 0.0_f64;
+                for (t, &w) in &island_tfidf {
+                    if let Some(&cw) = ce_tfidf.get(t) {
+                        dot += w * cw;
+                    }
+                }
+                let cosine = dot / (island_norm * ce_norm);
+                if cosine > 0.4 {
+                    if best.is_none() || cosine > best.unwrap().1 {
+                        best = Some((idx, cosine));
+                    }
+                }
+            }
+
+            if let Some((idx, score)) = best {
+                let target = connected_entities[idx];
+                let key = if island.id < target.id {
+                    (island.id, target.id)
+                } else {
+                    (target.id, island.id)
+                };
+                if seen_pairs.insert(key) && island.name != target.name {
+                    // Determine predicate based on types
+                    let pred = if island.entity_type == target.entity_type {
+                        "associated_with"
+                    } else if island.entity_type == "person" || target.entity_type == "person" {
+                        "associated_with"
+                    } else {
+                        "related_concept"
+                    };
+                    self.brain
+                        .upsert_relation(island.id, pred, target.id, "tfidf_reconnect")?;
+                    eprintln!(
+                        "  [tfidf-reconnect] {} → {} (score: {:.2}, pred: {})",
+                        island.name, target.name, score, pred
+                    );
+                    reconnected += 1;
+                    if reconnected >= 100 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(reconnected)
+    }
+
+    /// Knowledge coherence score: measure how well-integrated each topic cluster is.
+    /// Returns clusters sorted by "improvement potential" — clusters that would benefit
+    /// most from additional crawling or entity linking.
+    pub fn knowledge_coherence_analysis(
+        &self,
+    ) -> Result<Vec<(String, usize, f64, f64, Vec<String>)>> {
+        let communities = crate::graph::louvain_communities(self.brain)?;
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        let entity_map: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+
+        // Group entities by community
+        let mut comm_members: HashMap<usize, Vec<i64>> = HashMap::new();
+        for (&eid, &comm) in &communities {
+            if meaningful.contains(&eid) {
+                comm_members.entry(comm).or_default().push(eid);
+            }
+        }
+
+        // Build adjacency for degree counting
+        let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+        for r in &relations {
+            adj.entry(r.subject_id).or_default().insert(r.object_id);
+            adj.entry(r.object_id).or_default().insert(r.subject_id);
+        }
+
+        let mut results: Vec<(String, usize, f64, f64, Vec<String>)> = Vec::new();
+
+        for (comm_id, members) in &comm_members {
+            if members.len() < 3 {
+                continue;
+            }
+            let member_set: HashSet<i64> = members.iter().copied().collect();
+
+            // Internal density: edges within community / possible edges
+            let mut internal_edges = 0usize;
+            let mut external_edges = 0usize;
+            let mut total_degree = 0usize;
+
+            for &eid in members {
+                if let Some(neighbors) = adj.get(&eid) {
+                    for &n in neighbors {
+                        if member_set.contains(&n) {
+                            internal_edges += 1;
+                        } else {
+                            external_edges += 1;
+                        }
+                        total_degree += 1;
+                    }
+                }
+            }
+            internal_edges /= 2; // counted twice
+
+            let n = members.len() as f64;
+            let possible = n * (n - 1.0) / 2.0;
+            let density = if possible > 0.0 {
+                internal_edges as f64 / possible
+            } else {
+                0.0
+            };
+
+            // Coherence = density * (1 + external connectivity ratio)
+            let _avg_degree = if members.len() > 0 {
+                total_degree as f64 / members.len() as f64
+            } else {
+                0.0
+            };
+            let ext_ratio = if total_degree > 0 {
+                external_edges as f64 / total_degree as f64
+            } else {
+                0.0
+            };
+            let coherence = density * (1.0 + ext_ratio);
+
+            // Improvement potential: large clusters with low density
+            let improvement_potential = n * (1.0 - density);
+
+            // Find representative name (most connected entity)
+            let rep_name = members
+                .iter()
+                .max_by_key(|&&eid| adj.get(&eid).map_or(0, |n| n.len()))
+                .and_then(|&eid| entity_map.get(&eid).map(|e| e.name.clone()))
+                .unwrap_or_else(|| format!("community_{}", comm_id));
+
+            // Suggest topics: low-degree members that could use more connections
+            let suggestions: Vec<String> = members
+                .iter()
+                .filter(|&&eid| adj.get(&eid).map_or(0, |n| n.len()) <= 2)
+                .take(5)
+                .filter_map(|&eid| entity_map.get(&eid).map(|e| e.name.clone()))
+                .collect();
+
+            results.push((
+                rep_name,
+                members.len(),
+                coherence,
+                improvement_potential,
+                suggestions,
+            ));
+        }
+
+        results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(20);
+        Ok(results)
+    }
+
+    /// Strategy effectiveness report: analyze which hypothesis generation strategies
+    /// have the best confirmation rates and adjust weights accordingly.
+    pub fn strategy_effectiveness_report(&self) -> Result<Vec<(String, usize, usize, f64, f64)>> {
+        let hypotheses = self.list_hypotheses(None)?;
+
+        let mut strategy_stats: HashMap<String, (usize, usize, usize)> = HashMap::new(); // total, confirmed, rejected
+
+        for h in &hypotheses {
+            let entry = strategy_stats
+                .entry(h.pattern_source.clone())
+                .or_insert((0, 0, 0));
+            entry.0 += 1;
+            match h.status {
+                HypothesisStatus::Confirmed => entry.1 += 1,
+                HypothesisStatus::Rejected => entry.2 += 1,
+                _ => {}
+            }
+        }
+
+        let mut report: Vec<(String, usize, usize, f64, f64)> = strategy_stats
+            .iter()
+            .map(|(strategy, &(total, confirmed, rejected))| {
+                let resolved = confirmed + rejected;
+                let confirmation_rate = if resolved > 0 {
+                    confirmed as f64 / resolved as f64
+                } else {
+                    0.5 // no data
+                };
+                let current_weight = self.get_pattern_weight(strategy).unwrap_or(0.5);
+                (
+                    strategy.clone(),
+                    total,
+                    confirmed,
+                    confirmation_rate,
+                    current_weight,
+                )
+            })
+            .collect();
+
+        report.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(report)
     }
 }
 
