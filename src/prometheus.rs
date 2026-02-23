@@ -2479,6 +2479,10 @@ impl<'a> Prometheus<'a> {
         // Token-based island reconnection (TF-IDF shared token matching)
         let token_reconnected = self.reconnect_islands_by_tokens().unwrap_or(0);
 
+        // Name-containment island reconnection (substring matching within same type)
+        let name_containment_reconnected =
+            self.reconnect_islands_by_name_containment().unwrap_or(0);
+
         // Refine associated_with predicates using entity type pairs
         let predicates_refined = self.refine_associated_with().unwrap_or(0);
 
@@ -2531,7 +2535,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} token-reconnected, {} predicates refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} token-reconnected, {} name-containment reconnected, {} predicates refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -2593,6 +2597,7 @@ impl<'a> Prometheus<'a> {
             concept_islands_purged,
             mistyped_person_purged,
             token_reconnected,
+            name_containment_reconnected,
             predicates_refined,
             promoted,
             pair_deduped,
@@ -7603,8 +7608,127 @@ impl<'a> Prometheus<'a> {
                     "prometheus:token_reconnect",
                 )?;
                 reconnected += 1;
-                if reconnected >= 100 {
+                if reconnected >= 200 {
                     break; // Cap per run
+                }
+            }
+        }
+        Ok(reconnected)
+    }
+
+    /// Connect island entities to connected entities of the same type where the
+    /// island name is a substring of the connected entity name (or vice versa),
+    /// weighted by name overlap ratio. E.g., island "Fourier Transform" → connected
+    /// "Discrete Fourier Transform" with high confidence.
+    /// Returns count of new relations created.
+    pub fn reconnect_islands_by_name_containment(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        let mut connected: HashSet<i64> = HashSet::new();
+        let mut edges: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+            let key = if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            };
+            edges.insert(key);
+        }
+
+        // Build type → connected entities index
+        let mut type_connected: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+        for e in &entities {
+            if meaningful.contains(&e.id)
+                && connected.contains(&e.id)
+                && !is_noise_type(&e.entity_type)
+                && !is_noise_name(&e.name)
+                && e.name.split_whitespace().count() >= 2
+            {
+                type_connected
+                    .entry(e.entity_type.clone())
+                    .or_default()
+                    .push((e.id, e.name.to_lowercase()));
+            }
+        }
+
+        let mut reconnected = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id)
+                || !meaningful.contains(&e.id)
+                || is_noise_type(&e.entity_type)
+                || is_noise_name(&e.name)
+                || e.name.split_whitespace().count() < 2
+            {
+                continue;
+            }
+            let island_lower = e.name.to_lowercase();
+            let island_words: usize = island_lower.split_whitespace().count();
+
+            // Look for same-type connected entities where one name contains the other
+            if let Some(candidates) = type_connected.get(&e.entity_type) {
+                let mut best: Option<(i64, f64)> = None;
+                for (cid, cname) in candidates {
+                    let key = if e.id < *cid {
+                        (e.id, *cid)
+                    } else {
+                        (*cid, e.id)
+                    };
+                    if edges.contains(&key) {
+                        continue;
+                    }
+                    let cand_words: usize = cname.split_whitespace().count();
+
+                    // One must contain the other, and the shorter must be ≥2 words
+                    let (shorter, longer): (&str, &str) = if island_words <= cand_words {
+                        (island_lower.as_str(), cname.as_str())
+                    } else {
+                        (cname.as_str(), island_lower.as_str())
+                    };
+                    let shorter_words = shorter.split_whitespace().count();
+                    if shorter_words < 2 {
+                        continue;
+                    }
+                    if longer.contains(shorter) {
+                        // Overlap ratio: how much of the longer name is covered
+                        let ratio = shorter.len() as f64 / longer.len().max(1) as f64;
+                        if ratio > 0.4 {
+                            if best.is_none() || ratio > best.unwrap().1 {
+                                best = Some((*cid, ratio));
+                            }
+                        }
+                    }
+                }
+
+                if let Some((target_id, _ratio)) = best {
+                    let predicate = if island_words
+                        < type_connected
+                            .get(&e.entity_type)
+                            .map(|v| {
+                                v.iter()
+                                    .find(|(id, _)| *id == target_id)
+                                    .map(|(_, n)| n.split_whitespace().count())
+                                    .unwrap_or(0)
+                            })
+                            .unwrap_or(0)
+                    {
+                        "broader_form_of"
+                    } else {
+                        "specific_form_of"
+                    };
+                    self.brain.upsert_relation(
+                        e.id,
+                        predicate,
+                        target_id,
+                        "prometheus:name_containment_reconnect",
+                    )?;
+                    reconnected += 1;
+                    if reconnected >= 150 {
+                        break;
+                    }
                 }
             }
         }
