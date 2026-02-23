@@ -9656,6 +9656,38 @@ impl<'a> Prometheus<'a> {
             "educational",
             "electronic",
             "historical",
+            // Common non-person terms found in NLP extraction errors
+            "access",
+            "user",
+            "plans",
+            "prewar",
+            "staff",
+            "ego",
+            "productions",
+            "smashers",
+            "graves",
+            "mass",
+            "sex",
+            "gentle",
+            "imprecision",
+            "trees",
+            "counted",
+            "ministerium",
+            "bildung",
+            "stationen",
+            "dokumente",
+            "elenco",
+            "cronologico",
+            "eclogae",
+            "geologicae",
+            "cuarta",
+            "guerra",
+            "carlista",
+            "rainforests",
+            "tropical",
+            "hotel",
+            "inertia",
+            "isla",
         ]
         .into_iter()
         .collect();
@@ -9736,10 +9768,69 @@ impl<'a> Prometheus<'a> {
                 .iter()
                 .all(|w| w.chars().next().is_some_and(|c| c.is_lowercase()));
 
+            // Detect non-name patterns:
+            // 1. Name ending with single uppercase letter (citation: "Washbrook D", "Cebon Peter")
+            let ends_single_letter = words.len() >= 2
+                && words
+                    .last()
+                    .is_some_and(|w| w.len() == 1 && w.chars().all(|c| c.is_uppercase()));
+            // 2. Abbreviation endings ("Madison Univ", "Rear Adm")
+            let abbrev_endings = [
+                "univ", "adm", "dept", "inst", "corp", "assoc", "intl", "natl", "govt",
+            ];
+            let ends_abbrev = words
+                .last()
+                .is_some_and(|w| abbrev_endings.contains(&w.to_lowercase().as_str()));
+            // 3. Plural nouns as last word (not person names: "Mass Graves", "Atom Smashers", "B-Trees")
+            let plural_last = words.last().is_some_and(|w| {
+                let lw = w.to_lowercase();
+                lw.len() > 4 && lw.ends_with('s') && !lw.ends_with("ss") && !lw.ends_with("us")
+                && !lw.ends_with("is") && !lw.ends_with("as")
+                // Check it's not a common surname ending in 's'
+                && !["adams", "james", "jones", "williams", "davis", "harris",
+                     "lewis", "thomas", "evans", "roberts", "phillips", "edwards",
+                     "morris", "hughes", "rogers", "jenkins", "burns", "mills",
+                     "matthews", "sanders", "richards", "stevens", "daniels",
+                     "reynolds", "chambers", "simmons", "parsons", "watkins",
+                     "briggs", "sims", "reeves", "hayes", "rhodes", "sparks",
+                     "meadows", "saunders", "hodges", "lyons", "cyrus", "ames",
+                     "cummings", "jennings", "hastings", "hawkins", "clemens",
+                     "rawlings", "dickens", "collins", "owens", "burroughs",
+                     "descartes", "cervantes", "borges", "soares", "fernandes",
+                     "martins", "nunes", "gomes", "lopes", "abeles",
+                     ].contains(&lw.as_str())
+            });
+            // 4. Contains hyphen in non-name pattern ("B-Trees", "Cross-Cultural")
+            let has_nonname_hyphen = e.name.contains('-')
+                && words.iter().any(|w| {
+                    let lw = w.to_lowercase();
+                    lw.contains('-') && !lw.chars().next().is_some_and(|c| c.is_uppercase())
+                });
+            // 5. "Elenco Cronologico", "Stationen Dokumente" — multi-word non-English phrases
+            //    that aren't person names: no word looks like a first/last name
+            let looks_non_name_phrase = words.len() >= 2
+                && words.iter().all(|w| w.len() > 3)
+                && !words.iter().any(|w| {
+                    // Check if word could be a first name (starts uppercase, 3-12 chars, all alpha)
+                    let lw = w.to_lowercase();
+                    w.len() >= 3
+                        && w.len() <= 12
+                        && w.chars().next().is_some_and(|c| c.is_uppercase())
+                        && w.chars().all(|c| c.is_alphabetic())
+                        && !concept_words.contains(lw.as_str())
+                        && !place_words.contains(lw.as_str())
+                })
+                && e.confidence < 0.7;
+
             if has_concept_word
                 || has_place_word
                 || (has_non_english_phrase && e.confidence < 0.8)
                 || (all_lowercase_words && words.len() >= 2)
+                || ends_single_letter
+                || ends_abbrev
+                || (plural_last && !has_place_word && words.len() <= 3)
+                || has_nonname_hyphen
+                || looks_non_name_phrase
             {
                 eprintln!(
                     "  [mistyped-person-purge] deleting island '{}' (id={})",
