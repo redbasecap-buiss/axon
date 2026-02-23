@@ -3094,6 +3094,12 @@ impl<'a> Prometheus<'a> {
             rejected,
         );
 
+        // Discovery health check (trend analysis + hypothesis clustering)
+        let health_line = self
+            .discovery_health_check()
+            .map(|h| format!(", health: {}", h))
+            .unwrap_or_default();
+
         // Get trend comparison if previous snapshots exist
         let trend_line = {
             let snapshots = crate::graph::get_graph_snapshots(self.brain, 2).unwrap_or_default();
@@ -3202,6 +3208,8 @@ impl<'a> Prometheus<'a> {
             core_members.len(),
             trend_line,
         );
+        // Append health check to summary
+        let summary = format!("{}{}", summary, health_line);
 
         Ok(DiscoveryReport {
             patterns_found: all_patterns,
@@ -4246,6 +4254,126 @@ impl<'a> Prometheus<'a> {
                 Ok(Some(lines.join("\n")))
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Hypothesis clustering
+    // -----------------------------------------------------------------------
+
+    /// Cluster hypotheses by shared entities to surface thematic insights.
+    /// Groups hypotheses that mention overlapping subjects/objects into clusters.
+    /// Returns Vec of (theme_label, hypotheses_in_cluster).
+    pub fn cluster_hypotheses(&self) -> Result<Vec<(String, Vec<Hypothesis>)>> {
+        let hyps = self.list_hypotheses(Some(HypothesisStatus::Proposed))?;
+        if hyps.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build entity → hypothesis index
+        let mut entity_hyps: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, h) in hyps.iter().enumerate() {
+            entity_hyps.entry(h.subject.clone()).or_default().push(idx);
+            if h.object != "?" {
+                entity_hyps.entry(h.object.clone()).or_default().push(idx);
+            }
+        }
+
+        // Union-Find to cluster hypotheses sharing entities
+        let n = hyps.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        fn find(parent: &mut [usize], x: usize) -> usize {
+            if parent[x] != x {
+                parent[x] = find(parent, parent[x]);
+            }
+            parent[x]
+        }
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[ra] = rb;
+            }
+        }
+
+        for indices in entity_hyps.values() {
+            if indices.len() >= 2 {
+                for w in indices.windows(2) {
+                    union(&mut parent, w[0], w[1]);
+                }
+            }
+        }
+
+        // Group by root
+        let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
+        for i in 0..n {
+            let root = find(&mut parent, i);
+            clusters.entry(root).or_default().push(i);
+        }
+
+        // Build result with theme labels (most frequent entity in cluster)
+        let mut result: Vec<(String, Vec<Hypothesis>)> = Vec::new();
+        for indices in clusters.values() {
+            if indices.len() < 2 {
+                continue; // skip singletons
+            }
+            // Find the most mentioned entity as theme label
+            let mut entity_freq: HashMap<&str, usize> = HashMap::new();
+            for &idx in indices {
+                *entity_freq.entry(&hyps[idx].subject).or_insert(0) += 1;
+                if hyps[idx].object != "?" {
+                    *entity_freq.entry(&hyps[idx].object).or_insert(0) += 1;
+                }
+            }
+            let theme = entity_freq
+                .into_iter()
+                .max_by_key(|(_, c)| *c)
+                .map(|(name, _)| name.to_string())
+                .unwrap_or_default();
+
+            let cluster_hyps: Vec<Hypothesis> =
+                indices.iter().map(|&idx| hyps[idx].clone()).collect();
+            result.push((theme, cluster_hyps));
+        }
+        result.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        result.truncate(20);
+        Ok(result)
+    }
+
+    /// Discovery health check: analyze trend and recommend next actions.
+    pub fn discovery_health_check(&self) -> Result<String> {
+        let (trend, avg_delta, _, recommendation) =
+            crate::graph::analyze_discovery_trend(self.brain, 6)?;
+
+        let velocity = self.get_velocity_trend(5)?;
+        let velocity_note = if velocity.len() >= 2 {
+            let recent_hyps = velocity[0].2;
+            let prev_hyps = velocity[1].2;
+            if recent_hyps < prev_hyps / 2 && recent_hyps < 20 {
+                " Hypothesis generation dropping — knowledge frontiers may be exhausted."
+            } else {
+                ""
+            }
+        } else {
+            ""
+        };
+
+        let clusters = self.cluster_hypotheses()?;
+        let cluster_note = if !clusters.is_empty() {
+            format!(
+                " {} hypothesis clusters found; largest theme: '{}' ({} hypotheses).",
+                clusters.len(),
+                clusters[0].0,
+                clusters[0].1.len()
+            )
+        } else {
+            String::new()
+        };
+
+        Ok(format!(
+            "Discovery trend: {} (avg Δrels: {:.1}). {}{}{}",
+            trend, avg_delta, recommendation, velocity_note, cluster_note
+        ))
     }
 
     // -----------------------------------------------------------------------

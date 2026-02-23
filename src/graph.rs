@@ -2702,6 +2702,90 @@ pub fn structural_diversity(brain: &Brain) -> Result<f64, rusqlite::Error> {
     Ok(deg_entropy + comp_entropy)
 }
 
+/// Analyze discovery velocity trend: detect diminishing returns and suggest course corrections.
+/// Returns (trend_direction, avg_recent_patterns, avg_recent_confirmed, recommendation).
+/// trend_direction: "accelerating", "steady", "decelerating", "stalled"
+pub fn analyze_discovery_trend(
+    brain: &Brain,
+    window: usize,
+) -> Result<(String, f64, f64, String), rusqlite::Error> {
+    let snapshots = get_graph_snapshots(brain, window.max(4))?;
+    if snapshots.len() < 2 {
+        return Ok((
+            "insufficient_data".into(),
+            0.0,
+            0.0,
+            "Need at least 2 discovery runs for trend analysis.".into(),
+        ));
+    }
+
+    // Look at relation growth rate across snapshots (most recent first)
+    let recent = &snapshots[..snapshots.len().min(window)];
+    let mut deltas: Vec<i64> = Vec::new();
+    for w in recent.windows(2) {
+        // w[0] is newer, w[1] is older
+        deltas.push(w[0].2 - w[1].2); // relation delta
+    }
+
+    let avg_delta = if !deltas.is_empty() {
+        deltas.iter().sum::<i64>() as f64 / deltas.len() as f64
+    } else {
+        0.0
+    };
+
+    // Check if deltas are decreasing (diminishing returns)
+    let (trend, rec): (String, String) = if deltas.len() >= 3 {
+        let first_half_avg = deltas[deltas.len() / 2..].iter().sum::<i64>() as f64
+            / (deltas.len() - deltas.len() / 2) as f64;
+        let second_half_avg =
+            deltas[..deltas.len() / 2].iter().sum::<i64>() as f64 / (deltas.len() / 2) as f64;
+
+        if second_half_avg > first_half_avg * 1.2 {
+            (
+                "accelerating".into(),
+                "Discovery is accelerating — current strategies are effective. Keep going.".into(),
+            )
+        } else if second_half_avg < first_half_avg * 0.3 && second_half_avg < 10.0 {
+            ("stalled".into(), "Discovery has stalled — consider crawling new topic domains or adjusting NLP extraction.".into())
+        } else if second_half_avg < first_half_avg * 0.7 {
+            ("decelerating".into(), "Diminishing returns detected — existing topics are saturating. Explore new domains.".into())
+        } else {
+            (
+                "steady".into(),
+                "Discovery rate is steady. Continue current approach.".into(),
+            )
+        }
+    } else {
+        if avg_delta < 5.0 {
+            (
+                "slow".into(),
+                "Low discovery rate — need more diverse source material.".into(),
+            )
+        } else {
+            ("steady".into(), "Discovery rate looks healthy.".into())
+        }
+    };
+
+    // Fragmentation trend
+    let frag_current = snapshots[0].8;
+    let frag_oldest = snapshots.last().map(|s| s.8).unwrap_or(1.0);
+    let frag_delta = frag_current - frag_oldest;
+    let frag_note = if frag_delta < -0.01 {
+        " Graph cohesion improving."
+    } else if frag_delta > 0.01 {
+        " Warning: graph becoming more fragmented — focus on connecting existing clusters."
+    } else {
+        ""
+    };
+
+    Ok((
+        trend,
+        avg_delta,
+        0.0, // confirmed rate not tracked in snapshots
+        format!("{}{}", rec, frag_note),
+    ))
+}
+
 /// Topic-aware gap detection: for each community, find entities that have
 /// high betweenness centrality within the community but low connections to other communities.
 /// These are "local hubs" that could serve as bridges if connected cross-community.
