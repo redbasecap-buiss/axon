@@ -134,24 +134,26 @@ pub fn pagerank(
     }
     let mut scores: HashMap<i64, f64> = ids.iter().map(|&id| (id, 1.0 / n as f64)).collect();
     for _ in 0..iterations {
+        // Collect dangling node mass in one pass (avoid O(n*d) inner loop)
+        let mut dangling_sum = 0.0_f64;
         let mut new_scores: HashMap<i64, f64> = ids
             .iter()
             .map(|&id| (id, (1.0 - damping) / n as f64))
             .collect();
         for &id in &ids {
-            let out = out_links.get(&id);
-            let out_count = out.map_or(0, |v| v.len());
-            if out_count > 0 {
-                let share = scores[&id] / out_count as f64;
-                for &target in out.unwrap() {
+            if let Some(out) = out_links.get(&id) {
+                let share = scores[&id] / out.len() as f64;
+                for &target in out {
                     *new_scores.entry(target).or_insert(0.0) += damping * share;
                 }
             } else {
-                let share = scores[&id] / n as f64;
-                for &other in &ids {
-                    *new_scores.entry(other).or_insert(0.0) += damping * share;
-                }
+                dangling_sum += scores[&id];
             }
+        }
+        // Distribute dangling mass uniformly
+        let dangling_share = damping * dangling_sum / n as f64;
+        for v in new_scores.values_mut() {
+            *v += dangling_share;
         }
         scores = new_scores;
     }
@@ -636,6 +638,7 @@ pub fn weighted_pagerank(
 
     let mut scores: HashMap<i64, f64> = ids.iter().map(|&id| (id, 1.0 / n as f64)).collect();
     for _ in 0..iterations {
+        let mut dangling_sum = 0.0_f64;
         let mut new_scores: HashMap<i64, f64> = ids
             .iter()
             .map(|&id| (id, (1.0 - damping) / n as f64))
@@ -648,14 +651,16 @@ pub fn weighted_pagerank(
                         let share = scores[&id] * weight / total_weight;
                         *new_scores.entry(target).or_insert(0.0) += damping * share;
                     }
+                } else {
+                    dangling_sum += scores[&id];
                 }
             } else {
-                // Dangling node: distribute evenly
-                let share = scores[&id] / n as f64;
-                for &other in &ids {
-                    *new_scores.entry(other).or_insert(0.0) += damping * share;
-                }
+                dangling_sum += scores[&id];
             }
+        }
+        let dangling_share = damping * dangling_sum / n as f64;
+        for v in new_scores.values_mut() {
+            *v += dangling_share;
         }
         scores = new_scores;
     }

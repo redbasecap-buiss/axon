@@ -282,8 +282,68 @@ fn is_noise_name(name: &str) -> bool {
         "foundation",
         "academy",
         "department",
+        "commentary",
+        "surveys",
+        "critique",
+        "conflict",
+        "sport",
+        "civilization",
+        "tradition",
+        "empire",
+        "kingdom",
+        "dynasty",
+        "republic",
+        "province",
+        "strom",
+        "like",
+        "daughter",
     ];
     if word_count == 1 && generic_caps.contains(&lower_trimmed.as_ref()) {
+        return true;
+    }
+    // Names ending with "Journal", "During", "Resting", "Commentary" etc. — citation/fragment noise
+    let trailing_noise = [
+        "journal",
+        "during",
+        "resting",
+        "commentary",
+        "surveys",
+        "proceedings",
+        "magazine",
+        "review",
+        "bulletin",
+        "newsletter",
+        "gazette",
+        "digest",
+        "quarterly",
+        "annual",
+        "monthly",
+        "weekly",
+    ];
+    if word_count >= 2 {
+        let last_word = lower_trimmed.split_whitespace().last().unwrap_or("");
+        if trailing_noise.contains(&last_word) {
+            return true;
+        }
+    }
+    // Names containing "Journal" anywhere (journal titles extracted as entities)
+    if lower_trimmed.contains("journal") {
+        return true;
+    }
+    // Roman numeral suffixes without real content (e.g. "Michael V", "Morgan I")
+    let roman_numerals = [
+        "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "xi", "xii",
+    ];
+    if word_count == 2 {
+        let words: Vec<&str> = lower_trimmed.split_whitespace().collect();
+        if roman_numerals.contains(&words[1]) && words[0].len() <= 10 {
+            // But allow real names like "Henry VIII" — only filter if first word isn't a common first name
+            // For now, be conservative and keep this as a soft signal
+            // combined with other noise indicators
+        }
+    }
+    // "Like" suffix patterns (e.g. "German Like")
+    if word_count >= 2 && lower_trimmed.ends_with(" like") {
         return true;
     }
     // Names that are mostly numbers with some text (e.g. "1997 1", "Vol 23")
@@ -1616,6 +1676,9 @@ impl<'a> Prometheus<'a> {
         // Purge noise entities (cleanup)
         let purged = self.purge_noise_entities().unwrap_or(0);
 
+        // Bulk quality cleanup (aggressive isolated noise removal)
+        let bulk_cleaned = self.bulk_quality_cleanup().unwrap_or(0);
+
         // Predicate normalization (reduce "is" overuse)
         let normalized = self.normalize_predicates().unwrap_or(0);
 
@@ -1630,7 +1693,7 @@ impl<'a> Prometheus<'a> {
              predicate diversity: {}/{} ({:.0}% diverse), \
              {} fuzzy duplicates ({} auto-merge, {} auto-merged), {} sparse topic domains, \
              {} name subsumptions found, {} noise entities purged, \
-             {} predicates normalized, {} islands reconnected",
+             {} bulk cleaned, {} predicates normalized, {} islands reconnected",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1656,6 +1719,7 @@ impl<'a> Prometheus<'a> {
             sparse_topics,
             subsumptions.len(),
             purged,
+            bulk_cleaned,
             normalized,
             reconnected,
         );
@@ -2502,7 +2566,9 @@ impl<'a> Prometheus<'a> {
             // with very low confidence
             let is_noise = is_noise_name(&e.name) || is_noise_type(&e.entity_type);
             let is_low_value = deg == 0 && e.confidence < 0.3 && e.name.len() < 4;
-            if (deg <= 1 && is_noise) || is_low_value {
+            // Aggressive: purge isolated entities that look like citation fragments
+            let is_citation_fragment = deg == 0 && looks_like_citation(&e.name);
+            if (deg <= 1 && is_noise) || is_low_value || is_citation_fragment {
                 self.brain.with_conn(|conn| {
                     conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
                     conn.execute(
@@ -2515,6 +2581,35 @@ impl<'a> Prometheus<'a> {
             }
         }
         Ok(purged)
+    }
+
+    /// Bulk quality cleanup: remove isolated entities that are clearly extraction noise.
+    /// More aggressive than purge_noise_entities — targets patterns common in Wikipedia extraction.
+    /// Returns count of entities removed.
+    pub fn bulk_quality_cleanup(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        let mut removed = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue; // keep all connected entities
+            }
+            let should_remove = is_extraction_noise(&e.name, &e.entity_type);
+            if should_remove {
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                    Ok(())
+                })?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// Normalize generic predicates to more specific ones using context.
@@ -2806,6 +2901,80 @@ impl<'a> Prometheus<'a> {
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// Check if an entity name looks like a citation fragment (common in Wikipedia extraction).
+fn looks_like_citation(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    // Contains volume/page indicators
+    if lower.contains(" vol ") || lower.contains(" pp ") || lower.contains(" no ") {
+        return true;
+    }
+    // Contains "journal" anywhere
+    if lower.contains("journal") {
+        return true;
+    }
+    // Ends with common citation noise
+    let citation_suffixes = ["press", "publishers", "publishing", "edition", "eds"];
+    let last_word = lower.split_whitespace().last().unwrap_or("");
+    if citation_suffixes.contains(&last_word) && lower.split_whitespace().count() >= 3 {
+        return true;
+    }
+    false
+}
+
+/// Determine if an isolated entity is likely extraction noise from Wikipedia/encyclopedias.
+/// Aggressive filter — only apply to entities with ZERO relations.
+fn is_extraction_noise(name: &str, entity_type: &str) -> bool {
+    // Already caught by noise filters
+    if is_noise_name(name) || is_noise_type(entity_type) {
+        return true;
+    }
+    let lower = name.to_lowercase();
+    let word_count = lower.split_whitespace().count();
+
+    // Citation fragments
+    if looks_like_citation(name) {
+        return true;
+    }
+
+    // Names with mixed case patterns suggesting concatenated references
+    // e.g., "Browning Robert International Journal"
+    if word_count >= 3 {
+        let words: Vec<&str> = name.split_whitespace().collect();
+        // Check if it looks like "LastName FirstName SomethingElse" pattern
+        let has_trailing_noise = [
+            "During",
+            "Resting",
+            "Commentary",
+            "Surveys",
+            "Proceedings",
+            "Magazine",
+            "Review",
+            "Bulletin",
+            "Like",
+        ];
+        if words.len() >= 2 && has_trailing_noise.contains(&words[words.len() - 1]) {
+            return true;
+        }
+    }
+
+    // Pure acronyms that are too short to be meaningful when isolated
+    if word_count == 1 && name.len() <= 3 && name.chars().all(|c| c.is_uppercase()) {
+        return true;
+    }
+
+    // Possessive/genitive forms alone (e.g. "Switzerland's", "Ramanujan's")
+    if lower.ends_with("'s") || lower.ends_with("\u{2019}s") {
+        return true;
+    }
+
+    // Starts with "The " followed by a single generic word
+    if lower.starts_with("the ") && word_count == 2 {
+        return true;
+    }
+
+    false
+}
 
 fn now_str() -> String {
     Utc::now()
