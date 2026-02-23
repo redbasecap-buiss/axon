@@ -7958,8 +7958,34 @@ impl<'a> Prometheus<'a> {
             "emperor",
             "admiral",
             "general",
+            "generals",
             "colonel",
             "captain",
+            "marshal",
+            "field-marshal",
+            "sergeant",
+            "lieutenant",
+            "commander",
+            "commodore",
+            "minister",
+            "governor",
+            "archbishop",
+            "bishop",
+            "sultan",
+            "kaiser",
+            "tsar",
+            "czar",
+            "shah",
+            "prince",
+            "princess",
+            "duke",
+            "duchess",
+            "count",
+            "countess",
+            "baron",
+            "baroness",
+            "cardinal",
+            "pope",
             "saint",
             "san",
             "scientific",
@@ -8423,6 +8449,69 @@ impl<'a> Prometheus<'a> {
             "war",
             "bury",
             "compare",
+            // Common nouns that cause spurious cross-domain matches
+            "cube",
+            "theory",
+            "problem",
+            "system",
+            "model",
+            "code",
+            "map",
+            "maps",
+            "guide",
+            "lost",
+            "red",
+            "blue",
+            "green",
+            "black",
+            "white",
+            "golden",
+            "silver",
+            "dark",
+            "light",
+            "star",
+            "sun",
+            "moon",
+            "fire",
+            "ice",
+            "iron",
+            "steel",
+            "stone",
+            "rock",
+            "sand",
+            "snow",
+            "storm",
+            "wind",
+            "rain",
+            "cloud",
+            "wave",
+            "twin",
+            "double",
+            "triple",
+            "super",
+            "mega",
+            "ultra",
+            "mini",
+            "micro",
+            "nano",
+            "digital",
+            "analog",
+            "hybrid",
+            "memory",
+            "power",
+            "energy",
+            "force",
+            "speed",
+            "test",
+            "trial",
+            "game",
+            "play",
+            "race",
+            "match",
+            "fight",
+            "rule",
+            "rules",
+            "act",
             "finally",
             "scientist",
             "tri",
@@ -8526,6 +8615,19 @@ impl<'a> Prometheus<'a> {
                 if best_score < min_score {
                     continue;
                 }
+                // Count actual shared tokens (not just score)
+                let best_toks = entity_tokens.get(&best_id);
+                let shared_count = island_toks
+                    .iter()
+                    .filter(|t| best_toks.map(|bt| bt.contains(t)).unwrap_or(false))
+                    .count();
+                // Require ≥2 shared tokens for non-person entities to avoid
+                // single-word spurious matches like "Rubik Cube" ↔ "Hybrid Memory Cube"
+                let is_person =
+                    entity_map.get(&island_id).map(|e| e.entity_type.as_str()) == Some("person");
+                if !is_person && shared_count < 2 && island_toks.len() >= 2 {
+                    continue;
+                }
                 let island_name = entity_map
                     .get(&island_id)
                     .map(|e| e.name.as_str())
@@ -8572,6 +8674,33 @@ impl<'a> Prometheus<'a> {
                     // Require ≥2 shared tokens for person-person (avoid "John X" ↔ "John Y")
                     if shared_toks.len() < 2 && island_toks.len() >= 2 {
                         continue;
+                    }
+                }
+
+                // For person ↔ non-person matches, require that shared tokens
+                // include the person's surname (last word), not just first name.
+                // Avoids "Don Backer" ↔ "Don River" (shares "don" = first name only).
+                if (island_type == "person") != (target_type == "person") {
+                    let (person_name, person_toks) = if island_type == "person" {
+                        (island_name, island_toks.as_slice())
+                    } else {
+                        (target_name, best_toks.map(|t| t.as_slice()).unwrap_or(&[]))
+                    };
+                    if person_name.split_whitespace().count() >= 2 {
+                        let person_last = person_name
+                            .split_whitespace()
+                            .last()
+                            .unwrap_or("")
+                            .to_lowercase();
+                        let other_toks = if island_type == "person" {
+                            best_toks.map(|t| t.as_slice()).unwrap_or(&[])
+                        } else {
+                            island_toks.as_slice()
+                        };
+                        let shares_surname = other_toks.iter().any(|t| *t == person_last);
+                        if !shares_surname {
+                            continue;
+                        }
                     }
                 }
 
