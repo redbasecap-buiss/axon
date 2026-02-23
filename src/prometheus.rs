@@ -1860,6 +1860,15 @@ impl<'a> Prometheus<'a> {
         let (total_rels, _generic_rels, diverse_rels, div_ratio) =
             self.predicate_diversity().unwrap_or((0, 0, 0, 0.0));
 
+        // Exact-name deduplication (catches case-only duplicates)
+        let exact_deduped = self.dedup_exact_name_matches().unwrap_or(0);
+
+        // Reverse containment island merge (island "Euler" → "Leonhard Euler")
+        let reverse_merged = self.reverse_containment_island_merge().unwrap_or(0);
+
+        // Bulk reject stale testing hypotheses (>5 days, confidence < 0.5)
+        let bulk_rejected = self.bulk_reject_stale_testing(5, 0.5).unwrap_or(0);
+
         // Fuzzy duplicate detection + auto-merge high-confidence dupes
         let fuzzy_dupes = self.find_fuzzy_duplicates().unwrap_or_default();
         let merge_candidates = fuzzy_dupes.iter().filter(|d| d.3 == "merge").count();
@@ -1921,6 +1930,7 @@ impl<'a> Prometheus<'a> {
              {} cross-domain gaps, {} knowledge frontiers, {} bridge entities, {} connectable islands, \
              {} prioritized gaps, {} decayed, {} pruned, {} island clusters, \
              predicate diversity: {}/{} ({:.0}% diverse), \
+             {} exact-name deduped, {} reverse-containment merged, {} bulk-rejected stale, \
              {} fuzzy duplicates ({} auto-merge, {} auto-merged), {} sparse topic domains, \
              {} name subsumptions found, {} types fixed, {} noise entities purged, \
              {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected, \
@@ -1947,6 +1957,9 @@ impl<'a> Prometheus<'a> {
             diverse_rels,
             total_rels,
             div_ratio * 100.0,
+            exact_deduped,
+            reverse_merged,
+            bulk_rejected,
             fuzzy_dupes.len(),
             merge_candidates,
             auto_merged,
@@ -4035,6 +4048,216 @@ impl<'a> Prometheus<'a> {
             Ok(updated)
         })?;
         Ok(count)
+    }
+
+    /// Aggressive hypothesis cleanup: reject all testing hypotheses older than `max_days`
+    /// with confidence below `max_confidence`, regardless of the normal rejection threshold.
+    /// This prevents the testing queue from growing unboundedly.
+    /// Returns count of hypotheses rejected.
+    pub fn bulk_reject_stale_testing(&self, max_days: i64, max_confidence: f64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::days(max_days))
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let count = self.brain.with_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE hypotheses SET status = 'rejected' \
+                 WHERE status = 'testing' \
+                 AND discovered_at < ?1 \
+                 AND confidence < ?2",
+                params![cutoff, max_confidence],
+            )?;
+            Ok(updated)
+        })?;
+        // Record rejections for meta-learning
+        if count > 0 {
+            // Batch record — approximate by pattern source
+            let _ = self.record_outcome("stale_bulk_reject", false);
+        }
+        Ok(count)
+    }
+
+    /// Reconnect islands using reverse containment: find islands whose name appears
+    /// as a significant substring within a connected entity name.
+    /// E.g., island "Euler" → connected "Euler's Method" or "Leonhard Euler".
+    /// Unlike consolidate_prefix_islands (which checks if island is a prefix),
+    /// this checks if the island name appears anywhere as a word boundary match.
+    /// Returns count of merges performed.
+    pub fn reverse_containment_island_merge(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Build word index: word → list of connected entity IDs containing that word
+        let mut word_to_entities: HashMap<String, Vec<(i64, String, String)>> = HashMap::new();
+        for e in &entities {
+            if !connected.contains(&e.id) || is_noise_name(&e.name) || is_noise_type(&e.entity_type)
+            {
+                continue;
+            }
+            for word in e.name.to_lowercase().split_whitespace() {
+                if word.len() >= 4 {
+                    word_to_entities.entry(word.to_string()).or_default().push((
+                        e.id,
+                        e.name.to_lowercase(),
+                        e.entity_type.clone(),
+                    ));
+                }
+            }
+        }
+
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<i64> = HashSet::new();
+
+        for e in &entities {
+            if connected.contains(&e.id) || absorbed.contains(&e.id) {
+                continue;
+            }
+            if is_noise_name(&e.name) || is_noise_type(&e.entity_type) {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            let words: Vec<&str> = lower.split_whitespace().collect();
+
+            // Only handle single-word or two-word islands
+            if words.len() > 2 || words.is_empty() {
+                continue;
+            }
+
+            // For single-word islands: find connected entities containing this word
+            if words.len() == 1 && lower.len() >= 5 {
+                if let Some(candidates) = word_to_entities.get(&lower) {
+                    // Find best match: same type, shortest name (most specific)
+                    let mut best: Option<(i64, usize)> = None;
+                    for (cid, cname, ctype) in candidates {
+                        if *cid == e.id {
+                            continue;
+                        }
+                        // Must be multi-word (otherwise it's the same entity)
+                        if !cname.contains(' ') {
+                            continue;
+                        }
+                        let same_type = *ctype == e.entity_type;
+                        let compatible = same_type
+                            || matches!(
+                                (e.entity_type.as_str(), ctype.as_str()),
+                                ("concept", "person")
+                                    | ("person", "concept")
+                                    | ("concept", "place")
+                                    | ("place", "concept")
+                            );
+                        if !compatible {
+                            continue;
+                        }
+                        // Prefer same-type, then shorter names
+                        let score =
+                            if same_type { 10000 } else { 0 } + (1000 - cname.len().min(999));
+                        if best.is_none() || score > best.unwrap().1 {
+                            best = Some((*cid, score));
+                        }
+                    }
+                    if let Some((target_id, _)) = best {
+                        // Check the island has no facts worth preserving
+                        let facts = self.brain.get_facts_for(e.id)?;
+                        if facts.is_empty() {
+                            self.brain.merge_entities(e.id, target_id)?;
+                            absorbed.insert(e.id);
+                            merged += 1;
+                        }
+                    }
+                }
+            }
+
+            // For two-word islands: check if both words appear in a connected entity
+            if words.len() == 2 && lower.len() >= 6 {
+                let w0 = words[0].to_string();
+                let w1 = words[1].to_string();
+                if w0.len() < 4 || w1.len() < 4 {
+                    continue;
+                }
+                let c0 = word_to_entities.get(&w0);
+                let c1 = word_to_entities.get(&w1);
+                if let (Some(list0), Some(list1)) = (c0, c1) {
+                    // Find entities appearing in both word lists
+                    let ids0: HashSet<i64> = list0.iter().map(|(id, _, _)| *id).collect();
+                    for (cid, _cname, ctype) in list1 {
+                        if ids0.contains(cid) && *cid != e.id {
+                            let compatible = *ctype == e.entity_type
+                                || matches!(
+                                    (e.entity_type.as_str(), ctype.as_str()),
+                                    ("concept", "person")
+                                        | ("person", "concept")
+                                        | ("concept", "place")
+                                        | ("place", "concept")
+                                );
+                            if compatible {
+                                let facts = self.brain.get_facts_for(e.id)?;
+                                if facts.is_empty() {
+                                    self.brain.merge_entities(e.id, *cid)?;
+                                    absorbed.insert(e.id);
+                                    merged += 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Deduplicate entities with identical lowercase names but different IDs.
+    /// This catches exact duplicates that differ only in casing or whitespace.
+    /// Returns count of merges performed.
+    pub fn dedup_exact_name_matches(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let mut name_groups: HashMap<String, Vec<(i64, f64, usize)>> = HashMap::new();
+
+        // Build relation degree for tie-breaking
+        let relations = self.brain.all_relations()?;
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        for e in &entities {
+            if is_noise_type(&e.entity_type) {
+                continue;
+            }
+            let key = e.name.to_lowercase().trim().to_string();
+            if key.len() < 2 {
+                continue;
+            }
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            name_groups
+                .entry(key)
+                .or_default()
+                .push((e.id, e.confidence, deg));
+        }
+
+        let mut merged = 0usize;
+        for (_name, mut group) in name_groups {
+            if group.len() < 2 {
+                continue;
+            }
+            // Sort: highest degree first, then highest confidence
+            group.sort_by(|a, b| {
+                b.2.cmp(&a.2)
+                    .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            let keep_id = group[0].0;
+            for &(remove_id, _, _) in &group[1..] {
+                self.brain.merge_entities(remove_id, keep_id)?;
+                merged += 1;
+            }
+        }
+        Ok(merged)
     }
 
     /// Generate hypotheses from Louvain community bridges: entities in different
