@@ -1454,6 +1454,79 @@ pub fn graph_recommendations(brain: &Brain) -> Result<Vec<(u8, String)>, rusqlit
     Ok(recs)
 }
 
+/// Adamic-Adar link prediction: scores non-connected entity pairs by summing
+/// 1/ln(degree) for each shared neighbor. Higher score = more likely missing link.
+/// This is a proven link prediction algorithm from network science.
+/// Returns top `limit` predicted links as (entity_a, entity_b, score).
+pub fn adamic_adar_predict(
+    brain: &Brain,
+    limit: usize,
+) -> Result<Vec<(i64, i64, f64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    // Precompute degrees
+    let degree: HashMap<i64, usize> = adj
+        .iter()
+        .map(|(&id, neighbors)| (id, neighbors.len()))
+        .collect();
+
+    // Build direct-connection set
+    let relations = brain.all_relations()?;
+    let mut connected: HashSet<(i64, i64)> = HashSet::new();
+    for r in &relations {
+        let key = if r.subject_id < r.object_id {
+            (r.subject_id, r.object_id)
+        } else {
+            (r.object_id, r.subject_id)
+        };
+        connected.insert(key);
+    }
+
+    // Only score pairs where both nodes have degree >= 2 (otherwise no shared neighbors)
+    let candidates: Vec<i64> = degree
+        .iter()
+        .filter(|(_, &d)| d >= 2)
+        .map(|(&id, _)| id)
+        .collect();
+
+    let mut scores: Vec<(i64, i64, f64)> = Vec::new();
+    let nb_sets: HashMap<i64, HashSet<i64>> = candidates
+        .iter()
+        .map(|&id| {
+            let set: HashSet<i64> = adj
+                .get(&id)
+                .map(|v| v.iter().copied().collect())
+                .unwrap_or_default();
+            (id, set)
+        })
+        .collect();
+
+    for i in 0..candidates.len().min(500) {
+        let a = candidates[i];
+        let na = &nb_sets[&a];
+        for j in (i + 1)..candidates.len().min(500) {
+            let b = candidates[j];
+            let key = if a < b { (a, b) } else { (b, a) };
+            if connected.contains(&key) {
+                continue;
+            }
+            let nb = &nb_sets[&b];
+            let score: f64 = na
+                .intersection(nb)
+                .map(|&z| {
+                    let dz = degree.get(&z).copied().unwrap_or(1).max(2);
+                    1.0 / (dz as f64).ln()
+                })
+                .sum();
+            if score > 0.0 {
+                scores.push((a, b, score));
+            }
+        }
+    }
+    scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    scores.truncate(limit);
+    Ok(scores)
+}
+
 /// Graph fragmentation score: 0.0 = perfectly connected, 1.0 = completely fragmented.
 /// Based on fraction of node pairs that are unreachable from each other.
 pub fn fragmentation_score(brain: &Brain) -> Result<f64, rusqlite::Error> {

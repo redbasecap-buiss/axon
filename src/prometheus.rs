@@ -1943,6 +1943,13 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(near_miss_hyps);
         }
 
+        // 2g. Adamic-Adar link prediction (topology-based)
+        let aa_weight = self.get_pattern_weight("adamic_adar")?;
+        if aa_weight >= 0.05 {
+            let aa_hyps = self.generate_hypotheses_from_adamic_adar()?;
+            all_hypotheses.extend(aa_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -2066,6 +2073,9 @@ impl<'a> Prometheus<'a> {
         // Compound entity decomposition (break "Ada Lovelace Building" → named_after → "Ada Lovelace")
         let (compound_rels, compound_merged) = self.decompose_compound_entities().unwrap_or((0, 0));
 
+        // Split concatenated entity names ("Caucasus Crimea Balkans" → components)
+        let (concat_rels, concat_cleaned) = self.split_concatenated_entities().unwrap_or((0, 0));
+
         // Prefix island consolidation (merge "Euler" island → "Leonhard Euler" connected)
         let prefix_merged = self.consolidate_prefix_islands().unwrap_or(0);
 
@@ -2157,7 +2167,7 @@ impl<'a> Prometheus<'a> {
              {} name subsumptions found, {} types fixed, {} noise entities purged, \
              {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected, \
              {} fact-inferred relations, {} name cross-references, \
-             {} compound relations + {} compound merged, {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
+             {} compound relations + {} compound merged, {} concat split ({}r/{}c), {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} convergence-pass merges, \
              {} generic islands purged, {} predicates refined, {} hypotheses promoted, \
@@ -2200,6 +2210,9 @@ impl<'a> Prometheus<'a> {
             name_crossrefs,
             compound_rels,
             compound_merged,
+            concat_rels + concat_cleaned,
+            concat_rels,
+            concat_cleaned,
             prefix_merged,
             suffix_merged,
             word_merged,
@@ -4407,7 +4420,9 @@ impl<'a> Prometheus<'a> {
     /// Always merges into the entity with higher degree (more connections).
     /// Returns count of merges performed.
     pub fn merge_name_variants(&self) -> Result<usize> {
+        eprintln!("NAME_VARIANT_START: entering merge_name_variants");
         let entities = self.brain.all_entities()?;
+        eprintln!("NAME_VARIANT_START: got {} entities", entities.len());
         let relations = self.brain.all_relations()?;
 
         let mut degree: HashMap<i64, usize> = HashMap::new();
@@ -4459,6 +4474,8 @@ impl<'a> Prometheus<'a> {
             "minister",
             "saint",
             "pope",
+            "chaires",
+            "boot",
         ];
 
         // Trailing noise words that NLP extractors commonly append
@@ -4488,37 +4505,48 @@ impl<'a> Prometheus<'a> {
             "biography",
             "award",
             "day",
+            "website",
+            "frontiers",
+            "countess",
+            "working",
+            "linux",
+            "dm",
         ];
 
         let mut merged = 0usize;
         let mut absorbed: HashSet<i64> = HashSet::new();
 
         for e in &entities {
-            if e.name == "Claude Shannon Time" {
-                eprintln!(
-                    "NAME_VARIANT_DEBUG: found entity '{}' type='{}' is_noise_type={}",
-                    e.name,
-                    e.entity_type,
-                    is_noise_type(&e.entity_type)
-                );
-            }
             if absorbed.contains(&e.id) || is_noise_type(&e.entity_type) {
                 continue;
             }
             let words: Vec<&str> = e.name.split_whitespace().collect();
+            if e.name.contains("Claude Shannon") {
+                let last_w = words.last().map(|w| w.to_lowercase()).unwrap_or_default();
+                let is_trailing = trailing_noise.contains(&last_w.as_str());
+                let target = if words.len() >= 2 {
+                    name_to_info.get(&words[..words.len() - 1].join(" ").to_lowercase())
+                } else {
+                    None
+                };
+                eprintln!(
+                    "NAME_VARIANT_DEBUG: '{}' type='{}' words={} last='{}' is_trailing={} target={:?}",
+                    e.name, e.entity_type, words.len(), last_w, is_trailing, target
+                );
+            }
             if words.len() < 2 {
                 continue;
             }
             let my_deg = degree.get(&e.id).copied().unwrap_or(0);
 
-            // 1. Strip title prefix
+            // 1. Strip title prefix — always merge into canonical (untitled) form
             if words.len() >= 2 {
                 let first_lower = words[0].to_lowercase();
                 if title_prefixes.contains(&first_lower.as_str()) {
                     let suffix: String = words[1..].join(" ");
                     let lower_suffix = suffix.to_lowercase();
-                    if let Some(&(target_id, target_deg)) = name_to_info.get(&lower_suffix) {
-                        if target_id != e.id && target_deg >= my_deg {
+                    if let Some(&(target_id, _target_deg)) = name_to_info.get(&lower_suffix) {
+                        if target_id != e.id {
                             self.brain.merge_entities(e.id, target_id)?;
                             absorbed.insert(e.id);
                             merged += 1;
@@ -4528,14 +4556,14 @@ impl<'a> Prometheus<'a> {
                 }
             }
 
-            // 2. Strip trailing noise word
+            // 2. Strip trailing noise word — always merge into canonical (shorter) form
             if words.len() >= 2 {
                 let last_lower = words.last().unwrap().to_lowercase();
                 if trailing_noise.contains(&last_lower.as_str()) {
                     let prefix: String = words[..words.len() - 1].join(" ");
                     let lower_prefix = prefix.to_lowercase();
-                    if let Some(&(target_id, target_deg)) = name_to_info.get(&lower_prefix) {
-                        if target_id != e.id && target_deg >= my_deg {
+                    if let Some(&(target_id, _target_deg)) = name_to_info.get(&lower_prefix) {
+                        if target_id != e.id {
                             self.brain.merge_entities(e.id, target_id)?;
                             absorbed.insert(e.id);
                             merged += 1;
@@ -5400,6 +5428,45 @@ impl<'a> Prometheus<'a> {
 
     /// Generate hypotheses from near-miss connections (entities with multiple
     /// indirect paths but no direct edge).
+    /// Generate hypotheses from Adamic-Adar link prediction.
+    /// Uses network topology to predict the most likely missing links.
+    pub fn generate_hypotheses_from_adamic_adar(&self) -> Result<Vec<Hypothesis>> {
+        let predictions = crate::graph::adamic_adar_predict(self.brain, 30)?;
+        let mut hypotheses = Vec::new();
+        for (a_id, b_id, score) in &predictions {
+            let a_name = self.entity_name(*a_id)?;
+            let b_name = self.entity_name(*b_id)?;
+            if is_noise_name(&a_name) || is_noise_name(&b_name) {
+                continue;
+            }
+            let confidence = (0.4 + score * 0.1).min(0.85);
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.clone(),
+                predicate: "related_to".to_string(),
+                object: b_name.clone(),
+                confidence,
+                evidence_for: vec![format!(
+                    "Adamic-Adar score {:.3}: shared neighbors weighted by inverse log-degree",
+                    score
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!(
+                        "{} and {} share multiple well-connected neighbors",
+                        a_name, b_name
+                    ),
+                    format!("Adamic-Adar link prediction score: {:.3}", score),
+                    "High AA score strongly predicts missing links in real networks".to_string(),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "adamic_adar".to_string(),
+            });
+        }
+        Ok(hypotheses)
+    }
+
     pub fn generate_hypotheses_from_near_misses(&self) -> Result<Vec<Hypothesis>> {
         let near_misses = self.find_near_miss_connections(30)?;
         let mut hypotheses = Vec::new();
@@ -5532,6 +5599,84 @@ impl<'a> Prometheus<'a> {
             Ok(updated)
         })?;
         Ok(count)
+    }
+
+    /// Decompose concatenated entity names: entities like "Caucasus Crimea Balkans"
+    /// or "South-East Asia Africa" where multiple entity names got concatenated
+    /// during NLP extraction. Splits them and creates relations to component entities.
+    /// Returns count of relations created + entities cleaned up.
+    pub fn split_concatenated_entities(&self) -> Result<(usize, usize)> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Build name→id lookup for known entities (case-insensitive)
+        let mut name_to_id: HashMap<String, i64> = HashMap::new();
+        for e in &entities {
+            if !is_noise_name(&e.name) && !is_noise_type(&e.entity_type) {
+                name_to_id.entry(e.name.to_lowercase()).or_insert(e.id);
+            }
+        }
+
+        let mut rels_created = 0usize;
+        let mut entities_cleaned = 0usize;
+
+        for e in &entities {
+            if is_noise_name(&e.name) || is_noise_type(&e.entity_type) {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 3 {
+                continue;
+            }
+
+            // Try all possible splits into 2+ known entity names
+            // E.g., "Caucasus Crimea Balkans" → try "Caucasus" + "Crimea Balkans",
+            //   "Caucasus Crimea" + "Balkans", etc.
+            let mut found_components: Vec<(i64, String)> = Vec::new();
+            for split_at in 1..words.len() {
+                let left: String = words[..split_at].join(" ");
+                let right: String = words[split_at..].join(" ");
+                let left_lower = left.to_lowercase();
+                let right_lower = right.to_lowercase();
+
+                // Both parts must be known entities (different from this entity)
+                if let (Some(&lid), Some(&rid)) =
+                    (name_to_id.get(&left_lower), name_to_id.get(&right_lower))
+                {
+                    if lid != e.id && rid != e.id && lid != rid {
+                        found_components.push((lid, left));
+                        found_components.push((rid, right));
+                        break;
+                    }
+                }
+            }
+
+            if found_components.len() >= 2 {
+                // Create relations from this entity to its components
+                for (comp_id, _comp_name) in &found_components {
+                    self.brain
+                        .upsert_relation(e.id, "references", *comp_id, "")?;
+                    rels_created += 1;
+                }
+                // If this entity is an island, merge it away
+                if !connected.contains(&e.id) {
+                    let facts = self.brain.get_facts_for(e.id)?;
+                    if facts.is_empty() {
+                        self.brain.with_conn(|conn| {
+                            conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                            Ok(())
+                        })?;
+                        entities_cleaned += 1;
+                    }
+                }
+            }
+        }
+        Ok((rels_created, entities_cleaned))
     }
 }
 
@@ -6438,6 +6583,80 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         && (lower.contains("gdp") || lower.contains("population") || lower.contains("statistics"))
     {
         return Some("concept");
+    }
+
+    // Well-known misclassifications: geographic entities classified as person
+    let known_places: &[&str] = &[
+        "hong kong",
+        "new york",
+        "new zealand",
+        "sri lanka",
+        "el salvador",
+        "middle east",
+        "south america",
+        "north america",
+        "central asia",
+        "south asia",
+        "east asia",
+        "southeast asia",
+        "sub-saharan africa",
+        "saharan africa",
+        "latin america",
+        "central europe",
+        "western europe",
+        "eastern europe",
+        "northern europe",
+        "southern europe",
+    ];
+    if current_type == "person" && known_places.contains(&lower.as_ref()) {
+        return Some("place");
+    }
+
+    // Well-known concepts misclassified as person
+    let known_concepts: &[&str] = &[
+        "big bang",
+        "dark matter",
+        "dark energy",
+        "black hole",
+        "quantum mechanics",
+        "general relativity",
+        "special relativity",
+        "string theory",
+        "machine learning",
+        "artificial intelligence",
+        "deep learning",
+        "natural selection",
+        "climate change",
+        "global warming",
+        "plate tectonics",
+        "continental drift",
+        "new scientist",
+        "scientific american",
+    ];
+    if current_type == "person" && known_concepts.contains(&lower.as_ref()) {
+        return Some("concept");
+    }
+
+    // Organizations misclassified as person
+    let known_orgs: &[&str] = &["new scientist", "scientific american", "nature"];
+    if current_type == "person" && known_orgs.contains(&lower.as_ref()) {
+        return Some("organization");
+    }
+
+    // Single-word entities that are obviously not persons
+    if current_type == "person" && word_count == 1 {
+        let concept_singles = [
+            "philosophy",
+            "matrix",
+            "supersymmetries",
+            "supermembranes",
+            "microcontrollers",
+            "fundamentals",
+            "correspondents",
+        ];
+        if concept_singles.contains(&lower.as_ref()) {
+            return Some("concept");
+        }
     }
 
     None
