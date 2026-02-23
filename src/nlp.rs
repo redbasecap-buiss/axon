@@ -310,6 +310,15 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "namespace",
     "template",
     "user page",
+    "bibcode",
+    "s2cid",
+    "oclc",
+    "jstor",
+    "wayback machine",
+    "arxiv",
+    "accessed",
+    "published",
+    "original",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -1204,7 +1213,7 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
-    // Reject entities containing Wikipedia reference fragments
+    // Reject entities containing Wikipedia reference/citation fragments
     if lower.contains("archived")
         || lower.contains("isbn")
         || lower.contains(" pdf ")
@@ -1215,6 +1224,14 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         || lower.contains("issn")
         || lower.contains("pmid")
         || lower.contains("retrieved")
+        || lower.contains("bibcode")
+        || lower.contains("s2cid")
+        || lower.contains("oclc")
+        || lower.contains("jstor")
+        || lower.contains("wayback machine")
+        || lower.contains("arxiv")
+        || lower == "accessed"
+        || lower == "published"
     {
         return false;
     }
