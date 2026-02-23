@@ -1728,6 +1728,9 @@ impl<'a> Prometheus<'a> {
         // Prefix island consolidation (merge "Euler" island → "Leonhard Euler" connected)
         let prefix_merged = self.consolidate_prefix_islands().unwrap_or(0);
 
+        // Suffix-strip island merge ("Ada Lovelace WIRED" → "Ada Lovelace")
+        let suffix_merged = self.suffix_strip_island_merge().unwrap_or(0);
+
         // Word-overlap island merging (aggressive: merge "Marie Curie Avenue" → "Marie Curie")
         let word_merged = self.word_overlap_island_merge(0.6).unwrap_or(0);
 
@@ -1745,7 +1748,7 @@ impl<'a> Prometheus<'a> {
              {} name subsumptions found, {} types fixed, {} noise entities purged, \
              {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected, \
              {} fact-inferred relations, {} name cross-references, \
-             {} compound relations + {} compound merged, {} prefix-merged, {} word-overlap merged, \
+             {} compound relations + {} compound merged, {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
              k-core: k={} with {} entities in dense backbone",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -1783,6 +1786,7 @@ impl<'a> Prometheus<'a> {
             compound_rels,
             compound_merged,
             prefix_merged,
+            suffix_merged,
             word_merged,
             max_k,
             core_members.len(),
@@ -3695,6 +3699,63 @@ impl<'a> Prometheus<'a> {
         Ok(merged)
     }
 
+    /// Suffix-strip island merge: for island entities like "Ada Lovelace WIRED",
+    /// strip trailing words one at a time and check if a connected entity exists with
+    /// the shorter name. If so, merge. This handles NLP extractors that append context
+    /// words to entity names.
+    /// Returns count of merges performed.
+    pub fn suffix_strip_island_merge(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Build name→id index for connected entities (case-insensitive)
+        let mut name_to_id: HashMap<String, i64> = HashMap::new();
+        for e in &entities {
+            if connected.contains(&e.id) && !is_noise_name(&e.name) {
+                name_to_id.insert(e.name.to_lowercase(), e.id);
+            }
+        }
+
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<i64> = HashSet::new();
+
+        for e in &entities {
+            if connected.contains(&e.id) || absorbed.contains(&e.id) {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 {
+                continue;
+            }
+            // Try stripping 1, 2, (up to half) trailing words
+            let max_strip = (words.len() / 2).max(1).min(3);
+            for strip in 1..=max_strip {
+                if words.len() <= strip {
+                    break;
+                }
+                let prefix: String = words[..words.len() - strip].join(" ");
+                if prefix.len() < 3 {
+                    break;
+                }
+                let lower_prefix = prefix.to_lowercase();
+                if let Some(&target_id) = name_to_id.get(&lower_prefix) {
+                    if target_id != e.id {
+                        self.brain.merge_entities(e.id, target_id)?;
+                        absorbed.insert(e.id);
+                        merged += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(merged)
+    }
+
     /// Prune stale hypotheses: reject testing hypotheses older than `max_days`
     /// whose confidence has decayed below the rejection threshold.
     /// Returns count of hypotheses pruned.
@@ -4275,12 +4336,151 @@ fn is_likely_real_entity(name: &str, entity_type: &str) -> bool {
 
     // Single well-capitalized words that are proper nouns
     if word_count == 1 && name.starts_with(|c: char| c.is_uppercase()) && name.len() >= 4 {
-        // Likely a proper noun if it's not a common English word
-        // (imperfect heuristic, but keeps names like "Euler", "Zurich")
+        // Filter out common English words that sneak through as entities
+        // These are NOT proper nouns even when capitalized
+        if is_common_english_word(&lower) {
+            return false;
+        }
+        // Words ending in common verb/adjective suffixes are likely not proper nouns
+        if lower.ends_with("ing")
+            || lower.ends_with("tion")
+            || lower.ends_with("ment")
+            || lower.ends_with("ness")
+            || lower.ends_with("ists")
+            || lower.ends_with("isms")
+            || lower.ends_with("ally")
+            || lower.ends_with("edly")
+            || lower.ends_with("ious")
+            || lower.ends_with("eous")
+            || lower.ends_with("ible")
+            || lower.ends_with("able")
+        {
+            // But allow known proper nouns with these endings (e.g. "Beijing", "Turing")
+            let known_exceptions = [
+                "beijing",
+                "turing",
+                "reading",
+                "stirling",
+                "darjeeling",
+                "nanjing",
+                "chongqing",
+                "washington",
+                "wellington",
+                "nottingham",
+                "birmingham",
+                "buckingham",
+                "manning",
+                "browning",
+                "kipling",
+                "lessing",
+                "göttingen",
+            ];
+            if !known_exceptions.contains(&lower.as_str()) {
+                return false;
+            }
+        }
         return true;
     }
 
     false
+}
+
+/// Common English words that are NOT proper nouns even when capitalized.
+/// Used to filter island entities that are clearly generic terms.
+fn is_common_english_word(lower: &str) -> bool {
+    const COMMON_WORDS: &[&str] = &[
+        // Verbs / verb forms
+        "defeat",
+        "subtract",
+        "encode",
+        "assuming",
+        "conclude",
+        "declare",
+        "emerge",
+        "evolve",
+        "expand",
+        "explore",
+        "impose",
+        "improve",
+        "indicate",
+        "interpret",
+        "introduce",
+        "invoke",
+        "lapse",
+        "mandate",
+        "negotiate",
+        "observe",
+        "oppose",
+        "organize",
+        "overcome",
+        "persist",
+        "pledge",
+        "possess",
+        "precede",
+        "preserve",
+        "prevail",
+        "proceed",
+        "produce",
+        "propose",
+        "pursue",
+        "reckon",
+        "reform",
+        "reign",
+        "resolve",
+        "restore",
+        "retain",
+        "retrieve",
+        "settle",
+        "stimulate",
+        "succeed",
+        "suppress",
+        "sustain",
+        "transform",
+        "undermine",
+        "withdrew",
+        "yield",
+        "abolish",
+        "accomplish",
+        // Nouns (generic)
+        "beings",
+        "championships",
+        "director",
+        "formula",
+        "integers",
+        "passages",
+        "defeats",
+        "pledges",
+        "marshalls",
+        "theorists",
+        "adventists",
+        "caliphs",
+        "streifzüge",
+        "bilanz",
+        // Adjectives / adverbs
+        "postwar",
+        "naively",
+        "paleolithic",
+        "prehistoric",
+        "medieval",
+        "contemporary",
+        "predominantly",
+        "approximately",
+        "consequently",
+        "furthermore",
+        "nevertheless",
+        "subsequently",
+        "alternatively",
+        // German/French noise
+        "jahren",
+        "während",
+        "zwischen",
+        "bereits",
+        "allerdings",
+        "bibliothèque",
+        "musique",
+        "conseil",
+    ];
+    COMMON_WORDS.contains(&lower)
 }
 
 fn now_str() -> String {
