@@ -373,6 +373,9 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "sort",
     "browse",
     "explore",
+    "researchers",
+    "researchgate",
+    "mathpages",
     // French Wikipedia UI
     "accueil",
     "afficher",
@@ -593,6 +596,10 @@ const CONCEPT_INDICATORS: &[&str] = &[
     "palace",
     "castle",
     "tower",
+    "hall",
+    "manor",
+    "abbey",
+    "priory",
     "monument",
     "memorial",
     "museum",
@@ -2749,6 +2756,15 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
 
     // Reject single-word concepts under 4 chars (too ambiguous to be useful)
     if etype == "concept" && !lower.contains(' ') && trimmed.len() < 4 {
+        return false;
+    }
+
+    // Reject journal/encyclopedia citation fragments
+    if lower.contains("journal of")
+        || lower.contains("researchgate")
+        || lower.contains("encyclopedia")
+        || lower.contains("mathpages")
+    {
         return false;
     }
 
