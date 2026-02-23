@@ -98,6 +98,42 @@ const NOISE_NAMES: &[&str] = &[
     "recently",
     "today",
     "later",
+    "isbn",
+    "doi",
+    "vol",
+    "chapter",
+    "section",
+    "figure",
+    "table",
+    "appendix",
+    "note",
+    "notes",
+    "references",
+    "bibliography",
+    "list",
+    "index",
+    "contents",
+    "abstract",
+    "introduction",
+    "conclusion",
+    "discussion",
+    "results",
+    "methods",
+    "analysis",
+    "review",
+    "surveys",
+    "commentary",
+    "proceedings",
+    "during",
+    "resting",
+    "within",
+    "between",
+    "through",
+    "about",
+    "above",
+    "below",
+    "after",
+    "before",
     "early",
     "modern",
     "several",
@@ -230,8 +266,38 @@ fn is_noise_name(name: &str) -> bool {
         "prize",
         "meanwhile",
         "buried",
+        "research",
+        "finally",
+        "published",
+        "development",
+        "example",
+        "general",
+        "original",
+        "national",
+        "international",
+        "government",
+        "society",
+        "university",
+        "institute",
+        "foundation",
+        "academy",
+        "department",
     ];
     if word_count == 1 && generic_caps.contains(&lower_trimmed.as_ref()) {
+        return true;
+    }
+    // Names that are mostly numbers with some text (e.g. "1997 1", "Vol 23")
+    let digit_count = lower_trimmed.chars().filter(|c| c.is_ascii_digit()).count();
+    if digit_count > 0 && digit_count as f64 / lower_trimmed.len().max(1) as f64 > 0.4 {
+        return true;
+    }
+    // Names starting with "Sir" followed by a single letter (e.g. "Sir I")
+    if lower_trimmed.starts_with("sir ") && word_count <= 2 {
+        return true;
+    }
+    // Names that are just titles/honorifics
+    let title_only = ["sir", "mr", "mrs", "ms", "dr", "prof", "lord", "lady"];
+    if word_count == 1 && title_only.contains(&lower_trimmed.as_ref()) {
         return true;
     }
     false
@@ -1484,8 +1550,16 @@ impl<'a> Prometheus<'a> {
 
         let gaps_detected = all_hypotheses.len() + islands.len();
 
-        // 4. Deduplicate hypotheses against existing DB, then score and validate
+        // 4. Deduplicate hypotheses against existing DB, filter noise, then score and validate
         all_hypotheses.retain(|h| {
+            // Skip hypotheses involving noise entities
+            if is_noise_name(&h.subject) || (h.object != "?" && is_noise_name(&h.object)) {
+                return false;
+            }
+            // Skip hypotheses with very long entity names (likely sentence fragments)
+            if h.subject.len() > 60 || h.object.len() > 60 {
+                return false;
+            }
             !self
                 .hypothesis_exists(&h.subject, &h.predicate, &h.object)
                 .unwrap_or(true)
@@ -2424,8 +2498,11 @@ impl<'a> Prometheus<'a> {
         let mut purged = 0usize;
         for e in &entities {
             let deg = degree.get(&e.id).copied().unwrap_or(0);
-            // Only purge isolated or near-isolated noise
-            if deg <= 1 && (is_noise_name(&e.name) || is_noise_type(&e.entity_type)) {
+            // Purge isolated or near-isolated noise; also purge zero-degree entities
+            // with very low confidence
+            let is_noise = is_noise_name(&e.name) || is_noise_type(&e.entity_type);
+            let is_low_value = deg == 0 && e.confidence < 0.3 && e.name.len() < 4;
+            if (deg <= 1 && is_noise) || is_low_value {
                 self.brain.with_conn(|conn| {
                     conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
                     conn.execute(
@@ -2472,10 +2549,22 @@ impl<'a> Prometheus<'a> {
                 ("is", "place", "concept") => Some("classified_as"),
                 ("is", "concept", "concept") => Some("subclass_of"),
                 ("is", _, "place") => Some("located_in"),
+                ("is", "technology", "concept") => Some("classified_as"),
+                ("is", "product", "concept") => Some("classified_as"),
                 ("has", "person", "concept") => Some("possesses"),
                 ("has", "organization", "concept") => Some("features"),
+                ("has", "technology", "concept") => Some("features"),
+                ("has", "place", "concept") => Some("features"),
                 ("was", "person", "concept") => Some("formerly"),
                 ("was", "person", "organization") => Some("formerly_at"),
+                ("was", "organization", "concept") => Some("formerly"),
+                ("are", "concept", "concept") => Some("subclass_of"),
+                ("are", _, "concept") => Some("classified_as"),
+                ("were", "person", "organization") => Some("formerly_at"),
+                ("were", _, "concept") => Some("formerly"),
+                ("had", "person", "concept") => Some("formerly_possessed"),
+                ("had", "organization", "concept") => Some("formerly_had"),
+                ("do", _, _) | ("does", _, _) | ("did", _, _) => Some("performs"),
                 _ => None,
             };
 
@@ -2535,8 +2624,135 @@ impl<'a> Prometheus<'a> {
                     continue;
                 }
             }
+            // Containment match: if island name is a prefix of a connected entity's name
+            // and they share the same type, merge (e.g. "Ada" → "Ada Lovelace" when both are person)
+            if e.name.len() >= 4 && !e.entity_type.is_empty() && e.entity_type != "unknown" {
+                let mut best_match: Option<(i64, usize)> = None;
+                for (cname, &cid) in &name_to_connected {
+                    if cname.starts_with(&lower) && cname.len() > lower.len() + 1 {
+                        // Check same type
+                        if let Some(ce) = self.brain.get_entity_by_id(cid)? {
+                            if ce.entity_type == e.entity_type {
+                                let score = lower.len();
+                                if best_match.is_none() || score > best_match.unwrap().1 {
+                                    best_match = Some((cid, score));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((hub_id, _)) = best_match {
+                    self.brain.merge_entities(e.id, hub_id)?;
+                    reconnected += 1;
+                }
+            }
         }
         Ok(reconnected)
+    }
+
+    /// Compute entity importance scores combining PageRank, degree, and type value.
+    /// Returns top entities sorted by composite score.
+    pub fn entity_importance(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, f64, usize, f64)>> {
+        let pr = crate::graph::pagerank(self.brain, 0.85, 20)?;
+        let relations = self.brain.all_relations()?;
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        let entities = self.brain.all_entities()?;
+        let mut scores: Vec<(String, String, f64, usize, f64)> = Vec::new();
+
+        for e in &entities {
+            if is_noise_type(&e.entity_type) || is_noise_name(&e.name) {
+                continue;
+            }
+            let rank = pr.get(&e.id).copied().unwrap_or(0.0);
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            let type_boost = if HIGH_VALUE_TYPES.contains(&e.entity_type.as_str()) {
+                1.5
+            } else {
+                1.0
+            };
+            let composite = (rank * 10000.0 + deg as f64) * type_boost;
+            if composite > 0.0 {
+                scores.push((e.name.clone(), e.entity_type.clone(), rank, deg, composite));
+            }
+        }
+
+        scores.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+        scores.truncate(limit);
+        Ok(scores)
+    }
+
+    /// Find entity type distribution anomalies — types that are over/under-represented
+    /// relative to their connectivity, suggesting systematic extraction bias.
+    pub fn type_distribution_analysis(&self) -> Result<Vec<(String, usize, f64, String)>> {
+        let entities = self.brain.all_entities()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let relations = self.brain.all_relations()?;
+
+        let mut type_counts: HashMap<String, usize> = HashMap::new();
+        let mut type_connected: HashMap<String, usize> = HashMap::new();
+        let mut connected_ids: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected_ids.insert(r.subject_id);
+            connected_ids.insert(r.object_id);
+        }
+
+        for e in &entities {
+            if meaningful.contains(&e.id) {
+                *type_counts.entry(e.entity_type.clone()).or_insert(0) += 1;
+                if connected_ids.contains(&e.id) {
+                    *type_connected.entry(e.entity_type.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut analysis = Vec::new();
+        for (etype, count) in &type_counts {
+            if *count < 5 {
+                continue;
+            }
+            let connected = type_connected.get(etype).copied().unwrap_or(0);
+            let connectivity = connected as f64 / *count as f64;
+            let assessment = if connectivity < 0.05 {
+                format!(
+                    "EXTRACTION NOISE: {}/{} connected ({:.0}%) — likely over-extracted",
+                    connected,
+                    count,
+                    connectivity * 100.0
+                )
+            } else if connectivity < 0.2 {
+                format!(
+                    "SPARSE: {}/{} connected ({:.0}%) — needs enrichment",
+                    connected,
+                    count,
+                    connectivity * 100.0
+                )
+            } else if connectivity > 0.8 {
+                format!(
+                    "HEALTHY: {}/{} connected ({:.0}%)",
+                    connected,
+                    count,
+                    connectivity * 100.0
+                )
+            } else {
+                format!(
+                    "MODERATE: {}/{} connected ({:.0}%)",
+                    connected,
+                    count,
+                    connectivity * 100.0
+                )
+            };
+            analysis.push((etype.clone(), *count, connectivity, assessment));
+        }
+        analysis.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(analysis)
     }
 
     pub fn report_markdown(&self, report: &DiscoveryReport) -> String {
