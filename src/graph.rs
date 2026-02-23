@@ -901,6 +901,25 @@ pub fn estimated_diameter(
     Ok((max_dist, avg, sources.len()))
 }
 
+/// Edge reciprocity: fraction of directed edges that have a reverse edge.
+/// High reciprocity suggests symmetric relationships (knows, related_to).
+/// Low reciprocity suggests hierarchical relationships (part_of, located_in).
+pub fn edge_reciprocity(brain: &Brain) -> Result<f64, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let mut directed: HashSet<(i64, i64)> = HashSet::new();
+    for r in &relations {
+        directed.insert((r.subject_id, r.object_id));
+    }
+    if directed.is_empty() {
+        return Ok(0.0);
+    }
+    let reciprocal = directed
+        .iter()
+        .filter(|(s, o)| directed.contains(&(*o, *s)))
+        .count();
+    Ok(reciprocal as f64 / directed.len() as f64)
+}
+
 /// Graph density: ratio of actual edges to possible edges.
 pub fn graph_density(brain: &Brain) -> Result<f64, rusqlite::Error> {
     let n = brain.all_entities()?.len() as f64;

@@ -343,6 +343,10 @@ fn is_noise_name(name: &str) -> bool {
     if lower_trimmed.contains("journal") {
         return true;
     }
+    // Names containing academic publication patterns
+    if lower_trimmed.contains("monthly notices") || lower_trimmed.contains("physical review") {
+        return true;
+    }
     // Roman numeral suffixes without real content (e.g. "Michael V", "Morgan I")
     let roman_numerals = [
         "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "xi", "xii",
@@ -2074,6 +2078,29 @@ impl<'a> Prometheus<'a> {
         // Fragment island purging (remove single-word fragments like "Lovelace", "Hopper")
         let fragment_purged = self.purge_fragment_islands().unwrap_or(0);
 
+        // Prefix-strip island merge ("Christy Grace Hopper" → "Grace Hopper" by stripping leading words)
+        let prefix_strip_merged = self.prefix_strip_island_merge().unwrap_or(0);
+
+        // Auto-consolidation: merge high-scoring entity pairs from consolidation analysis
+        let auto_consolidated = self.auto_consolidate_entities(0.65).unwrap_or(0);
+
+        // Multi-pass convergence: repeat merge strategies until no more progress
+        let mut convergence_merges = 0usize;
+        for _pass in 0..3 {
+            let mut pass_merges = 0usize;
+            pass_merges += self.dedup_exact_name_matches().unwrap_or(0);
+            pass_merges += self.suffix_strip_island_merge().unwrap_or(0);
+            pass_merges += self.consolidate_prefix_islands().unwrap_or(0);
+            pass_merges += self.word_overlap_island_merge(0.6).unwrap_or(0);
+            pass_merges += self.reverse_containment_island_merge().unwrap_or(0);
+            pass_merges += self.purge_fragment_islands().unwrap_or(0);
+            pass_merges += self.prefix_strip_island_merge().unwrap_or(0);
+            if pass_merges == 0 {
+                break;
+            }
+            convergence_merges += pass_merges;
+        }
+
         // Hypothesis pair deduplication (prevent bloat from multiple runs)
         let pair_deduped = self.dedup_hypotheses_by_pair().unwrap_or(0);
 
@@ -2117,7 +2144,9 @@ impl<'a> Prometheus<'a> {
              {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected, \
              {} fact-inferred relations, {} name cross-references, \
              {} compound relations + {} compound merged, {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
-             {} fragment-purged, {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
+             {} fragment-purged, {} prefix-strip merged, {} auto-consolidated, \
+             {} convergence-pass merges, \
+             {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -2160,6 +2189,9 @@ impl<'a> Prometheus<'a> {
             suffix_merged,
             word_merged,
             fragment_purged,
+            prefix_strip_merged,
+            auto_consolidated,
+            convergence_merges,
             pair_deduped,
             max_k,
             core_members.len(),
@@ -4212,6 +4244,140 @@ impl<'a> Prometheus<'a> {
         Ok(merged)
     }
 
+    /// Prefix-strip merge: for entities like "Christy Grace Hopper" or "Admiral Grace Hopper",
+    /// strip leading words one at a time and check if a shorter-named entity exists.
+    /// If so, merge the longer name into the shorter one. Works on both islands and
+    /// connected entities (merges redundant variants into the canonical shorter form).
+    /// Also strips trailing words as a second pass.
+    /// Returns count of merges performed.
+    pub fn prefix_strip_island_merge(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        // Build degree map for deciding which entity to keep
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Build name→(id, degree) index (case-insensitive)
+        let mut name_to_info: HashMap<String, (i64, usize)> = HashMap::new();
+        for e in &entities {
+            if !is_noise_name(&e.name) && !is_noise_type(&e.entity_type) {
+                let deg = degree.get(&e.id).copied().unwrap_or(0);
+                let lower = e.name.to_lowercase();
+                // Keep the entry with the highest degree
+                let existing_deg = name_to_info.get(&lower).map(|(_, d)| *d).unwrap_or(0);
+                if deg > existing_deg || !name_to_info.contains_key(&lower) {
+                    name_to_info.insert(lower, (e.id, deg));
+                }
+            }
+        }
+
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<i64> = HashSet::new();
+
+        eprintln!(
+            "PREFIX_STRIP_DEBUG: entities count={}, name_to_info count={}",
+            entities.len(),
+            name_to_info.len()
+        );
+        let mut _checked = 0usize;
+
+        for e in &entities {
+            if absorbed.contains(&e.id) || is_noise_name(&e.name) || is_noise_type(&e.entity_type) {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 3 {
+                continue;
+            }
+            _checked += 1;
+
+            let my_deg = degree.get(&e.id).copied().unwrap_or(0);
+
+            // Try stripping 1-2 leading words
+            let max_strip = (words.len() / 2).max(1).min(2);
+            let mut found = false;
+            for strip in 1..=max_strip {
+                if words.len() <= strip + 1 {
+                    break; // result must be at least 2 words
+                }
+                let suffix: String = words[strip..].join(" ");
+                let lower_suffix = suffix.to_lowercase();
+                if let Some(&(target_id, target_deg)) = name_to_info.get(&lower_suffix) {
+                    if target_id != e.id && target_deg >= my_deg {
+                        // Only merge if target has more/equal connections (is more canonical)
+                        self.brain.merge_entities(e.id, target_id)?;
+                        absorbed.insert(e.id);
+                        merged += 1;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if found {
+                continue;
+            }
+
+            // Also try stripping 1-2 trailing words (for patterns like "Blaise Pascal Chairs")
+            for strip in 1..=max_strip {
+                if words.len() <= strip + 1 {
+                    break;
+                }
+                let prefix: String = words[..words.len() - strip].join(" ");
+                let lower_prefix = prefix.to_lowercase();
+                if let Some(&(target_id, target_deg)) = name_to_info.get(&lower_prefix) {
+                    if target_id != e.id && target_deg >= my_deg {
+                        self.brain.merge_entities(e.id, target_id)?;
+                        absorbed.insert(e.id);
+                        merged += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "PREFIX_STRIP_DEBUG: checked={}, merged={}",
+            _checked, merged
+        );
+        Ok(merged)
+    }
+
+    /// Auto-consolidation: use entity_consolidation_candidates to find and merge
+    /// entity pairs with high consolidation scores. Only merges pairs above
+    /// `min_score` threshold to avoid false positives.
+    /// Returns count of merges performed.
+    pub fn auto_consolidate_entities(&self, min_score: f64) -> Result<usize> {
+        let candidates = self.entity_consolidation_candidates(100)?;
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<String> = HashSet::new();
+
+        for (name_a, name_b, score, _reason) in &candidates {
+            if *score < min_score {
+                continue;
+            }
+            if absorbed.contains(name_a) || absorbed.contains(name_b) {
+                continue;
+            }
+            let entity_a = self.brain.get_entity_by_name(name_a)?;
+            let entity_b = self.brain.get_entity_by_name(name_b)?;
+            if let (Some(a), Some(b)) = (entity_a, entity_b) {
+                // Keep the shorter name (usually the canonical form)
+                let (keep, remove) = if a.name.len() <= b.name.len() {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                self.brain.merge_entities(remove.id, keep.id)?;
+                absorbed.insert(remove.name.clone());
+                merged += 1;
+            }
+        }
+        Ok(merged)
+    }
+
     /// Prune stale hypotheses: reject testing hypotheses older than `max_days`
     /// whose confidence has decayed below the rejection threshold.
     /// Returns count of hypotheses pruned.
@@ -5262,6 +5428,114 @@ fn is_extraction_noise(name: &str, entity_type: &str) -> bool {
     // Entity name == entity type (e.g. entity "Actor" of type "concept")
     if lower == entity_type {
         return true;
+    }
+
+    // Non-English words that commonly appear as extracted entity fragments
+    // (French, German academic/citation text)
+    let non_english_noise = [
+        "accompagnées",
+        "pensées",
+        "chaires",
+        "mémoires",
+        "études",
+        "régime",
+        "même",
+        "après",
+        "année",
+        "années",
+        "siècle",
+        "über",
+        "und",
+        "eine",
+        "eines",
+        "junge",
+        "neue",
+        "neuen",
+        "des",
+        "der",
+        "die",
+        "das",
+        "dem",
+        "den",
+        "für",
+        "avec",
+        "dans",
+        "pour",
+        "les",
+        "aux",
+        "sur",
+        "une",
+        "della",
+        "degli",
+        "delle",
+        "nelle",
+        "nella",
+        "dello",
+    ];
+    if word_count >= 2 {
+        let words: Vec<&str> = lower.split_whitespace().collect();
+        let foreign_count = words
+            .iter()
+            .filter(|w| non_english_noise.contains(w))
+            .count();
+        // If >30% of words are non-English noise, it's a citation fragment
+        if foreign_count >= 1 && foreign_count as f64 / word_count as f64 > 0.3 {
+            return true;
+        }
+    }
+
+    // Academic journal abbreviation patterns: entities containing "Monthly Notices",
+    // "Astrophysical Journal", "Physical Review", etc.
+    let journal_patterns = [
+        "monthly notices",
+        "physical review",
+        "astrophysical",
+        "letters to",
+        "annals of",
+        "proceedings of",
+        "transactions of",
+        "reviews of",
+        "reports on",
+        "advances in",
+        "frontiers in",
+        "studies in",
+    ];
+    if word_count >= 2 && journal_patterns.iter().any(|jp| lower.contains(jp)) {
+        return true;
+    }
+
+    // Entities where known entity name is prefixed/suffixed with random context words
+    // Pattern: "SomeContext KnownEntity MoreContext" where the middle is what matters
+    // Detect by checking for ALL-CAPS abbreviations mixed with regular words
+    if word_count >= 3 {
+        let words: Vec<&str> = name.split_whitespace().collect();
+        let has_acronym = words.iter().any(|w| {
+            w.len() >= 3
+                && w.len() <= 8
+                && w.chars().all(|c| c.is_uppercase() || c.is_ascii_digit())
+        });
+        let has_normal = words.iter().any(|w| {
+            w.len() >= 3
+                && w.starts_with(|c: char| c.is_uppercase())
+                && w.chars().skip(1).any(|c| c.is_lowercase())
+        });
+        // "CFHTLenS Monthly Notices" pattern: acronym + generic words
+        if has_acronym && has_normal && word_count <= 4 {
+            let generic_trail: HashSet<&str> = [
+                "monthly", "notices", "letters", "review", "reports", "papers", "notes", "studies",
+                "focus", "dead", "mass",
+            ]
+            .iter()
+            .copied()
+            .collect();
+            let generic_count = words
+                .iter()
+                .filter(|w| generic_trail.contains(&w.to_lowercase().as_str()))
+                .count();
+            if generic_count >= 1 {
+                return true;
+            }
+        }
     }
 
     // Mixed-script names (Latin + Cyrillic/Arabic/CJK) — usually translation artifacts
