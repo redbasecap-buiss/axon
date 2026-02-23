@@ -702,8 +702,15 @@ pub fn louvain_communities(brain: &Brain) -> Result<HashMap<i64, usize>, rusqlit
         k.insert(node, neighbors.values().sum());
     }
 
-    // Iterative modularity optimization
+    // Iterative modularity optimization with incremental sigma_tot
     let m2 = total_weight; // 2m
+
+    // Maintain sigma_tot incrementally instead of recomputing O(n) per node
+    let mut sigma_tot: HashMap<usize, f64> = HashMap::new();
+    for (&n, &c) in &community {
+        *sigma_tot.entry(c).or_insert(0.0) += k.get(&n).copied().unwrap_or(0.0);
+    }
+
     for _ in 0..20 {
         let mut moved = false;
         for &node in &nodes {
@@ -717,12 +724,6 @@ pub fn louvain_communities(brain: &Brain) -> Result<HashMap<i64, usize>, rusqlit
                     let c = community[&nb];
                     *comm_weights.entry(c).or_insert(0.0) += w;
                 }
-            }
-
-            // Sum of k for each community
-            let mut sigma_tot: HashMap<usize, f64> = HashMap::new();
-            for (&n, &c) in &community {
-                *sigma_tot.entry(c).or_insert(0.0) += k.get(&n).copied().unwrap_or(0.0);
             }
 
             // Find best community
@@ -748,6 +749,9 @@ pub fn louvain_communities(brain: &Brain) -> Result<HashMap<i64, usize>, rusqlit
             }
 
             if best_comm != node_comm {
+                // Update sigma_tot incrementally
+                *sigma_tot.entry(node_comm).or_insert(0.0) -= ki;
+                *sigma_tot.entry(best_comm).or_insert(0.0) += ki;
                 community.insert(node, best_comm);
                 moved = true;
             }

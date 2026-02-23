@@ -1057,6 +1057,10 @@ impl<'a> Prometheus<'a> {
         // Find pairs sharing ≥2 sources but not directly connected
         let mut pair_sources: HashMap<(i64, i64), usize> = HashMap::new();
         for entities in source_entities.values() {
+            // Skip sources with too many entities (O(n²) pairs)
+            if entities.len() > 50 {
+                continue;
+            }
             let ids: Vec<i64> = entities.iter().copied().collect();
             for i in 0..ids.len() {
                 for j in (i + 1)..ids.len() {
@@ -1074,7 +1078,7 @@ impl<'a> Prometheus<'a> {
 
         let mut patterns = Vec::new();
         for ((a, b), count) in &pair_sources {
-            if *count >= 1 {
+            if *count >= 2 {
                 let a_name = self.entity_name(*a)?;
                 let b_name = self.entity_name(*b)?;
                 patterns.push(Pattern {
@@ -1665,6 +1669,9 @@ impl<'a> Prometheus<'a> {
                                     name, etype, pred, count, eids.len()
                                 ),
                             });
+                            if patterns.len() >= 200 {
+                                return Ok(patterns);
+                            }
                         }
                     }
                 }
@@ -1761,7 +1768,13 @@ impl<'a> Prometheus<'a> {
             }
         }
         let mut analogies = Vec::new();
-        let pairs: Vec<((i64, i64), HashSet<String>)> = pair_preds.into_iter().collect();
+        let mut pairs: Vec<((i64, i64), HashSet<String>)> = pair_preds
+            .into_iter()
+            .filter(|(_, preds)| preds.len() >= 2)
+            .collect();
+        // Sort by predicate count descending and cap to avoid O(n²) blowup
+        pairs.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        pairs.truncate(500);
         for i in 0..pairs.len() {
             for j in (i + 1)..pairs.len() {
                 let ((a, b), preds_ab) = &pairs[i];
@@ -2494,28 +2507,81 @@ impl<'a> Prometheus<'a> {
         let co_threshold = if meaningful_rels < 50 { 1 } else { 2 };
         let subgraph_threshold = if meaningful_rels < 100 { 1 } else { 2 };
 
+        eprintln!(
+            "[PROMETHEUS] Starting pattern discovery ({} meaningful rels)",
+            meaningful_rels
+        );
+        let t0 = std::time::Instant::now();
+
         let co_occ = self.find_co_occurrences(co_threshold)?;
+        eprintln!(
+            "[PROMETHEUS] co_occurrences: {} in {:?}",
+            co_occ.len(),
+            t0.elapsed()
+        );
         all_patterns.extend(co_occ);
 
+        let t1 = std::time::Instant::now();
         let source_co = self.find_source_co_occurrences()?;
+        eprintln!(
+            "[PROMETHEUS] source_co: {} in {:?}",
+            source_co.len(),
+            t1.elapsed()
+        );
         all_patterns.extend(source_co);
 
+        let t1 = std::time::Instant::now();
         let clusters = self.find_entity_clusters()?;
+        eprintln!(
+            "[PROMETHEUS] clusters: {} in {:?}",
+            clusters.len(),
+            t1.elapsed()
+        );
         all_patterns.extend(clusters);
 
+        let t1 = std::time::Instant::now();
         let subgraphs = self.find_frequent_subgraphs(subgraph_threshold)?;
+        eprintln!(
+            "[PROMETHEUS] subgraphs: {} in {:?}",
+            subgraphs.len(),
+            t1.elapsed()
+        );
         all_patterns.extend(subgraphs);
 
+        let t1 = std::time::Instant::now();
         let temporal = self.find_temporal_patterns(2)?;
+        eprintln!(
+            "[PROMETHEUS] temporal: {} in {:?}",
+            temporal.len(),
+            t1.elapsed()
+        );
         all_patterns.extend(temporal);
 
+        let t1 = std::time::Instant::now();
         let anomalies = self.find_anomalies()?;
+        eprintln!(
+            "[PROMETHEUS] anomalies: {} in {:?}",
+            anomalies.len(),
+            t1.elapsed()
+        );
         all_patterns.extend(anomalies);
 
+        let t1 = std::time::Instant::now();
         let pmi_patterns = self.find_pmi_co_occurrences(1.0)?;
+        eprintln!(
+            "[PROMETHEUS] pmi: {} in {:?}",
+            pmi_patterns.len(),
+            t1.elapsed()
+        );
         all_patterns.extend(pmi_patterns);
 
+        let t1 = std::time::Instant::now();
         let chains = self.find_predicate_chains(2)?;
+        eprintln!(
+            "[PROMETHEUS] chains: {} in {:?}",
+            chains.len(),
+            t1.elapsed()
+        );
         all_patterns.extend(chains);
 
         // Deduplicate and save patterns
@@ -2525,27 +2591,51 @@ impl<'a> Prometheus<'a> {
         }
 
         // 2. Gap detection & hypothesis generation (adaptive: skip low-weight strategies)
+        eprintln!("[PROMETHEUS] Starting hypothesis generation...");
+        let t1 = std::time::Instant::now();
         let hole_weight = self.get_pattern_weight("structural_hole")?;
         if hole_weight >= 0.05 {
             let hole_hyps = self.generate_hypotheses_from_holes()?;
+            eprintln!(
+                "[PROMETHEUS] holes: {} in {:?}",
+                hole_hyps.len(),
+                t1.elapsed()
+            );
             all_hypotheses.extend(hole_hyps);
         }
 
+        let t1 = std::time::Instant::now();
         let gap_hyps = self.generate_hypotheses_from_type_gaps()?;
+        eprintln!(
+            "[PROMETHEUS] type_gaps: {} in {:?}",
+            gap_hyps.len(),
+            t1.elapsed()
+        );
         all_hypotheses.extend(gap_hyps);
 
+        let t1 = std::time::Instant::now();
         let shared_weight = self.get_pattern_weight("shared_object")?;
         if shared_weight >= 0.10 {
             let shared_hyps = self.generate_hypotheses_from_shared_objects()?;
+            eprintln!(
+                "[PROMETHEUS] shared_objects: {} in {:?}",
+                shared_hyps.len(),
+                t1.elapsed()
+            );
             all_hypotheses.extend(shared_hyps);
         }
 
+        let t1 = std::time::Instant::now();
         let source_weight = self.get_pattern_weight("source_co_occurrence")?;
         if source_weight >= 0.05 {
             let source_hyps = self.generate_hypotheses_from_source_co_occurrence()?;
+            eprintln!(
+                "[PROMETHEUS] source_co_occ: {} in {:?}",
+                source_hyps.len(),
+                t1.elapsed()
+            );
             all_hypotheses.extend(source_hyps);
         } else {
-            // Strategy has proven unreliable — skip but note it
             all_patterns.push(Pattern {
                 id: 0,
                 pattern_type: PatternType::CoOccurrence,
@@ -2560,52 +2650,100 @@ impl<'a> Prometheus<'a> {
         }
 
         // 2b. Analogy-based hypotheses
+        let t1 = std::time::Instant::now();
         let analogy_hyps = self.generate_hypotheses_from_analogies()?;
+        eprintln!(
+            "[PROMETHEUS] analogies: {} in {:?}",
+            analogy_hyps.len(),
+            t1.elapsed()
+        );
         all_hypotheses.extend(analogy_hyps);
 
-        // 2c. Hub-spoke hypotheses: hubs should connect to nearby same-type entities
+        // 2c. Hub-spoke hypotheses
+        let t1 = std::time::Instant::now();
         let hub_weight = self.get_pattern_weight("hub_spoke")?;
         if hub_weight >= 0.10 {
             let hub_hyps = self.generate_hypotheses_from_hubs()?;
+            eprintln!(
+                "[PROMETHEUS] hubs: {} in {:?}",
+                hub_hyps.len(),
+                t1.elapsed()
+            );
             all_hypotheses.extend(hub_hyps);
         }
 
         // 2d. Community bridge hypotheses
+        let t1 = std::time::Instant::now();
         let bridge_hyps = self.generate_hypotheses_from_community_bridges()?;
+        eprintln!(
+            "[PROMETHEUS] community_bridges: {} in {:?}",
+            bridge_hyps.len(),
+            t1.elapsed()
+        );
         all_hypotheses.extend(bridge_hyps);
 
         // 2e. Predicate chain hypotheses
+        let t1 = std::time::Instant::now();
         let chain_weight = self.get_pattern_weight("predicate_chain")?;
         if chain_weight >= 0.05 {
             let chain_hyps = self.generate_hypotheses_from_chains()?;
+            eprintln!(
+                "[PROMETHEUS] pred_chains: {} in {:?}",
+                chain_hyps.len(),
+                t1.elapsed()
+            );
             all_hypotheses.extend(chain_hyps);
         }
 
-        // 2f. Near-miss connection hypotheses (entities with many indirect paths but no direct edge)
+        // 2f. Near-miss connection hypotheses
+        let t1 = std::time::Instant::now();
         let near_miss_weight = self.get_pattern_weight("near_miss")?;
         if near_miss_weight >= 0.05 {
             let near_miss_hyps = self.generate_hypotheses_from_near_misses()?;
+            eprintln!(
+                "[PROMETHEUS] near_miss: {} in {:?}",
+                near_miss_hyps.len(),
+                t1.elapsed()
+            );
             all_hypotheses.extend(near_miss_hyps);
         }
 
-        // 2g. Adamic-Adar link prediction (topology-based)
+        // 2g. Adamic-Adar link prediction
+        let t1 = std::time::Instant::now();
         let aa_weight = self.get_pattern_weight("adamic_adar")?;
         if aa_weight >= 0.05 {
             let aa_hyps = self.generate_hypotheses_from_adamic_adar()?;
+            eprintln!(
+                "[PROMETHEUS] adamic_adar: {} in {:?}",
+                aa_hyps.len(),
+                t1.elapsed()
+            );
             all_hypotheses.extend(aa_hyps);
         }
 
-        // 2h. Resource Allocation link prediction (better for sparse graphs)
+        // 2h. Resource Allocation link prediction
+        let t1 = std::time::Instant::now();
         let ra_weight = self.get_pattern_weight("resource_allocation")?;
         if ra_weight >= 0.05 {
             let ra_hyps = self.generate_hypotheses_from_resource_allocation()?;
+            eprintln!(
+                "[PROMETHEUS] resource_alloc: {} in {:?}",
+                ra_hyps.len(),
+                t1.elapsed()
+            );
             all_hypotheses.extend(ra_hyps);
         }
 
-        // 2i. Type-aware link prediction (boosts same-type entity pairs)
+        // 2i. Type-aware link prediction
+        let t1 = std::time::Instant::now();
         let ta_weight = self.get_pattern_weight("type_affinity")?;
         if ta_weight >= 0.05 {
             let ta_hyps = self.generate_hypotheses_from_type_affinity()?;
+            eprintln!(
+                "[PROMETHEUS] type_affinity: {} in {:?}",
+                ta_hyps.len(),
+                t1.elapsed()
+            );
             all_hypotheses.extend(ta_hyps);
         }
 
