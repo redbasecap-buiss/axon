@@ -2316,6 +2316,20 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             "medieval",
             "commemorations",
             "business",
+            "using",
+            "according",
+            "including",
+            "following",
+            "based",
+            "known",
+            "called",
+            "named",
+            "related",
+            "located",
+            "described",
+            "considered",
+            "established",
+            "published",
         ];
         if lower.contains(' ') && leading_verbs.contains(&first_word) {
             return false;

@@ -101,6 +101,7 @@ const NOISE_NAMES: &[&str] = &[
     "pdf",
     "time",
     "see",
+    "examples",
     "new",
     "used",
     "using",
@@ -2693,6 +2694,7 @@ impl<'a> Prometheus<'a> {
             pass_merges += self.merge_high_confidence_prefix_variants().unwrap_or(0);
             pass_merges += self.dissolve_name_fragment_hubs().unwrap_or(0);
             pass_merges += self.strip_leading_adjectives().unwrap_or(0);
+            pass_merges += self.merge_reversed_names().unwrap_or(0);
             if pass_merges == 0 {
                 break;
             }
@@ -2725,6 +2727,12 @@ impl<'a> Prometheus<'a> {
 
         // Merge prefix-noise entities (e.g., "Devastated Tim Berners-Lee" → "Tim Berners-Lee")
         let prefix_noise_merged = self.merge_prefix_noise_entities().unwrap_or(0);
+
+        // Merge reversed names ("Neumann John" → "John von Neumann")
+        let reversed_names_merged = self.merge_reversed_names().unwrap_or(0);
+
+        // Purge NLP concatenation noise ("Examples Yang", "Neumann John Examples")
+        let concat_noise_purged = self.purge_concatenation_noise().unwrap_or(0);
 
         // Token-based island reconnection (TF-IDF shared token matching)
         let token_reconnected = self.reconnect_islands_by_tokens().unwrap_or(0);
@@ -2789,7 +2797,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
@@ -2853,6 +2861,8 @@ impl<'a> Prometheus<'a> {
             mistyped_person_purged,
             country_concat_fixed,
             prefix_noise_merged,
+            reversed_names_merged,
+            concat_noise_purged,
             token_reconnected,
             name_containment_reconnected,
             single_word_reconnected,
@@ -5969,6 +5979,220 @@ impl<'a> Prometheus<'a> {
             }
         }
         Ok(merged)
+    }
+
+    /// Merge reversed name entities: "Neumann John" → "John von Neumann" etc.
+    /// Detects 2-word person entities where swapping word order matches a connected entity.
+    /// Also catches partial reversed names (e.g., "Elwood Shannon" → "Claude Elwood Shannon").
+    /// Returns count of entities merged.
+    pub fn merge_reversed_names(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Build name → entity lookup (prefer connected, higher degree entities)
+        let mut name_to_entity: HashMap<String, (i64, usize)> = HashMap::new();
+        for e in &entities {
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            let key = e.name.to_lowercase();
+            let entry = name_to_entity.entry(key).or_insert((e.id, deg));
+            if deg > entry.1 {
+                *entry = (e.id, deg);
+            }
+        }
+
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<i64> = HashSet::new();
+
+        for e in &entities {
+            if absorbed.contains(&e.id) || e.entity_type != "person" {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+
+            // Case 1: Two-word reversed names ("Neumann John" → "John Neumann" or "John von Neumann")
+            if words.len() == 2 {
+                let reversed = format!("{} {}", words[1], words[0]);
+                let rev_lower = reversed.to_lowercase();
+
+                // Check exact reversed match
+                if let Some(&(target_id, target_deg)) = name_to_entity.get(&rev_lower) {
+                    if target_id != e.id && !absorbed.contains(&target_id) {
+                        let my_deg = degree.get(&e.id).copied().unwrap_or(0);
+                        let (keep, remove) = if target_deg >= my_deg {
+                            (target_id, e.id)
+                        } else {
+                            (e.id, target_id)
+                        };
+                        self.brain.merge_entities(remove, keep)?;
+                        absorbed.insert(remove);
+                        merged += 1;
+                        continue;
+                    }
+                }
+
+                // Check if reversed form is a substring of a connected entity
+                // e.g., "Neumann John" → matches "John von Neumann"
+                for candidate in &entities {
+                    if candidate.id == e.id
+                        || absorbed.contains(&candidate.id)
+                        || candidate.entity_type != "person"
+                    {
+                        continue;
+                    }
+                    let cand_lower = candidate.name.to_lowercase();
+                    let cand_words: Vec<&str> = cand_lower.split_whitespace().collect();
+                    if cand_words.len() >= 3 {
+                        // Check if both words appear in the candidate (in reversed order)
+                        let w0 = words[0].to_lowercase();
+                        let w1 = words[1].to_lowercase();
+                        let has_both =
+                            cand_words.contains(&w0.as_str()) && cand_words.contains(&w1.as_str());
+                        if has_both {
+                            let cand_deg = degree.get(&candidate.id).copied().unwrap_or(0);
+                            let my_deg = degree.get(&e.id).copied().unwrap_or(0);
+                            // Merge into the more connected entity
+                            if cand_deg > my_deg
+                                || (cand_deg == my_deg && candidate.name.len() > e.name.len())
+                            {
+                                self.brain.merge_entities(e.id, candidate.id)?;
+                                absorbed.insert(e.id);
+                                merged += 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Case 2: Partial name fragments ("Elwood Shannon" → "Claude Elwood Shannon")
+            if words.len() == 2 && !absorbed.contains(&e.id) {
+                let w0 = words[0].to_lowercase();
+                let w1 = words[1].to_lowercase();
+                for candidate in &entities {
+                    if candidate.id == e.id
+                        || absorbed.contains(&candidate.id)
+                        || candidate.entity_type != "person"
+                    {
+                        continue;
+                    }
+                    let cand_lower = candidate.name.to_lowercase();
+                    let cand_words: Vec<String> = cand_lower
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect();
+                    if cand_words.len() == 3 {
+                        // "Elwood Shannon" matches "Claude Elwood Shannon" (middle + last)
+                        if cand_words[1] == w0 && cand_words[2] == w1 {
+                            let cand_deg = degree.get(&candidate.id).copied().unwrap_or(0);
+                            let my_deg = degree.get(&e.id).copied().unwrap_or(0);
+                            if cand_deg >= my_deg {
+                                self.brain.merge_entities(e.id, candidate.id)?;
+                                absorbed.insert(e.id);
+                                merged += 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Purge entities containing "Examples" or other NLP concatenation noise.
+    /// Catches patterns like "Examples Yang", "Neumann John Examples", etc.
+    /// Returns count of entities purged.
+    pub fn purge_concatenation_noise(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected_degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *connected_degree.entry(r.subject_id).or_insert(0) += 1;
+            *connected_degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Words that signal NLP concatenation errors
+        let concat_noise_words: HashSet<&str> = [
+            "examples",
+            "quiz",
+            "featured",
+            "archived",
+            "template",
+            "categories",
+            "namespace",
+            "redirect",
+            "disambiguation",
+            "stub",
+            "infobox",
+            "navbox",
+            "sidebar",
+            "footer",
+            "reflist",
+            "citation",
+            "webarchive",
+            "coord",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let mut purged = 0usize;
+        for e in &entities {
+            let lower = e.name.to_lowercase();
+            let words: Vec<&str> = lower.split_whitespace().collect();
+
+            let should_purge = {
+                let deg = connected_degree.get(&e.id).copied().unwrap_or(0);
+                // Single word "Examples" or similar
+                if words.len() == 1 && concat_noise_words.contains(words[0]) && deg <= 5 {
+                    true
+                }
+                // Multi-word entities containing noise words
+                else if words.len() >= 2
+                    && words.iter().any(|w| concat_noise_words.contains(w))
+                    && deg <= 5
+                {
+                    true
+                }
+                // "Surname X Y" patterns: known surname followed by unrelated words
+                // e.g., "Neumann John Examples", "Neumann German", "Neumann Barbara McClintock"
+                // These are NLP extraction errors from citations like "von Neumann, John"
+                else if words.len() >= 2 && e.entity_type == "person" && deg <= 20 {
+                    // Check if the name looks like "Surname + random words" (citation fragment)
+                    // Heuristic: if the entity has very few unique neighbors and most are also noise
+                    let name_has_3plus_parts = words.len() >= 3;
+                    // Detect citation-style names: single surname + multiple first/middle names
+                    // that are actually separate people concatenated
+                    let looks_like_concat = name_has_3plus_parts
+                        && words.iter().all(|w| {
+                            w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                                && w.len() >= 2
+                                && w.chars().all(|c| c.is_alphabetic())
+                        })
+                        && words.len() >= 4; // 4+ capitalized words = likely concatenation noise
+                    looks_like_concat
+                } else {
+                    false
+                }
+            };
+            if should_purge {
+                let eid = e.id;
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM entities WHERE id = ?1", params![eid])?;
+                    Ok(())
+                })?;
+                purged += 1;
+            }
+        }
+        Ok(purged)
     }
 
     /// Prune stale hypotheses: reject testing hypotheses older than `max_days`
@@ -11122,8 +11346,8 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         return Some("place");
     }
 
-    // Multi-word place names misclassified as concept (e.g. "Spanish Netherlands", "Ottoman Empire")
-    if current_type == "concept" && word_count >= 2 {
+    // Multi-word place names misclassified as concept or person (e.g. "Spanish Netherlands", "Ottoman Empire")
+    if (current_type == "concept" || current_type == "person") && word_count >= 2 {
         let place_compounds: &[&str] = &[
             "spanish netherlands",
             "austrian netherlands",
