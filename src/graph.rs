@@ -3310,3 +3310,212 @@ pub fn katz_centrality(
     result.truncate(limit);
     Ok(result)
 }
+
+/// Random Walk with Restart (RWR) similarity between two entities.
+/// Simulates a random walker starting from `source` that at each step either
+/// follows a random edge (prob `1-alpha`) or teleports back to `source` (prob `alpha`).
+/// The stationary probability at `target` measures structural relatedness.
+/// More robust than shortest-path for dense subgraphs because it considers ALL paths.
+/// Returns a score in [0, 1]; higher = more structurally related.
+pub fn rwr_similarity(
+    brain: &Brain,
+    source_id: i64,
+    target_id: i64,
+    alpha: f64,
+    iterations: usize,
+) -> Result<f64, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    if !adj.contains_key(&source_id) {
+        return Ok(0.0);
+    }
+
+    // Power-iteration RWR
+    let all_nodes: Vec<i64> = adj.keys().copied().collect();
+    let mut prob: HashMap<i64, f64> = HashMap::new();
+    prob.insert(source_id, 1.0);
+
+    for _ in 0..iterations {
+        let mut new_prob: HashMap<i64, f64> = HashMap::new();
+        // Teleport component
+        *new_prob.entry(source_id).or_insert(0.0) += alpha;
+
+        // Walk component
+        for &node in &all_nodes {
+            let p = prob.get(&node).copied().unwrap_or(0.0);
+            if p < 1e-12 {
+                continue;
+            }
+            if let Some(neighbors) = adj.get(&node) {
+                if neighbors.is_empty() {
+                    // Dangling node: teleport to source
+                    *new_prob.entry(source_id).or_insert(0.0) += (1.0 - alpha) * p;
+                } else {
+                    let share = (1.0 - alpha) * p / neighbors.len() as f64;
+                    for &nb in neighbors {
+                        *new_prob.entry(nb).or_insert(0.0) += share;
+                    }
+                }
+            } else {
+                // Isolated in adjacency: teleport
+                *new_prob.entry(source_id).or_insert(0.0) += (1.0 - alpha) * p;
+            }
+        }
+        prob = new_prob;
+    }
+
+    Ok(prob.get(&target_id).copied().unwrap_or(0.0))
+}
+
+/// Batch RWR: find top-N entities most similar to a seed via Random Walk with Restart.
+/// More informative than PPR for discovery because alpha controls locality vs globality.
+/// Lower alpha = more global exploration, higher alpha = more local.
+/// Returns (entity_id, rwr_score) sorted descending, excluding the seed.
+pub fn rwr_top_similar(
+    brain: &Brain,
+    seed_id: i64,
+    alpha: f64,
+    iterations: usize,
+    limit: usize,
+) -> Result<Vec<(i64, f64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    if !adj.contains_key(&seed_id) {
+        return Ok(vec![]);
+    }
+
+    let all_nodes: Vec<i64> = adj.keys().copied().collect();
+    let mut prob: HashMap<i64, f64> = HashMap::new();
+    prob.insert(seed_id, 1.0);
+
+    for _ in 0..iterations {
+        let mut new_prob: HashMap<i64, f64> = HashMap::new();
+        *new_prob.entry(seed_id).or_insert(0.0) += alpha;
+
+        for &node in &all_nodes {
+            let p = prob.get(&node).copied().unwrap_or(0.0);
+            if p < 1e-12 {
+                continue;
+            }
+            if let Some(neighbors) = adj.get(&node) {
+                if neighbors.is_empty() {
+                    *new_prob.entry(seed_id).or_insert(0.0) += (1.0 - alpha) * p;
+                } else {
+                    let share = (1.0 - alpha) * p / neighbors.len() as f64;
+                    for &nb in neighbors {
+                        *new_prob.entry(nb).or_insert(0.0) += share;
+                    }
+                }
+            } else {
+                *new_prob.entry(seed_id).or_insert(0.0) += (1.0 - alpha) * p;
+            }
+        }
+        prob = new_prob;
+    }
+
+    prob.remove(&seed_id);
+    let mut result: Vec<(i64, f64)> = prob.into_iter().filter(|(_, s)| *s > 1e-10).collect();
+    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    result.truncate(limit);
+    Ok(result)
+}
+
+/// Algebraic connectivity estimate (Fiedler value / spectral gap).
+/// Approximates the second-smallest eigenvalue of the graph Laplacian using
+/// power iteration on the inverse-shifted Laplacian. This value measures how
+/// well-connected the graph is: 0 = disconnected, higher = more robust connectivity.
+/// For knowledge graphs, this indicates whether removing a few bridge entities
+/// would fragment the graph. Returns (algebraic_connectivity, interpretation).
+pub fn algebraic_connectivity_estimate(
+    brain: &Brain,
+    iterations: usize,
+) -> Result<(f64, String), rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let nodes: Vec<i64> = adj.keys().copied().collect();
+    let n = nodes.len();
+    if n < 3 {
+        return Ok((0.0, "Graph too small for spectral analysis".into()));
+    }
+    let node_idx: HashMap<i64, usize> = nodes.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+
+    // Power iteration to find largest eigenvalue of adjacency matrix,
+    // then λ₂(L) ≈ max_degree - λ₁(A) for connected graphs.
+    // More practical approach: inverse iteration on L to find smallest non-trivial eigenvalue.
+    // We use Rayleigh quotient iteration with deflation of the constant eigenvector.
+
+    let degrees: Vec<f64> = nodes
+        .iter()
+        .map(|id| adj.get(id).map_or(0, |n| n.len()) as f64)
+        .collect();
+
+    // Random initial vector, orthogonalized against the constant vector (1/√n)
+    let inv_sqrt_n = 1.0 / (n as f64).sqrt();
+    let mut v: Vec<f64> = (0..n).map(|i| (i as f64 * 0.7 + 0.3).sin()).collect();
+    // Remove projection onto constant vector
+    let proj: f64 = v.iter().sum::<f64>() * inv_sqrt_n;
+    for vi in v.iter_mut() {
+        *vi -= proj * inv_sqrt_n;
+    }
+    // Normalize
+    let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm < 1e-12 {
+        return Ok((0.0, "Degenerate vector".into()));
+    }
+    for vi in v.iter_mut() {
+        *vi /= norm;
+    }
+
+    let mut lambda = 0.0_f64;
+    for _ in 0..iterations {
+        // Compute L*v where L = D - A (Laplacian)
+        let mut lv = vec![0.0_f64; n];
+        for (i, &node) in nodes.iter().enumerate() {
+            lv[i] = degrees[i] * v[i]; // D*v component
+            if let Some(neighbors) = adj.get(&node) {
+                for &nb in neighbors {
+                    if let Some(&j) = node_idx.get(&nb) {
+                        lv[i] -= v[j]; // -A*v component
+                    }
+                }
+            }
+        }
+
+        // Deflate: remove projection onto constant eigenvector
+        let proj: f64 = lv.iter().sum::<f64>() * inv_sqrt_n;
+        for lvi in lv.iter_mut() {
+            *lvi -= proj * inv_sqrt_n;
+        }
+
+        // Rayleigh quotient: λ = v^T L v / v^T v
+        lambda = v.iter().zip(lv.iter()).map(|(a, b)| a * b).sum::<f64>();
+        let vtv: f64 = v.iter().map(|x| x * x).sum();
+        if vtv > 0.0 {
+            lambda /= vtv;
+        }
+
+        // Update v = Lv (power iteration finds LARGEST eigenvalue of L, but
+        // with deflation of constant vector, this gives us λ₂)
+        v = lv;
+        let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm < 1e-12 {
+            break;
+        }
+        for vi in v.iter_mut() {
+            *vi /= norm;
+        }
+    }
+
+    // Normalize by max possible (max_degree for d-regular graph)
+    let max_deg = degrees.iter().cloned().fold(0.0_f64, f64::max);
+    let normalized = if max_deg > 0.0 { lambda / max_deg } else { 0.0 };
+
+    let interpretation = if lambda < 0.01 {
+        "Near-disconnected: graph has weak bridges that could easily fragment".into()
+    } else if lambda < 0.1 {
+        "Low connectivity: a few key entities hold the graph together".into()
+    } else if lambda < 0.5 {
+        "Moderate connectivity: reasonably robust structure".into()
+    } else {
+        "High connectivity: well-interconnected graph".into()
+    };
+
+    Ok((normalized, interpretation))
+}

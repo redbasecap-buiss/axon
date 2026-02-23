@@ -2678,6 +2678,125 @@ impl<'a> Prometheus<'a> {
         Ok(thresholds)
     }
 
+    /// Exploration/exploitation budget allocator for hypothesis generation strategies.
+    /// Uses Upper Confidence Bound (UCB1) to balance generating hypotheses from
+    /// proven strategies (exploitation) vs trying underexplored strategies (exploration).
+    /// Returns a map of strategy → budget_fraction (sums to 1.0) for allocating
+    /// hypothesis slots across strategies.
+    pub fn strategy_budget_allocation(
+        &self,
+        total_budget: usize,
+    ) -> Result<HashMap<String, usize>> {
+        let roi_data = self.strategy_roi()?;
+        if roi_data.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let total_trials: f64 = roi_data.iter().map(|(_, t, _, _, _, _)| *t as f64).sum();
+        let ln_total = if total_trials > 0.0 {
+            total_trials.ln()
+        } else {
+            1.0
+        };
+
+        // UCB1 score for each strategy: roi + sqrt(2 * ln(N) / n_i)
+        let mut ucb_scores: Vec<(String, f64)> = roi_data
+            .iter()
+            .map(|(strategy, total, _, _, roi_val, _)| {
+                let n = (*total).max(1) as f64;
+                let exploitation = *roi_val;
+                let exploration = (2.0 * ln_total / n).sqrt();
+                (strategy.clone(), exploitation + exploration)
+            })
+            .collect();
+
+        // Normalize to sum to 1.0
+        let total_score: f64 = ucb_scores.iter().map(|(_, s)| s).sum();
+        if total_score <= 0.0 {
+            // Equal allocation
+            let per = total_budget / ucb_scores.len().max(1);
+            return Ok(ucb_scores
+                .into_iter()
+                .map(|(s, _)| (s, per.max(1)))
+                .collect());
+        }
+
+        let mut allocation: HashMap<String, usize> = HashMap::new();
+        let mut remaining = total_budget;
+        ucb_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (i, (strategy, score)) in ucb_scores.iter().enumerate() {
+            let fraction = score / total_score;
+            let slots = if i == ucb_scores.len() - 1 {
+                remaining // Last strategy gets remainder
+            } else {
+                let s = (fraction * total_budget as f64).round() as usize;
+                s.max(1).min(remaining) // At least 1 slot per strategy
+            };
+            allocation.insert(strategy.clone(), slots);
+            remaining = remaining.saturating_sub(slots);
+        }
+
+        Ok(allocation)
+    }
+
+    /// Strategy diversity score: Shannon entropy of hypothesis distribution across strategies.
+    /// Higher entropy = more diverse discovery. Low entropy = over-reliance on one strategy.
+    /// Returns (entropy_bits, dominant_strategy, dominant_fraction, recommendation).
+    pub fn strategy_diversity(&self) -> Result<(f64, String, f64, String)> {
+        let counts: HashMap<String, i64> = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT pattern_source, COUNT(*) FROM hypotheses GROUP BY pattern_source",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let mut map = HashMap::new();
+            for row in rows {
+                let (src, count) = row?;
+                map.insert(src, count);
+            }
+            Ok(map)
+        })?;
+
+        let total: f64 = counts.values().sum::<i64>() as f64;
+        if total == 0.0 {
+            return Ok((0.0, String::new(), 0.0, "No hypotheses yet".into()));
+        }
+
+        let mut entropy = 0.0_f64;
+        let mut dominant = String::new();
+        let mut dominant_count = 0i64;
+        for (strategy, &count) in &counts {
+            if count > dominant_count {
+                dominant_count = count;
+                dominant = strategy.clone();
+            }
+            let p = count as f64 / total;
+            if p > 0.0 {
+                entropy -= p * p.log2();
+            }
+        }
+        let dominant_frac = dominant_count as f64 / total;
+        let max_entropy = (counts.len() as f64).log2();
+
+        let rec = if counts.len() < 3 {
+            "Too few strategies active — enable more hypothesis generators".into()
+        } else if entropy < max_entropy * 0.4 {
+            format!(
+                "Low diversity: '{}' dominates at {:.0}% — rebalance strategy weights",
+                dominant,
+                dominant_frac * 100.0
+            )
+        } else if entropy > max_entropy * 0.8 {
+            "Excellent diversity across strategies".into()
+        } else {
+            "Good diversity — consider boosting underrepresented strategies".into()
+        };
+
+        Ok((entropy, dominant, dominant_frac, rec))
+    }
+
     /// Get total discovery count (confirmed hypotheses that were recorded).
     pub fn discovery_count(&self) -> Result<i64> {
         self.brain.with_conn(|conn| {
@@ -3458,8 +3577,20 @@ impl<'a> Prometheus<'a> {
             core_members.len(),
             trend_line,
         );
-        // Append health check to summary
-        let summary = format!("{}{}", summary, health_line);
+        // Append health check and strategy diversity to summary
+        let diversity_line = self
+            .strategy_diversity()
+            .map(|(ent, dom, frac, rec)| {
+                format!(
+                    ", strategy diversity: {:.2} bits (dominant: {} at {:.0}%, {})",
+                    ent,
+                    dom,
+                    frac * 100.0,
+                    rec
+                )
+            })
+            .unwrap_or_default();
+        let summary = format!("{}{}{}", summary, health_line, diversity_line);
 
         Ok(DiscoveryReport {
             patterns_found: all_patterns,
