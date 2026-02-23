@@ -2101,6 +2101,15 @@ impl<'a> Prometheus<'a> {
             convergence_merges += pass_merges;
         }
 
+        // Purge generic single-word islands (adverbs, adjectives, citation surnames)
+        let generic_purged = self.purge_generic_single_word_islands().unwrap_or(0);
+
+        // Refine associated_with predicates using entity type pairs
+        let predicates_refined = self.refine_associated_with().unwrap_or(0);
+
+        // Promote mature testing hypotheses (>3 days, confidence >= 0.65)
+        let promoted = self.promote_mature_hypotheses(3, 0.65).unwrap_or(0);
+
         // Hypothesis pair deduplication (prevent bloat from multiple runs)
         let pair_deduped = self.dedup_hypotheses_by_pair().unwrap_or(0);
 
@@ -2146,6 +2155,7 @@ impl<'a> Prometheus<'a> {
              {} compound relations + {} compound merged, {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
              {} fragment-purged, {} prefix-strip merged, {} auto-consolidated, \
              {} convergence-pass merges, \
+             {} generic islands purged, {} predicates refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -2192,6 +2202,9 @@ impl<'a> Prometheus<'a> {
             prefix_strip_merged,
             auto_consolidated,
             convergence_merges,
+            generic_purged,
+            predicates_refined,
+            promoted,
             pair_deduped,
             max_k,
             core_members.len(),
@@ -5229,6 +5242,113 @@ impl<'a> Prometheus<'a> {
         }
         Ok(hypotheses)
     }
+
+    /// Aggressively purge single-word island entities that are clearly generic English words,
+    /// citation surnames, adverbs, or adjectives. These entities have zero relations and
+    /// zero facts — they contribute nothing to the knowledge graph.
+    ///
+    /// Heuristic: a single-word island is "generic" if it matches common English word patterns
+    /// (adverbs ending in -ly, adjectives ending in -ous/-ive/-ful/-less, common nouns,
+    /// past participles ending in -ed, gerunds ending in -ing, plurals of abstract concepts).
+    /// We preserve single-word islands that are clearly proper nouns with known-entity signals.
+    pub fn purge_generic_single_word_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        let mut removed = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+            let name = e.name.trim();
+            let word_count = name.split_whitespace().count();
+            if word_count != 1 {
+                continue;
+            }
+            if should_purge_single_word(name, &e.entity_type) {
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                    Ok(())
+                })?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Refine over-generic `associated_with` predicates using entity type pairs.
+    /// E.g., person→place becomes "active_in", person→organization becomes "affiliated_with",
+    /// concept→concept becomes "related_concept", person→person becomes "contemporary_of", etc.
+    /// Returns count of relations updated.
+    pub fn refine_associated_with(&self) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let id_to_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        let mut updated = 0usize;
+        for r in &relations {
+            if r.predicate != "associated_with" {
+                continue;
+            }
+            let s_type = id_to_type.get(&r.subject_id).copied().unwrap_or("unknown");
+            let o_type = id_to_type.get(&r.object_id).copied().unwrap_or("unknown");
+            let new_pred = match (s_type, o_type) {
+                ("person", "place") | ("place", "person") => "active_in",
+                ("person", "organization") | ("organization", "person") => "affiliated_with",
+                ("person", "person") => "contemporary_of",
+                ("person", "concept") => "contributed_to",
+                ("concept", "person") => "pioneered_by",
+                ("person", "event") | ("event", "person") => "participated_in",
+                ("organization", "place") | ("place", "organization") => "based_in",
+                ("organization", "organization") => "partner_of",
+                ("organization", "concept") => "works_on",
+                ("concept", "concept") => "related_concept",
+                ("concept", "place") | ("place", "concept") => "relevant_to",
+                ("event", "place") | ("place", "event") => "held_in",
+                _ => continue,
+            };
+            self.brain.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE relations SET predicate = ?1 WHERE id = ?2",
+                    params![new_pred, r.id],
+                )?;
+                Ok(())
+            })?;
+            updated += 1;
+        }
+        Ok(updated)
+    }
+
+    /// Promote high-confidence testing hypotheses to confirmed if they've been
+    /// testing for over `min_days` and confidence is above `min_conf`.
+    /// This prevents hypothesis limbo — if nothing contradicts a plausible hypothesis
+    /// after several discovery cycles, it's likely valid.
+    pub fn promote_mature_hypotheses(&self, min_days: i64, min_conf: f64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::days(min_days))
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let count = self.brain.with_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE hypotheses SET status = 'confirmed' WHERE status = 'testing' AND confidence >= ?1 AND discovered_at < ?2",
+                params![min_conf, cutoff],
+            )?;
+            Ok(updated)
+        })?;
+        Ok(count)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5576,6 +5696,311 @@ fn is_extraction_noise(name: &str, entity_type: &str) -> bool {
         if noise_endings.contains(&last) {
             return true;
         }
+    }
+
+    false
+}
+
+/// Determine if a single-word isolated entity should be purged.
+/// Returns true for generic English words, citation surnames, adverbs, adjectives, etc.
+/// Preserves entities that look like well-known proper nouns or technical terms.
+fn should_purge_single_word(name: &str, entity_type: &str) -> bool {
+    let lower = name.to_lowercase();
+    let len = lower.len();
+
+    // Very short names are almost always noise
+    if len <= 3 {
+        return true;
+    }
+
+    // Already caught by noise filters
+    if is_noise_name(name) || is_noise_type(entity_type) {
+        return true;
+    }
+
+    // Starts with lowercase → not a proper noun → generic word
+    if name.starts_with(|c: char| c.is_lowercase()) {
+        return true;
+    }
+
+    // For "concept" type: aggressively purge common English word patterns
+    if entity_type == "concept" {
+        // Adverbs ending in -ly
+        if lower.ends_with("ly") && len >= 5 {
+            return true;
+        }
+        // Adjectives: -ous, -ive, -ful, -less, -able, -ible, -ical, -ary, -ory
+        let adj_suffixes = [
+            "ous", "ive", "ful", "less", "able", "ible", "ical", "ary", "ory", "ish", "ular",
+            "inal", "ular", "etic", "atic",
+        ];
+        if adj_suffixes.iter().any(|s| lower.ends_with(s)) && len >= 6 {
+            return true;
+        }
+        // Past participles (-ed), gerunds (-ing) — often sentence fragments
+        if (lower.ends_with("ed") || lower.ends_with("ing")) && len >= 5 {
+            return true;
+        }
+        // Plural abstract concepts (-ies, -isms, -ists, -ments, -tions, -nesses)
+        let abstract_suffixes = [
+            "isms", "ists", "ments", "tions", "nesses", "ities", "ences", "ances",
+        ];
+        if abstract_suffixes.iter().any(|s| lower.ends_with(s)) {
+            return true;
+        }
+        // Common generic concept words
+        let generic_concepts = [
+            "unlike",
+            "others",
+            "battle",
+            "timeline",
+            "further",
+            "please",
+            "learn",
+            "multiple",
+            "lectures",
+            "origins",
+            "bulletin",
+            "elements",
+            "universe",
+            "physicists",
+            "aside",
+            "together",
+            "video",
+            "consider",
+            "attempts",
+            "fellows",
+            "chamber",
+            "user",
+            "contexts",
+            "humans",
+            "lowest",
+            "bells",
+            "comic",
+            "chariot",
+            "comet",
+            "ceramic",
+            "stellar",
+            "temperature",
+            "falcon",
+            "piranha",
+            "mitten",
+            "treatise",
+            "television",
+            "particle",
+            "stratosphere",
+            "antimatter",
+            "apply",
+            "strongly",
+            "axioms",
+            "debates",
+            "problems",
+            "ideas",
+            "systems",
+            "methods",
+            "models",
+            "levels",
+            "forces",
+            "fields",
+            "waves",
+            "forms",
+            "rules",
+            "tools",
+            "parts",
+            "types",
+            "modes",
+            "roles",
+            "units",
+            "rates",
+            "phases",
+            "zones",
+            "loops",
+            "paths",
+            "nodes",
+            "links",
+            "terms",
+            "claims",
+            "facts",
+            "texts",
+            "codes",
+            "tests",
+            "maps",
+            "keys",
+            "data",
+            "sets",
+            "rows",
+            "logs",
+            "tags",
+            "runs",
+            "gaps",
+            "ends",
+            "bits",
+            "aims",
+        ];
+        if generic_concepts.contains(&lower.as_str()) {
+            return true;
+        }
+        return false;
+    }
+
+    // For "person" type: purge if it looks like a citation surname
+    if entity_type == "person" {
+        // Single-word "person" entities are almost always citation last names
+        // unless they're a very well-known mononymous person
+        let known_mononymous = [
+            "aristotle",
+            "plato",
+            "socrates",
+            "euclid",
+            "archimedes",
+            "confucius",
+            "avicenna",
+            "averroes",
+            "fibonacci",
+            "michelangelo",
+            "raphael",
+            "caravaggio",
+            "rembrandt",
+            "voltaire",
+            "napoleon",
+            "galileo",
+            "copernicus",
+            "hypatia",
+            "ptolemy",
+            "hippocrates",
+            "pythagoras",
+            "herodotus",
+            "homer",
+            "thales",
+            "democritus",
+            "epicurus",
+            "seneca",
+            "virgil",
+            "ovid",
+            "tacitus",
+            "livy",
+            "cicero",
+            "nero",
+            "caesar",
+            "cleopatra",
+            "hannibal",
+            "xerxes",
+            "charlemagne",
+            "saladin",
+            "tamerlane",
+            "maimonides",
+            "rumi",
+            "hafez",
+            "omar",
+            "drake",
+            "magellan",
+            "columbus",
+            "vespucci",
+            "pizarro",
+            "cortez",
+            "nostradamus",
+            "paracelsus",
+            "vesalius",
+            "kepler",
+            "descartes",
+            "pascal",
+            "leibniz",
+            "euler",
+            "gauss",
+            "riemann",
+            "hilbert",
+            "poincaré",
+            "noether",
+            "ramanujan",
+            "turing",
+            "gödel",
+            "shannon",
+            "babbage",
+            "lovelace",
+            "tesla",
+            "edison",
+            "faraday",
+            "maxwell",
+            "boltzmann",
+            "heisenberg",
+            "schrödinger",
+            "dirac",
+            "feynman",
+            "hawking",
+            "einstein",
+            "newton",
+            "darwin",
+            "mendel",
+            "pasteur",
+            "curie",
+            "planck",
+            "bohr",
+            "rutherford",
+            "fermi",
+            "oppenheimer",
+            "madonna",
+            "beyoncé",
+            "shakira",
+            "adele",
+            "rihanna",
+            "drake",
+            "eminem",
+            "bono",
+            "cher",
+            "prince",
+            "moby",
+            "björk",
+            "sia",
+            "pelé",
+            "ronaldinho",
+            "neymar",
+            "ronaldo",
+            "messi",
+            "madonna",
+            "picasso",
+            "banksy",
+            "kandinsky",
+            "monet",
+            "renoir",
+            "cézanne",
+            "matisse",
+            "warhol",
+            "pollock",
+            "dostoevsky",
+            "tolstoy",
+            "chekhov",
+            "pushkin",
+            "nabokov",
+            "kafka",
+            "goethe",
+            "nietzsche",
+            "hegel",
+            "kant",
+            "spinoza",
+            "hume",
+            "locke",
+            "hobbes",
+            "rousseau",
+            "montesquieu",
+            "machiavelli",
+            "buddha",
+            "confucius",
+            "laozi",
+            "zoroaster",
+            "muhammad",
+            "moses",
+            "jesus",
+        ];
+        if known_mononymous.contains(&lower.as_str()) {
+            return false; // Keep well-known mononymous persons
+        }
+        // Otherwise, single-word person is almost certainly a citation surname
+        return true;
+    }
+
+    // For "organization" type: single-word orgs are usually abbreviations or generic
+    if entity_type == "organization" && len <= 5 {
+        return true;
     }
 
     false
