@@ -1952,6 +1952,20 @@ fn extract_capitalized(
     all_stops: &[&HashSet<&str>],
     entities: &mut Vec<(String, String)>,
 ) {
+    // Split on em-dashes and en-dashes before processing to avoid cross-clause entities
+    let sub_sentences: Vec<&str> = sentence
+        .split(|c: char| c == '—' || c == '–' || c == '|')
+        .collect();
+    for sub in sub_sentences {
+        extract_capitalized_inner(sub, all_stops, entities);
+    }
+}
+
+fn extract_capitalized_inner(
+    sentence: &str,
+    all_stops: &[&HashSet<&str>],
+    entities: &mut Vec<(String, String)>,
+) {
     let words: Vec<&str> = sentence.split_whitespace().collect();
     let is_stop = |w: &str| -> bool {
         let lower = w.to_lowercase();
@@ -1959,7 +1973,12 @@ fn extract_capitalized(
     };
     let mut i = 0;
     while i < words.len() {
-        let word = words[i].trim_matches(|c: char| !c.is_alphanumeric());
+        let raw_word = words[i];
+        // Strip possessives ('s, 's) before processing
+        let word = raw_word
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .trim_end_matches("'s")
+            .trim_end_matches("\u{2019}s");
         if !word.is_empty()
             && word.chars().next().is_some_and(|c| c.is_uppercase())
             && !is_stop(word)
@@ -1969,7 +1988,10 @@ fn extract_capitalized(
             let mut j = i + 1;
             // Max 4 words per entity phrase to avoid capturing paragraphs
             while j < words.len() && phrase.len() < 4 {
-                let next = words[j].trim_matches(|c: char| !c.is_alphanumeric());
+                let next = words[j]
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .trim_end_matches("'s")
+                    .trim_end_matches("\u{2019}s");
                 if !next.is_empty() && next.chars().next().is_some_and(|c| c.is_uppercase()) {
                     phrase.push(next.to_string());
                     j += 1;
