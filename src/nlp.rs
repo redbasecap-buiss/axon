@@ -2061,6 +2061,36 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         }
     }
 
+    // Reject sentence fragments (contain verbs/articles in long phrases)
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    if words.len() >= 4 {
+        let sentence_markers = [
+            "the", "a", "an", "is", "was", "were", "are", "have", "had", "has", "if", "that",
+            "which", "by", "from", "into", "also", "then", "when", "where", "who", "whom", "whose",
+            "not", "but", "yet", "so", "because", "although", "though", "since", "until", "while",
+            "after", "before", "during", "about", "against", "between", "through", "without",
+        ];
+        let marker_count = words
+            .iter()
+            .filter(|w| sentence_markers.contains(&w.as_ref()))
+            .count();
+        if marker_count >= 2 {
+            return false;
+        }
+    }
+
+    // Reject multi-word phrases starting with lowercase (not proper nouns)
+    if trimmed.contains(' ') && trimmed.len() > 20 {
+        if trimmed.chars().next().is_some_and(|c| c.is_lowercase()) {
+            return false;
+        }
+    }
+
+    // Reject entities with ISBN, citation markers, or caret references
+    if lower.contains("isbn") || lower.contains(" ^ ") || trimmed.contains('^') {
+        return false;
+    }
+
     // Reject single long words (code identifiers, not knowledge entities)
     if !lower.contains(' ') && trimmed.len() > 20 {
         return false;
@@ -2159,6 +2189,20 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     // Reject single-word entities classified as "person" — real people have at least two words
     if etype == "person" && !lower.contains(' ') {
         return false;
+    }
+
+    // Reject "person" entities containing tech acronyms (3+ consecutive uppercase letters)
+    if etype == "person" {
+        let has_acronym = trimmed.split_whitespace().any(|w| {
+            let upper_run = w.chars().filter(|c| c.is_uppercase()).count();
+            upper_run >= 3
+                && w.len() >= 3
+                && w.chars()
+                    .all(|c| c.is_uppercase() || c.is_ascii_digit() || c == '-')
+        });
+        if has_acronym {
+            return false;
+        }
     }
 
     // Reject single-word concepts under 4 chars (too ambiguous to be useful)
@@ -2372,6 +2416,15 @@ fn classify_entity_type(name: &str) -> &'static str {
             }
             return "concept";
         }
+    }
+
+    // If any word is an all-caps acronym (3+ chars), it's likely a concept/tech term, not a person
+    if name.split_whitespace().any(|w| {
+        w.len() >= 3
+            && w.chars()
+                .all(|c| c.is_uppercase() || c.is_ascii_digit() || c == '-')
+    }) {
+        return "concept";
     }
 
     // Two or three capitalized words with no indicators → likely person name

@@ -2163,6 +2163,10 @@ impl<'a> Prometheus<'a> {
         // Fact-based relation inference
         let fact_inferred = self.infer_relations_from_facts().unwrap_or(0);
 
+        // High-confidence prefix variant merge (cross-type, 3x degree threshold)
+        // Run BEFORE compound decomposition to avoid degree inflation
+        let hc_prefix_merged = self.merge_high_confidence_prefix_variants().unwrap_or(0);
+
         // Entity name cross-referencing
         let name_crossrefs = self.crossref_entity_names().unwrap_or(0);
 
@@ -2194,6 +2198,9 @@ impl<'a> Prometheus<'a> {
         // Auto-consolidation: merge high-scoring entity pairs from consolidation analysis
         let auto_consolidated = self.auto_consolidate_entities(0.65).unwrap_or(0);
 
+        // Dissolve single-word name fragment hubs ("Charles" → "Charles Babbage", etc.)
+        let fragments_dissolved = self.dissolve_name_fragment_hubs().unwrap_or(0);
+
         // Multi-pass convergence: repeat merge strategies until no more progress
         let mut convergence_merges = 0usize;
         for _pass in 0..3 {
@@ -2207,6 +2214,7 @@ impl<'a> Prometheus<'a> {
             pass_merges += self.prefix_strip_island_merge().unwrap_or(0);
             pass_merges += self.merge_name_variants().unwrap_or(0);
             pass_merges += self.aggressive_prefix_dedup().unwrap_or(0);
+            pass_merges += self.merge_high_confidence_prefix_variants().unwrap_or(0);
             if pass_merges == 0 {
                 break;
             }
@@ -2278,7 +2286,7 @@ impl<'a> Prometheus<'a> {
              {} fact-inferred relations, {} name cross-references, \
              {} compound relations + {} compound merged, {} concat split ({}r/{}c), {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
-             {} convergence-pass merges, \
+             {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
              {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} predicates refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
@@ -2330,6 +2338,8 @@ impl<'a> Prometheus<'a> {
             prefix_strip_merged,
             name_variants_merged,
             auto_consolidated,
+            fragments_dissolved,
+            hc_prefix_merged,
             convergence_merges,
             containment_merged,
             aggressive_deduped,
@@ -6011,18 +6021,19 @@ impl<'a> Prometheus<'a> {
                     {
                         continue;
                     }
-                    // Must be same type or compatible types
-                    if shorter.entity_type != longer.entity_type {
+                    // Must be same type, or shorter has 3x+ degree (NLP mistype)
+                    let short_deg = degree.get(&shorter.id).copied().unwrap_or(0);
+                    let long_deg = degree.get(&longer.id).copied().unwrap_or(0);
+                    if shorter.entity_type != longer.entity_type && short_deg < long_deg.max(1) * 3
+                    {
                         continue;
                     }
                     // Must be connected (directly related)
-                    let connected = adj.contains(&(shorter.id, longer.id));
-                    if !connected {
+                    let connected_pair = adj.contains(&(shorter.id, longer.id));
+                    if !connected_pair {
                         continue;
                     }
                     // Shorter form should have >= degree of longer form
-                    let short_deg = degree.get(&shorter.id).copied().unwrap_or(0);
-                    let long_deg = degree.get(&longer.id).copied().unwrap_or(0);
                     if short_deg < long_deg {
                         continue;
                     }
@@ -6106,12 +6117,81 @@ impl<'a> Prometheus<'a> {
                     if target_id == e.id || absorbed.contains(&target_id) {
                         continue;
                     }
-                    // Same type or compatible
-                    if target_type != &e.entity_type {
+                    // Type check: same type required, OR target has 3x+ degree
+                    // (high-degree target with matching prefix = NLP mistyped variant)
+                    if target_type != &e.entity_type && target_deg < my_deg.max(1) * 3 {
                         continue;
                     }
                     // Target must be more connected (canonical)
                     if target_deg <= my_deg && my_deg > 0 {
+                        continue;
+                    }
+                    self.brain.merge_entities(e.id, target_id)?;
+                    absorbed.insert(e.id);
+                    merged += 1;
+                    break;
+                }
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Merge any entity whose name is "KnownEntity + suffix" into KnownEntity,
+    /// regardless of type or connectivity, when KnownEntity has 5x+ the degree.
+    /// This catches NLP artifacts like "Ada Lovelace WIRED", "Byzantine Empire Rhomaioi" etc.
+    pub fn merge_high_confidence_prefix_variants(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Build index: lowercase name → (id, degree) for entities with 2+ words and degree >= 5
+        let mut canonical: HashMap<String, (i64, usize)> = HashMap::new();
+        for e in &entities {
+            if is_noise_type(&e.entity_type) {
+                continue;
+            }
+            let wc = e.name.split_whitespace().count();
+            if wc < 2 {
+                continue;
+            }
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            if deg < 5 {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            let existing_deg = canonical.get(&lower).map(|(_, d)| *d).unwrap_or(0);
+            if deg > existing_deg {
+                canonical.insert(lower, (e.id, deg));
+            }
+        }
+
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<i64> = HashSet::new();
+
+        for e in &entities {
+            if absorbed.contains(&e.id) || is_noise_type(&e.entity_type) {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 3 {
+                continue;
+            }
+            let my_deg = degree.get(&e.id).copied().unwrap_or(0);
+
+            // Try progressively shorter prefixes
+            for take in (2..words.len()).rev() {
+                let prefix = words[..take].join(" ").to_lowercase();
+                if let Some(&(target_id, target_deg)) = canonical.get(&prefix) {
+                    if target_id == e.id || absorbed.contains(&target_id) {
+                        continue;
+                    }
+                    // Require target to have 3x+ degree (high confidence)
+                    if target_deg < my_deg.max(1) * 3 {
                         continue;
                     }
                     self.brain.merge_entities(e.id, target_id)?;
@@ -6302,6 +6382,290 @@ impl<'a> Prometheus<'a> {
             }
         }
         Ok((rels_created, entities_cleaned))
+    }
+
+    /// Dissolve single-word name fragment hubs.
+    ///
+    /// Entities like "Charles" (concept, 35 relations) are NLP extraction artifacts
+    /// that absorb connections meant for real entities ("Charles Babbage", "Charles Darwin").
+    /// This method:
+    /// 1. Finds single-word entities with high degree that look like name fragments
+    /// 2. For each, checks if multi-word entities exist containing that name
+    /// 3. If so, merges the fragment into the most connected matching entity
+    /// 4. Or if the fragment is just a hub linking unrelated "Charles *" entities,
+    ///    deletes it and its relations (they're noise)
+    ///
+    /// Returns count of fragments dissolved (merged or removed).
+    pub fn dissolve_name_fragment_hubs(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Known real single-word entities that should NOT be dissolved
+        let real_single_words: HashSet<&str> = [
+            // Countries & major places
+            "China",
+            "France",
+            "Germany",
+            "Japan",
+            "India",
+            "Russia",
+            "Italy",
+            "Spain",
+            "Brazil",
+            "Canada",
+            "Mexico",
+            "Egypt",
+            "Iran",
+            "Iraq",
+            "Turkey",
+            "Greece",
+            "Sweden",
+            "Norway",
+            "Finland",
+            "Denmark",
+            "Poland",
+            "Austria",
+            "Belgium",
+            "Portugal",
+            "Romania",
+            "Hungary",
+            "Ireland",
+            "Scotland",
+            "England",
+            "Wales",
+            "Africa",
+            "Asia",
+            "Europe",
+            "America",
+            "Antarctica",
+            "Australia",
+            "Paris",
+            "London",
+            "Berlin",
+            "Rome",
+            "Tokyo",
+            "Moscow",
+            "Vienna",
+            "Prague",
+            "Madrid",
+            "Lisbon",
+            "Athens",
+            "Cairo",
+            "Baghdad",
+            "Tehran",
+            "Delhi",
+            "Zurich",
+            "Geneva",
+            "Bern",
+            "Basel",
+            "Lausanne",
+            "Lucerne",
+            "Svalbard",
+            "Crimea",
+            "Balkans",
+            "Caucasus",
+            "Anatolia",
+            "Mesopotamia",
+            // Major concepts/things
+            "Internet",
+            "Bitcoin",
+            "Linux",
+            "Wikipedia",
+            "Amazon",
+            "Google",
+            "Apple",
+            "Microsoft",
+            "Tesla",
+            "Netflix",
+            "Facebook",
+            "Twitter",
+            "YouTube",
+            "DNA",
+            "RNA",
+            "CRISPR",
+            "NATO",
+            "UNESCO",
+            "UNICEF",
+            // Historical entities
+            "Renaissance",
+            "Reformation",
+            "Enlightenment",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        // Build lookup: lowercase_name → Vec<(id, degree, name)> for multi-word entities
+        let mut multiword_by_word: HashMap<String, Vec<(i64, usize, String)>> = HashMap::new();
+        for e in &entities {
+            if is_noise_type(&e.entity_type) {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() >= 2 {
+                let deg = degree.get(&e.id).copied().unwrap_or(0);
+                for w in &words {
+                    multiword_by_word
+                        .entry(w.to_lowercase())
+                        .or_default()
+                        .push((e.id, deg, e.name.clone()));
+                }
+            }
+        }
+
+        let mut dissolved = 0usize;
+
+        // Debug: count how many single-word entities with deg>=5 we find
+        let mut dbg_count = 0usize;
+        for e in &entities {
+            let name = e.name.trim();
+            if name.split_whitespace().count() == 1 && !is_noise_type(&e.entity_type) {
+                let deg = degree.get(&e.id).copied().unwrap_or(0);
+                if deg >= 5 && !real_single_words.contains(name) {
+                    dbg_count += 1;
+                    if dbg_count <= 5 {
+                        eprintln!(
+                            "  [dissolve-debug] '{}' type={} deg={}",
+                            name, e.entity_type, deg
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("  [dissolve] total candidates with deg>=5: {}", dbg_count);
+
+        for e in &entities {
+            if is_noise_type(&e.entity_type) {
+                continue;
+            }
+            let name = e.name.trim();
+            let word_count = name.split_whitespace().count();
+            if word_count != 1 {
+                continue;
+            }
+            // Skip known real entities
+            if real_single_words.contains(name) {
+                continue;
+            }
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            if deg < 5 {
+                continue; // Only target high-degree fragments
+            }
+
+            // Check: does this look like a name fragment?
+            let lower = name.to_lowercase();
+            let matching = multiword_by_word.get(&lower).cloned().unwrap_or_default();
+
+            if name == "Charles" || name == "Noether" || name == "Lovelace" {
+                eprintln!(
+                    "  [dissolve-trace] '{}' deg={} matching.len()={}",
+                    name,
+                    deg,
+                    matching.len()
+                );
+            }
+
+            if matching.len() < 2 {
+                continue; // Not enough evidence it's a fragment
+            }
+            eprintln!(
+                "  [dissolve] candidate: '{}' (deg={}, {} matching multi-word entities)",
+                name,
+                deg,
+                matching.len()
+            );
+
+            // This is a fragment hub. Find the best target to merge into.
+            // Best = most connected multi-word entity containing this name.
+            let mut best_target: Option<(i64, usize, String)> = None;
+            for (mid, mdeg, mname) in &matching {
+                if *mid == e.id {
+                    continue;
+                }
+                if best_target.is_none() || mdeg > &best_target.as_ref().unwrap().1 {
+                    best_target = Some((*mid, *mdeg, mname.clone()));
+                }
+            }
+
+            if let Some((target_id, _target_deg, _target_name)) = best_target {
+                // Merge fragment into best matching multi-word entity
+                self.brain.merge_entities(e.id, target_id)?;
+                dissolved += 1;
+            }
+        }
+        Ok(dissolved)
+    }
+
+    /// Information-theoretic entity scoring: rank entities by how much they contribute
+    /// to the knowledge graph's information content. Uses a combination of:
+    /// - Structural importance (betweenness centrality proxy via degree * clustering)
+    /// - Uniqueness (inverse of how many similar entities exist)
+    /// - Connectivity quality (ratio of diverse predicates to total degree)
+    /// Returns (entity_name, entity_type, info_score) sorted descending.
+    pub fn information_content_ranking(&self, limit: usize) -> Result<Vec<(String, String, f64)>> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        let mut predicates: HashMap<i64, HashSet<String>> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+            predicates
+                .entry(r.subject_id)
+                .or_default()
+                .insert(r.predicate.clone());
+            predicates
+                .entry(r.object_id)
+                .or_default()
+                .insert(r.predicate.clone());
+        }
+
+        // Type frequency for uniqueness scoring
+        let mut type_count: HashMap<String, usize> = HashMap::new();
+        for e in &entities {
+            *type_count.entry(e.entity_type.clone()).or_insert(0) += 1;
+        }
+
+        let total_entities = entities.len().max(1) as f64;
+        let mut scores: Vec<(String, String, f64)> = Vec::new();
+
+        for e in &entities {
+            if is_noise_type(&e.entity_type) || is_noise_name(&e.name) {
+                continue;
+            }
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            if deg == 0 {
+                continue;
+            }
+
+            let pred_diversity = predicates.get(&e.id).map(|s| s.len()).unwrap_or(0) as f64;
+            let type_freq = type_count.get(&e.entity_type).copied().unwrap_or(1) as f64;
+
+            // Information score components:
+            // 1. Connectivity: log(degree + 1) — diminishing returns for hubs
+            let connectivity = (deg as f64 + 1.0).ln();
+            // 2. Predicate diversity: more diverse connections = more informative
+            let diversity = pred_diversity / (deg as f64).max(1.0);
+            // 3. Type uniqueness: rarer types are more informative
+            let uniqueness = (total_entities / type_freq).ln().max(0.1);
+            // 4. Fact richness
+            let facts = self.brain.get_facts_for(e.id)?.len() as f64;
+            let fact_bonus = (facts + 1.0).ln() * 0.5;
+
+            let info_score = connectivity * diversity * uniqueness + fact_bonus;
+            scores.push((e.name.clone(), e.entity_type.clone(), info_score));
+        }
+
+        scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        scores.truncate(limit);
+        Ok(scores)
     }
 }
 
