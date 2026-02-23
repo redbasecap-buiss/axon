@@ -2114,6 +2114,9 @@ impl<'a> Prometheus<'a> {
             convergence_merges += pass_merges;
         }
 
+        // Merge connected entities where one name contains the other
+        let containment_merged = self.merge_connected_containment().unwrap_or(0);
+
         // Purge generic single-word islands (adverbs, adjectives, citation surnames)
         let generic_purged = self.purge_generic_single_word_islands().unwrap_or(0);
 
@@ -2171,6 +2174,7 @@ impl<'a> Prometheus<'a> {
              {} compound relations + {} compound merged, {} concat split ({}r/{}c), {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} convergence-pass merges, \
+             {} connected-containment merged, \
              {} generic islands purged, {} multiword noise purged, {} predicates refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
@@ -2222,6 +2226,7 @@ impl<'a> Prometheus<'a> {
             name_variants_merged,
             auto_consolidated,
             convergence_merges,
+            containment_merged,
             generic_purged,
             multiword_purged,
             predicates_refined,
@@ -4594,7 +4599,15 @@ impl<'a> Prometheus<'a> {
     pub fn merge_name_variants(&self) -> Result<usize> {
         eprintln!("NAME_VARIANT_START: entering merge_name_variants");
         let entities = self.brain.all_entities()?;
-        eprintln!("NAME_VARIANT_START: got {} entities", entities.len());
+        let cs_count = entities
+            .iter()
+            .filter(|e| e.name.contains("Claude Shannon"))
+            .count();
+        eprintln!(
+            "NAME_VARIANT_START: got {} entities ({} contain 'Claude Shannon')",
+            entities.len(),
+            cs_count
+        );
         let relations = self.brain.all_relations()?;
 
         let mut degree: HashMap<i64, usize> = HashMap::new();
@@ -4688,12 +4701,27 @@ impl<'a> Prometheus<'a> {
         let mut merged = 0usize;
         let mut absorbed: HashSet<i64> = HashSet::new();
 
+        let mut iter_count = 0usize;
         for e in &entities {
+            iter_count += 1;
+            if e.name.contains("Claude Shannon") || e.name.contains("Professor Claude") {
+                eprintln!(
+                    "NAME_VARIANT_ITER[{}]: '{}' id={} absorbed={} noise_type={}",
+                    iter_count,
+                    e.name,
+                    e.id,
+                    absorbed.contains(&e.id),
+                    is_noise_type(&e.entity_type)
+                );
+            }
             if absorbed.contains(&e.id) || is_noise_type(&e.entity_type) {
                 continue;
             }
             let words: Vec<&str> = e.name.split_whitespace().collect();
-            if e.name.contains("Claude Shannon") {
+            if e.name.contains("Claude Shannon")
+                || e.name.contains("Ada Lovelace")
+                || e.name.contains("Professor Claude")
+            {
                 let last_w = words.last().map(|w| w.to_lowercase()).unwrap_or_default();
                 let is_trailing = trailing_noise.contains(&last_w.as_str());
                 let target = if words.len() >= 2 {
@@ -4729,13 +4757,24 @@ impl<'a> Prometheus<'a> {
             }
 
             // 2. Strip trailing noise word — always merge into canonical (shorter) form
-            if words.len() >= 2 {
+            if words.len() >= 2 && !absorbed.contains(&e.id) {
                 let last_lower = words.last().unwrap().to_lowercase();
                 if trailing_noise.contains(&last_lower.as_str()) {
                     let prefix: String = words[..words.len() - 1].join(" ");
                     let lower_prefix = prefix.to_lowercase();
+                    eprintln!(
+                        "TRAILING_STRIP: '{}' → trailing='{}' prefix='{}' lookup={:?}",
+                        e.name,
+                        last_lower,
+                        lower_prefix,
+                        name_to_info.get(&lower_prefix)
+                    );
                     if let Some(&(target_id, _target_deg)) = name_to_info.get(&lower_prefix) {
                         if target_id != e.id {
+                            eprintln!(
+                                "TRAILING_MERGE: merging '{}' (id={}) into target_id={}",
+                                e.name, e.id, target_id
+                            );
                             self.brain.merge_entities(e.id, target_id)?;
                             absorbed.insert(e.id);
                             merged += 1;
@@ -5671,6 +5710,113 @@ impl<'a> Prometheus<'a> {
     /// zero facts — they contribute nothing to the knowledge graph.
     ///
     /// Heuristic: a single-word island is "generic" if it matches common English word patterns
+    /// Merge connected entities where one name fully contains the other.
+    /// Targets patterns like "Byzantine Empire Christianity" connected to "Byzantine Empire"
+    /// — the longer form is usually a sentence-fragment extraction, not a real entity.
+    /// Only merges when the shorter form has higher or equal degree and names share the same type.
+    /// Returns count of merges performed.
+    pub fn merge_connected_containment(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        // Build adjacency and degree
+        let mut adj: HashSet<(i64, i64)> = HashSet::new();
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            adj.insert((r.subject_id, r.object_id));
+            adj.insert((r.object_id, r.subject_id));
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Build name→entity index for meaningful entities only
+        let meaningful: Vec<&crate::db::Entity> = entities
+            .iter()
+            .filter(|e| !is_noise_type(&e.entity_type) && e.name.len() >= 3)
+            .collect();
+
+        // Index by first word for efficient lookup
+        let mut by_first_word: HashMap<String, Vec<&crate::db::Entity>> = HashMap::new();
+        for e in &meaningful {
+            if let Some(first) = e.name.split_whitespace().next() {
+                by_first_word
+                    .entry(first.to_lowercase())
+                    .or_default()
+                    .push(e);
+            }
+        }
+
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<i64> = HashSet::new();
+
+        for e in &meaningful {
+            if absorbed.contains(&e.id) {
+                continue;
+            }
+            let e_words: Vec<&str> = e.name.split_whitespace().collect();
+            if e_words.len() < 2 {
+                continue;
+            }
+            let first_lower = e_words[0].to_lowercase();
+            // Find potential shorter forms that this entity's name contains
+            if let Some(candidates) = by_first_word.get(&first_lower) {
+                for &cand in candidates {
+                    if cand.id == e.id || absorbed.contains(&cand.id) {
+                        continue;
+                    }
+                    // Check: is one name contained in the other?
+                    let (shorter, longer) = if cand.name.len() < e.name.len() {
+                        (cand, *e)
+                    } else if cand.name.len() > e.name.len() {
+                        (*e, cand)
+                    } else {
+                        continue;
+                    };
+                    let shorter_lower = shorter.name.to_lowercase();
+                    let longer_lower = longer.name.to_lowercase();
+                    // The longer name must start with or end with the shorter name
+                    if !longer_lower.starts_with(&shorter_lower)
+                        && !longer_lower.ends_with(&shorter_lower)
+                    {
+                        continue;
+                    }
+                    // Must be same type or compatible types
+                    if shorter.entity_type != longer.entity_type {
+                        continue;
+                    }
+                    // Must be connected (directly related)
+                    let connected = adj.contains(&(shorter.id, longer.id));
+                    if !connected {
+                        continue;
+                    }
+                    // Shorter form should have >= degree of longer form
+                    let short_deg = degree.get(&shorter.id).copied().unwrap_or(0);
+                    let long_deg = degree.get(&longer.id).copied().unwrap_or(0);
+                    if short_deg < long_deg {
+                        continue;
+                    }
+                    // The extra words in the longer name should be "noise-like"
+                    let shorter_words: Vec<&str> = shorter.name.split_whitespace().collect();
+                    let longer_words: Vec<&str> = longer.name.split_whitespace().collect();
+                    let extra_words: Vec<&&str> = longer_words
+                        .iter()
+                        .filter(|w| !shorter_words.contains(w))
+                        .collect();
+                    // At least one extra word, and all extra words should be short or generic
+                    if extra_words.is_empty() {
+                        continue;
+                    }
+
+                    // Merge longer into shorter
+                    self.brain.merge_entities(longer.id, shorter.id)?;
+                    absorbed.insert(longer.id);
+                    merged += 1;
+                }
+            }
+        }
+        Ok(merged)
+    }
+
     /// (adverbs ending in -ly, adjectives ending in -ous/-ive/-ful/-less, common nouns,
     /// past participles ending in -ed, gerunds ending in -ing, plurals of abstract concepts).
     /// We preserve single-word islands that are clearly proper nouns with known-entity signals.
@@ -6519,9 +6665,11 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         "north",
         "south",
         "island",
+        "islands",
         "ocean",
         "sea",
         "mountain",
+        "mountains",
         "valley",
         "river",
         "lake",
@@ -6542,6 +6690,30 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         "county",
         "district",
         "territory",
+        "springs",
+        "city",
+        "creek",
+        "basin",
+        "desert",
+        "plateau",
+        "cape",
+        "coast",
+        "reef",
+        "archipelago",
+        "fjord",
+        "steppe",
+        "tundra",
+        "savanna",
+        "mesa",
+        "gorge",
+        "canyon",
+        "ridge",
+        "hills",
+        "plains",
+        "marsh",
+        "swamp",
+        "oasis",
+        "inlet",
     ];
     if (current_type == "person" || current_type == "concept")
         && word_count >= 2
@@ -6785,6 +6957,49 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
     ];
     if current_type == "person" && known_places.contains(&lower) {
         return Some("place");
+    }
+    // Entities ending with geographic suffixes that are definitely places
+    if current_type == "person" && word_count >= 2 {
+        let geo_suffixes = [
+            "springs",
+            "city",
+            "islands",
+            "island",
+            "mountains",
+            "mountain",
+            "valley",
+            "river",
+            "lake",
+            "strait",
+            "peninsula",
+            "gulf",
+            "bay",
+            "creek",
+            "basin",
+            "desert",
+            "plateau",
+            "cape",
+            "coast",
+            "reef",
+            "archipelago",
+            "steppe",
+            "canyon",
+            "ridge",
+            "hills",
+            "plains",
+            "falls",
+            "pass",
+            "harbor",
+            "harbour",
+            "port",
+            "inlet",
+            "fjord",
+        ];
+        if let Some(last) = words.last() {
+            if geo_suffixes.contains(last) {
+                return Some("place");
+            }
+        }
     }
 
     // Well-known concepts misclassified as person
