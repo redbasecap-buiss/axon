@@ -878,9 +878,9 @@ pub fn estimated_diameter(
             let d = visited[&v];
             if let Some(neighbors) = adj.get(&v) {
                 for &w in neighbors {
-                    if !visited.contains_key(&w) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = visited.entry(w) {
                         let nd = d + 1;
-                        visited.insert(w, nd);
+                        e.insert(nd);
                         if nd > max_dist {
                             max_dist = nd;
                         }

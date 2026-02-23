@@ -2003,13 +2003,12 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     }
 
     // Reject entities that look like sentence fragments (contain common verbs/prepositions sequences)
-    if lower.contains("noted ") || lower.contains("known ") || lower.contains("called ") {
-        if lower.starts_with("noted ")
+    if (lower.contains("noted ") || lower.contains("known ") || lower.contains("called "))
+        && (lower.starts_with("noted ")
             || lower.starts_with("known ")
-            || lower.starts_with("called ")
-        {
-            return false;
-        }
+            || lower.starts_with("called "))
+    {
+        return false;
     }
 
     true
@@ -2263,9 +2262,7 @@ fn extract_capitalized(
     entities: &mut Vec<(String, String)>,
 ) {
     // Split on em-dashes and en-dashes before processing to avoid cross-clause entities
-    let sub_sentences: Vec<&str> = sentence
-        .split(|c: char| c == '—' || c == '–' || c == '|')
-        .collect();
+    let sub_sentences: Vec<&str> = sentence.split(['—', '–', '|']).collect();
     for sub in sub_sentences {
         extract_capitalized_inner(sub, all_stops, entities);
     }

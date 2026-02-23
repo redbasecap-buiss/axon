@@ -232,10 +232,8 @@ fn is_noise_name(name: &str) -> bool {
         }
     }
     // Possessive forms as standalone entities (e.g. "Newton's", "Switzerland's") — noise
-    if lower_trimmed.ends_with("'s") || lower_trimmed.ends_with("'s") {
-        if word_count <= 2 {
-            return true;
-        }
+    if (lower_trimmed.ends_with("'s") || lower_trimmed.ends_with("'s")) && word_count <= 2 {
+        return true;
     }
     // Entities ending with common suffix noise
     if lower_trimmed.ends_with(" et al") || lower_trimmed.ends_with(" et al.") {
@@ -311,7 +309,7 @@ fn is_noise_name(name: &str) -> bool {
         "phillips",
         "admiral",
     ];
-    if word_count == 1 && generic_caps.contains(&lower_trimmed.as_ref()) {
+    if word_count == 1 && generic_caps.contains(&lower_trimmed) {
         return true;
     }
     // Names ending with "Journal", "During", "Resting", "Commentary" etc. — citation/fragment noise
@@ -374,7 +372,7 @@ fn is_noise_name(name: &str) -> bool {
     }
     // Names that are just titles/honorifics
     let title_only = ["sir", "mr", "mrs", "ms", "dr", "prof", "lord", "lady"];
-    if word_count == 1 && title_only.contains(&lower_trimmed.as_ref()) {
+    if word_count == 1 && title_only.contains(&lower_trimmed) {
         return true;
     }
     false
@@ -614,7 +612,7 @@ impl<'a> Prometheus<'a> {
 
         // Find pairs sharing ≥2 sources but not directly connected
         let mut pair_sources: HashMap<(i64, i64), usize> = HashMap::new();
-        for (_src, entities) in &source_entities {
+        for entities in source_entities.values() {
             let ids: Vec<i64> = entities.iter().copied().collect();
             for i in 0..ids.len() {
                 for j in (i + 1)..ids.len() {
@@ -2984,7 +2982,7 @@ impl<'a> Prometheus<'a> {
             by_type.entry(etype).or_default().push(idx);
         }
 
-        for (_etype, indices) in &by_type {
+        for indices in by_type.values() {
             // Skip huge groups to avoid O(n²) explosion
             if indices.len() > 2000 {
                 continue;
@@ -3240,7 +3238,7 @@ impl<'a> Prometheus<'a> {
         }
 
         let mut subsumptions = Vec::new();
-        for (_etype, group) in &by_type {
+        for group in by_type.values() {
             if group.len() > 3000 {
                 continue; // skip huge groups
             }
@@ -4183,7 +4181,7 @@ impl<'a> Prometheus<'a> {
                             continue;
                         }
                         // Prefer same-type matches, then shorter names
-                        let dominated = best.map_or(false, |(_, blen, bsame)| {
+                        let dominated = best.is_some_and(|(_, blen, bsame)| {
                             (same_type && !bsame) || (same_type == bsame && cname.len() < blen)
                         });
                         if best.is_none() || dominated {
@@ -4370,7 +4368,7 @@ impl<'a> Prometheus<'a> {
             let lower = e.name.to_lowercase();
             // Check if this word appears as a component of connected entities
             if let Some(matches) = word_to_connected.get(&lower) {
-                if matches.len() >= 1 {
+                if !matches.is_empty() {
                     // This single word is a fragment of at least one known entity
                     // Check if it has any facts worth keeping
                     let facts = self.brain.get_facts_for(e.id)?;
@@ -5031,7 +5029,7 @@ impl<'a> Prometheus<'a> {
         let ids: Vec<i64> = adj.keys().copied().collect();
 
         for &node in &ids {
-            let node_comm = communities.get(&node).copied().unwrap_or(usize::MAX);
+            let _node_comm = communities.get(&node).copied().unwrap_or(usize::MAX);
             let neighbours = match adj.get(&node) {
                 Some(n) => n,
                 None => continue,
@@ -5408,7 +5406,7 @@ impl<'a> Prometheus<'a> {
         let mut candidates: Vec<(String, String, f64, String)> = Vec::new();
         let mut seen_pairs: HashSet<(usize, usize)> = HashSet::new();
 
-        for (_word, indices) in &word_index {
+        for indices in word_index.values() {
             if indices.len() > 200 {
                 continue; // Skip extremely common words
             }
@@ -5490,7 +5488,7 @@ impl<'a> Prometheus<'a> {
 
                     // 5. Co-source frequency
                     let mut co_sources = 0usize;
-                    for (_src, src_entities) in &source_entities {
+                    for src_entities in source_entities.values() {
                         if src_entities.contains(&ea.id) && src_entities.contains(&eb.id) {
                             co_sources += 1;
                         }
@@ -6545,10 +6543,11 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         "district",
         "territory",
     ];
-    if current_type == "person" || current_type == "concept" {
-        if word_count >= 2 && words.iter().any(|w| place_words.contains(w)) {
-            return Some("place");
-        }
+    if (current_type == "person" || current_type == "concept")
+        && word_count >= 2
+        && words.iter().any(|w| place_words.contains(w))
+    {
+        return Some("place");
     }
 
     // Place → person: names that look like "Firstname Lastname" classified as place
@@ -6715,10 +6714,11 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         "kernel",
         "driver",
     ];
-    if current_type == "organization" && word_count >= 2 {
-        if words.iter().any(|w| tech_words.contains(w)) {
-            return Some("technology");
-        }
+    if current_type == "organization"
+        && word_count >= 2
+        && words.iter().any(|w| tech_words.contains(w))
+    {
+        return Some("technology");
     }
 
     // Concept-like names classified as person (multi-word abstractions)
@@ -6740,14 +6740,15 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         "number",
         "formula",
     ];
-    if current_type == "person" && word_count >= 2 {
-        if words.iter().any(|w| concept_indicators.contains(w)) {
-            // But "Euler's theorem" should be concept, "Leonhard Euler" should stay person
-            // Check: if the last word is a concept indicator, it's probably a concept
-            if let Some(last) = words.last() {
-                if concept_indicators.contains(last) {
-                    return Some("concept");
-                }
+    if current_type == "person"
+        && word_count >= 2
+        && words.iter().any(|w| concept_indicators.contains(w))
+    {
+        // But "Euler's theorem" should be concept, "Leonhard Euler" should stay person
+        // Check: if the last word is a concept indicator, it's probably a concept
+        if let Some(last) = words.last() {
+            if concept_indicators.contains(last) {
+                return Some("concept");
             }
         }
     }
@@ -6782,7 +6783,7 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         "northern europe",
         "southern europe",
     ];
-    if current_type == "person" && known_places.contains(&lower.as_ref()) {
+    if current_type == "person" && known_places.contains(&lower) {
         return Some("place");
     }
 
@@ -6807,13 +6808,13 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         "new scientist",
         "scientific american",
     ];
-    if current_type == "person" && known_concepts.contains(&lower.as_ref()) {
+    if current_type == "person" && known_concepts.contains(&lower) {
         return Some("concept");
     }
 
     // Organizations misclassified as person
     let known_orgs: &[&str] = &["new scientist", "scientific american", "nature"];
-    if current_type == "person" && known_orgs.contains(&lower.as_ref()) {
+    if current_type == "person" && known_orgs.contains(&lower) {
         return Some("organization");
     }
 
@@ -6828,7 +6829,7 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
             "fundamentals",
             "correspondents",
         ];
-        if concept_singles.contains(&lower.as_ref()) {
+        if concept_singles.contains(&lower) {
             return Some("concept");
         }
     }
