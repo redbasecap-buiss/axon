@@ -2103,6 +2103,23 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "neurodynamics",
     "janissaries",
     "malaria",
+    // Added 2026-02-23 round 5: capitalized common English words appearing as false entities
+    "access",
+    "across",
+    "again",
+    "another",
+    "because",
+    "finally",
+    "however",
+    "indeed",
+    "instead",
+    "later",
+    "longer",
+    "often",
+    "still",
+    "therefore",
+    "today",
+    "together",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).

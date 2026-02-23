@@ -2925,6 +2925,9 @@ impl<'a> Prometheus<'a> {
         // Single-word island reconnection (match isolated single-word entities to connected multi-word entities)
         let single_word_reconnected = self.reconnect_single_word_islands().unwrap_or(0);
 
+        // Cross-component merger: find entities in different components with matching names
+        let cross_component_merged = self.merge_cross_component_duplicates().unwrap_or(0);
+
         // Refine generic predicates using entity type pairs
         let predicates_refined = self.refine_associated_with().unwrap_or(0);
         let contributed_refined = self.refine_contributed_to().unwrap_or(0);
@@ -2981,7 +2984,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, \
              {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
@@ -3050,6 +3053,7 @@ impl<'a> Prometheus<'a> {
             token_reconnected,
             name_containment_reconnected,
             single_word_reconnected,
+            cross_component_merged,
             predicates_refined,
             contributed_refined,
             promoted,
@@ -3896,7 +3900,24 @@ impl<'a> Prometheus<'a> {
         let mut confirmed = 0usize;
         let mut rejected = 0usize;
 
+        // Pre-load pattern weights for strategy-aware resolution
+        let weights = self.get_pattern_weights().unwrap_or_default();
+        let weight_map: HashMap<String, f64> = weights
+            .iter()
+            .map(|w| (w.pattern_type.clone(), w.weight))
+            .collect();
+
         for h in hyps.iter_mut() {
+            // Strategy-aware rejection: auto-reject hypotheses from strategies with
+            // historically very low confirmation rates (weight < 0.10)
+            let source_weight = weight_map.get(&h.pattern_source).copied().unwrap_or(1.0);
+            if source_weight < 0.10 && h.confidence < 0.6 {
+                self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                self.record_outcome(&h.pattern_source, false)?;
+                rejected += 1;
+                continue;
+            }
+
             // Check if a path exists between subject and object (evidence of relation)
             if h.object != "?" {
                 // Reject single-word fragment pairs (NLP noise like "Grace" → "Hopper")
@@ -9378,6 +9399,60 @@ impl<'a> Prometheus<'a> {
     /// Uses type-aware scoring: same-type matches are preferred, and high-value types
     /// (person, place, concept, technology) get a boost.
     /// Only reconnects when the match is unambiguous (one clearly best candidate).
+    /// Merge entities in different connected components that share the same name.
+    /// This directly reduces graph fragmentation by unifying duplicate entities
+    /// that ended up in separate components due to different source pages.
+    pub fn merge_cross_component_duplicates(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let components = crate::graph::connected_components(self.brain)?;
+        if components.len() < 2 {
+            return Ok(0);
+        }
+
+        // Map entity_id → component_index
+        let mut entity_component: HashMap<i64, usize> = HashMap::new();
+        for (ci, comp) in components.iter().enumerate() {
+            for &eid in comp {
+                entity_component.insert(eid, ci);
+            }
+        }
+
+        // Group entities by lowercase name
+        let mut name_groups: HashMap<String, Vec<(i64, usize)>> = HashMap::new();
+        for e in &entities {
+            if is_noise_type(&e.entity_type) || is_noise_name(&e.name) || e.name.len() < 3 {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            let comp_idx = entity_component.get(&e.id).copied().unwrap_or(usize::MAX);
+            name_groups.entry(lower).or_default().push((e.id, comp_idx));
+        }
+
+        let mut merged = 0usize;
+        for (_name, group) in &name_groups {
+            if group.len() < 2 {
+                continue;
+            }
+            // Find the entity in the largest component (most connected)
+            let best = group
+                .iter()
+                .min_by_key(|(_, ci)| {
+                    // Lower component index = larger component (sorted desc by size)
+                    *ci
+                })
+                .copied();
+            if let Some((keep_id, keep_comp)) = best {
+                for &(eid, comp_idx) in group {
+                    if eid != keep_id && comp_idx != keep_comp {
+                        self.brain.merge_entities(eid, keep_id)?;
+                        merged += 1;
+                    }
+                }
+            }
+        }
+        Ok(merged)
+    }
+
     pub fn reconnect_single_word_islands(&self) -> Result<usize> {
         let entities = self.brain.all_entities()?;
         let relations = self.brain.all_relations()?;
