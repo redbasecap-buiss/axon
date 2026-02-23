@@ -273,6 +273,75 @@ fn is_noise_name(name: &str) -> bool {
     if word_count > 6 {
         return true;
     }
+    // Names starting with gerunds/verbs — NLP extraction errors (e.g. "Using Hilbert", "Subscribe Soviet")
+    if word_count >= 2 {
+        let first_word = lower_trimmed.split_whitespace().next().unwrap_or("");
+        let verb_starts = [
+            "using",
+            "including",
+            "according",
+            "following",
+            "resulting",
+            "subscribe",
+            "completing",
+            "completions",
+            "completeness",
+            "containing",
+            "considering",
+            "regarding",
+            "concerning",
+            "involving",
+            "requiring",
+            "providing",
+            "offering",
+            "describing",
+            "explaining",
+            "demonstrating",
+            "establishing",
+            "developing",
+            "producing",
+            "creating",
+            "building",
+            "making",
+            "taking",
+            "giving",
+            "getting",
+            "having",
+            "being",
+            "doing",
+            "going",
+            "coming",
+            "keeping",
+            "leaving",
+            "putting",
+            "running",
+            "setting",
+            "turning",
+            "working",
+            "playing",
+            "moving",
+            "living",
+            "starting",
+            "beginning",
+            "opening",
+            "closing",
+            "ending",
+            "finishing",
+            "applying",
+            "measuring",
+            "calculating",
+            "computing",
+            "processing",
+            "representing",
+            "connecting",
+            "combining",
+            "comparing",
+            "assuming",
+        ];
+        if verb_starts.contains(&first_word) {
+            return true;
+        }
+    }
     // Names containing verbs typical of sentence fragments
     if word_count > 3 {
         let words: Vec<&str> = lower_trimmed.split_whitespace().collect();
@@ -841,40 +910,69 @@ impl<'a> Prometheus<'a> {
                     .insert(r.subject_id);
             }
         }
-        let ids: Vec<i64> = neighbours.keys().copied().collect();
+        // Only consider entities with ≥2 neighbours (otherwise can't share any)
+        let ids: Vec<i64> = neighbours
+            .iter()
+            .filter(|(_, nb)| nb.len() >= min_shared.max(2))
+            .map(|(&id, _)| id)
+            .collect();
+        // Cap at 2000 highest-degree entities to avoid O(n²) blowup
+        let mut ids_sorted: Vec<(i64, usize)> =
+            ids.iter().map(|&id| (id, neighbours[&id].len())).collect();
+        ids_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        ids_sorted.truncate(2000);
+        let ids: Vec<i64> = ids_sorted.into_iter().map(|(id, _)| id).collect();
+        // Use inverted index: for each neighbour, list which candidates have it
+        let mut inv: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (idx, &id) in ids.iter().enumerate() {
+            for &nb in &neighbours[&id] {
+                inv.entry(nb).or_default().push(idx);
+            }
+        }
+        // Count shared neighbours via inverted index (avoids full O(n²))
+        let mut pair_shared: HashMap<(usize, usize), usize> = HashMap::new();
+        for posting in inv.values() {
+            if posting.len() < 2 || posting.len() > 200 {
+                continue; // skip hubs to avoid quadratic blowup within posting lists
+            }
+            for i in 0..posting.len() {
+                for j in (i + 1)..posting.len() {
+                    let key = (posting[i].min(posting[j]), posting[i].max(posting[j]));
+                    *pair_shared.entry(key).or_insert(0) += 1;
+                }
+            }
+        }
         let mut patterns = Vec::new();
-        for i in 0..ids.len() {
-            for j in (i + 1)..ids.len() {
-                let a = ids[i];
-                let b = ids[j];
+        for ((i, j), shared) in &pair_shared {
+            if *shared >= min_shared {
+                let a = ids[*i];
+                let b = ids[*j];
                 let na = &neighbours[&a];
                 let nb = &neighbours[&b];
-                let shared: usize = na.intersection(nb).count();
-                if shared >= min_shared {
-                    let union_size = na.union(nb).count();
-                    let jaccard = if union_size > 0 {
-                        shared as f64 / union_size as f64
-                    } else {
-                        0.0
-                    };
-                    let a_name = self.entity_name(a)?;
-                    let b_name = self.entity_name(b)?;
-                    patterns.push(Pattern {
-                        id: 0,
-                        pattern_type: PatternType::CoOccurrence,
-                        entities_involved: vec![a_name.clone(), b_name.clone()],
-                        frequency: shared as i64,
-                        last_seen: now_str(),
-                        description: format!(
-                            "{} and {} share {} neighbours (Jaccard: {:.2})",
-                            a_name, b_name, shared, jaccard
-                        ),
-                    });
-                }
+                let union_size = na.union(nb).count();
+                let jaccard = if union_size > 0 {
+                    *shared as f64 / union_size as f64
+                } else {
+                    0.0
+                };
+                let a_name = self.entity_name(a)?;
+                let b_name = self.entity_name(b)?;
+                patterns.push(Pattern {
+                    id: 0,
+                    pattern_type: PatternType::CoOccurrence,
+                    entities_involved: vec![a_name.clone(), b_name.clone()],
+                    frequency: *shared as i64,
+                    last_seen: now_str(),
+                    description: format!(
+                        "{} and {} share {} neighbours (Jaccard: {:.2})",
+                        a_name, b_name, shared, jaccard
+                    ),
+                });
             }
         }
         // Sort by frequency descending for better results
         patterns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        patterns.truncate(100);
         Ok(patterns)
     }
 
@@ -924,12 +1022,15 @@ impl<'a> Prometheus<'a> {
             connected.insert(key);
         }
 
-        // Only consider entities appearing in ≥1 source
-        let candidates: Vec<(i64, &HashSet<String>)> = entity_sources
+        // Only consider entities appearing in ≥2 sources (reduces noise + O(n²) cost)
+        let mut candidates: Vec<(i64, &HashSet<String>)> = entity_sources
             .iter()
-            .filter(|(_, sources)| !sources.is_empty())
+            .filter(|(_, sources)| sources.len() >= 2)
             .map(|(&id, sources)| (id, sources))
             .collect();
+        // Cap at 1000 entities with most sources to avoid O(n²) blowup
+        candidates.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        candidates.truncate(1000);
 
         let mut patterns = Vec::new();
         for i in 0..candidates.len() {
@@ -1389,6 +1490,10 @@ impl<'a> Prometheus<'a> {
         let mut holes = Vec::new();
         let mut seen: HashSet<(i64, i64)> = HashSet::new();
         for (&a, a_nb) in &adj {
+            // Skip high-degree nodes to avoid O(d²) blowup
+            if a_nb.len() > 50 {
+                continue;
+            }
             let a_list: Vec<i64> = a_nb.iter().copied().collect();
             for i in 0..a_list.len() {
                 for j in (i + 1)..a_list.len() {
@@ -1410,6 +1515,9 @@ impl<'a> Prometheus<'a> {
                         }
                     }
                 }
+            }
+            if holes.len() >= 200 {
+                break;
             }
         }
         Ok(holes)
@@ -2246,6 +2354,13 @@ impl<'a> Prometheus<'a> {
         if ta_weight >= 0.05 {
             let ta_hyps = self.generate_hypotheses_from_type_affinity()?;
             all_hypotheses.extend(ta_hyps);
+        }
+
+        // 2j. Neighborhood overlap link prediction (robust to degree imbalance)
+        let no_weight = self.get_pattern_weight("neighborhood_overlap")?;
+        if no_weight >= 0.05 {
+            let no_hyps = self.generate_hypotheses_from_neighborhood_overlap()?;
+            all_hypotheses.extend(no_hyps);
         }
 
         // 3. Island entities as gaps
@@ -6575,6 +6690,46 @@ impl<'a> Prometheus<'a> {
         Ok(hypotheses)
     }
 
+    /// Generate hypotheses using neighborhood overlap coefficient.
+    /// Finds unconnected node pairs with high overlap in their neighborhoods.
+    /// Overlap = |N(a) ∩ N(b)| / min(|N(a)|, |N(b)|) — robust to degree imbalance.
+    pub fn generate_hypotheses_from_neighborhood_overlap(&self) -> Result<Vec<Hypothesis>> {
+        let overlaps = crate::graph::neighborhood_overlap(self.brain, 0.3, 30)?;
+        let mut hypotheses = Vec::new();
+        for (a_id, b_id, score) in &overlaps {
+            let a_name = self.entity_name(*a_id)?;
+            let b_name = self.entity_name(*b_id)?;
+            if is_noise_name(&a_name) || is_noise_name(&b_name) {
+                continue;
+            }
+            let confidence = (0.45 + score * 0.4).min(0.90);
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.clone(),
+                predicate: "related_to".to_string(),
+                object: b_name.clone(),
+                confidence,
+                evidence_for: vec![format!(
+                    "Neighborhood overlap coefficient {:.3} — strong structural similarity",
+                    score
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!(
+                        "{} and {} share a large fraction of their neighbors",
+                        a_name, b_name
+                    ),
+                    format!("Overlap score: {:.2} (≥0.3 threshold)", score),
+                    "High neighborhood overlap strongly predicts missing links".to_string(),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "neighborhood_overlap".to_string(),
+            });
+        }
+        Ok(hypotheses)
+    }
+
     pub fn generate_hypotheses_from_near_misses(&self) -> Result<Vec<Hypothesis>> {
         let near_misses = self.find_near_miss_connections(30)?;
         let mut hypotheses = Vec::new();
@@ -9536,6 +9691,195 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         ];
         if concept_singles.contains(&lower) {
             return Some("concept");
+        }
+    }
+
+    // Well-known countries/regions misclassified as concept or person
+    let known_countries: &[&str] = &[
+        "netherlands",
+        "germany",
+        "france",
+        "spain",
+        "portugal",
+        "italy",
+        "greece",
+        "turkey",
+        "egypt",
+        "india",
+        "china",
+        "japan",
+        "korea",
+        "russia",
+        "brazil",
+        "mexico",
+        "canada",
+        "australia",
+        "argentina",
+        "chile",
+        "peru",
+        "colombia",
+        "venezuela",
+        "cuba",
+        "iran",
+        "iraq",
+        "syria",
+        "afghanistan",
+        "pakistan",
+        "bangladesh",
+        "myanmar",
+        "thailand",
+        "vietnam",
+        "indonesia",
+        "malaysia",
+        "singapore",
+        "taiwan",
+        "mongolia",
+        "nepal",
+        "cambodia",
+        "laos",
+        "austria",
+        "switzerland",
+        "belgium",
+        "poland",
+        "czechia",
+        "hungary",
+        "romania",
+        "bulgaria",
+        "serbia",
+        "croatia",
+        "ukraine",
+        "belarus",
+        "lithuania",
+        "latvia",
+        "estonia",
+        "finland",
+        "sweden",
+        "norway",
+        "denmark",
+        "iceland",
+        "ireland",
+        "scotland",
+        "wales",
+        "england",
+        "morocco",
+        "algeria",
+        "tunisia",
+        "libya",
+        "sudan",
+        "ethiopia",
+        "kenya",
+        "tanzania",
+        "uganda",
+        "nigeria",
+        "ghana",
+        "senegal",
+        "cameroon",
+        "madagascar",
+        "mozambique",
+        "zimbabwe",
+        "zambia",
+        "angola",
+        "namibia",
+        "botswana",
+        "somalia",
+        "eritrea",
+        "djibouti",
+        "gabon",
+        "congo",
+        "shropshire",
+        "bradford",
+        "clermont",
+        "esztergom",
+        "lombardy",
+        "saxony",
+        "bavaria",
+        "bohemia",
+        "moravia",
+        "silesia",
+        "alsace",
+        "catalonia",
+        "andalusia",
+        "galicia",
+        "brittany",
+        "normandy",
+        "flanders",
+        "wallonia",
+        "tyrol",
+        "transylvania",
+        "thrace",
+        "mesopotamia",
+        "anatolia",
+        "persia",
+        "judea",
+        "canaan",
+        "baltic",
+        "siberia",
+        "sahara",
+        "patagonia",
+        "scandinavia",
+        "balkans",
+        "caucasus",
+        "crimea",
+        "cyprus",
+        "crete",
+        "sardinia",
+        "sicily",
+        "corsica",
+        "sumatra",
+        "borneo",
+        "java",
+        "ceylon",
+        "formosa",
+        "kashmir",
+        "tibet",
+        "manchuria",
+        "xinjiang",
+    ];
+    if (current_type == "concept" || current_type == "person") && word_count == 1 {
+        if known_countries.contains(&lower) {
+            return Some("place");
+        }
+    }
+
+    // Multi-word place names misclassified as concept (e.g. "Spanish Netherlands", "Ottoman Empire")
+    if current_type == "concept" && word_count >= 2 {
+        let place_compounds: &[&str] = &[
+            "spanish netherlands",
+            "austrian netherlands",
+            "southern netherlands",
+            "ottoman empire",
+            "roman empire",
+            "byzantine empire",
+            "british empire",
+            "russian empire",
+            "persian empire",
+            "mughal empire",
+            "holy roman empire",
+            "soviet union",
+            "austro-hungarian empire",
+            "habsburg empire",
+            "west germany",
+            "east germany",
+            "west berlin",
+            "east berlin",
+            "north korea",
+            "south korea",
+            "north vietnam",
+            "south vietnam",
+            "saudi arabia",
+            "south africa",
+            "costa rica",
+            "puerto rico",
+            "new guinea",
+            "new caledonia",
+            "new hebrides",
+            "rhine valley",
+            "nile delta",
+            "ganges plain",
+            "fertile crescent",
+        ];
+        if place_compounds.contains(&lower) {
+            return Some("place");
         }
     }
 

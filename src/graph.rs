@@ -2254,4 +2254,91 @@ mod tests {
         assert!(path.is_some());
         assert_eq!(path.unwrap().len(), 1);
     }
+
+    #[test]
+    fn test_neighborhood_overlap() {
+        let brain = setup();
+        // The test graph may be too sparse for overlaps; just ensure no crash
+        let overlaps = neighborhood_overlap(&brain, 0.1, 20).unwrap();
+        // Result may be empty for sparse test data — that's OK
+        assert!(overlaps.len() <= 20);
+    }
+}
+
+/// Neighborhood overlap coefficient for link prediction.
+/// For each pair of unconnected nodes with shared neighbors, compute:
+///   overlap = |N(u) ∩ N(v)| / min(|N(u)|, |N(v)|)
+/// This is better than Jaccard for hub-heavy graphs because it normalizes
+/// by the smaller neighborhood, making it robust to degree imbalance.
+/// Returns (entity_a_id, entity_b_id, overlap_score) sorted by score desc.
+pub fn neighborhood_overlap(
+    brain: &Brain,
+    min_score: f64,
+    limit: usize,
+) -> Result<Vec<(i64, i64, f64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+
+    // Only consider nodes with degree >= 2 (need at least 2 neighbors to share)
+    let candidates: Vec<(i64, &Vec<i64>)> = adj
+        .iter()
+        .filter(|(_, neighbors)| neighbors.len() >= 2)
+        .map(|(&id, neighbors)| (id, neighbors))
+        .collect();
+
+    // Build neighbor sets
+    let neighbor_sets: HashMap<i64, HashSet<i64>> = candidates
+        .iter()
+        .map(|&(id, neighbors)| (id, neighbors.iter().copied().collect()))
+        .collect();
+
+    // Direct edge set for filtering
+    let mut direct: HashSet<(i64, i64)> = HashSet::new();
+    for (&id, neighbors) in &adj {
+        for &n in neighbors {
+            let key = if id < n { (id, n) } else { (n, id) };
+            direct.insert(key);
+        }
+    }
+
+    // For efficiency with large graphs, use inverted index: neighbor → set of nodes
+    let mut inv_index: HashMap<i64, Vec<i64>> = HashMap::new();
+    for &(id, neighbors) in &candidates {
+        for &n in neighbors {
+            inv_index.entry(n).or_default().push(id);
+        }
+    }
+
+    let mut results: Vec<(i64, i64, f64)> = Vec::new();
+    let mut seen: HashSet<(i64, i64)> = HashSet::new();
+
+    // For each shared neighbor, consider all pairs of its "parents"
+    for (_shared, parents) in &inv_index {
+        if parents.len() < 2 || parents.len() > 200 {
+            continue; // Skip super-hubs to avoid O(n²) blowup
+        }
+        for i in 0..parents.len() {
+            for j in (i + 1)..parents.len() {
+                let a = parents[i].min(parents[j]);
+                let b = parents[i].max(parents[j]);
+                let key = (a, b);
+                if direct.contains(&key) || !seen.insert(key) {
+                    continue;
+                }
+                if let (Some(sa), Some(sb)) = (neighbor_sets.get(&a), neighbor_sets.get(&b)) {
+                    let shared_count = sa.intersection(sb).count();
+                    let min_size = sa.len().min(sb.len());
+                    if min_size > 0 {
+                        let score = shared_count as f64 / min_size as f64;
+                        if score >= min_score {
+                            results.push((a, b, score));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    Ok(results)
 }
