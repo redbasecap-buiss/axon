@@ -1542,6 +1542,12 @@ impl<'a> Prometheus<'a> {
         // Purge noise entities (cleanup)
         let purged = self.purge_noise_entities().unwrap_or(0);
 
+        // Predicate normalization (reduce "is" overuse)
+        let normalized = self.normalize_predicates().unwrap_or(0);
+
+        // Island reconnection
+        let reconnected = self.reconnect_islands().unwrap_or(0);
+
         let summary = format!(
             "Discovered {} patterns, generated {} new hypotheses ({} confirmed, {} rejected), \
              auto-resolved {} existing ({}✓ {}✗), {} island entities, {} meaningful relations, \
@@ -1549,7 +1555,8 @@ impl<'a> Prometheus<'a> {
              {} prioritized gaps, {} decayed, {} island clusters, \
              predicate diversity: {}/{} ({:.0}% diverse), \
              {} fuzzy duplicates ({} auto-merge, {} auto-merged), {} sparse topic domains, \
-             {} name subsumptions found, {} noise entities purged",
+             {} name subsumptions found, {} noise entities purged, \
+             {} predicates normalized, {} islands reconnected",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1575,6 +1582,8 @@ impl<'a> Prometheus<'a> {
             sparse_topics,
             subsumptions.len(),
             purged,
+            normalized,
+            reconnected,
         );
 
         Ok(DiscoveryReport {
@@ -2429,6 +2438,105 @@ impl<'a> Prometheus<'a> {
             }
         }
         Ok(purged)
+    }
+
+    /// Normalize generic predicates to more specific ones using context.
+    /// E.g., "Person X is Concept Y" → "Person X instance_of Concept Y".
+    /// Returns count of relations updated.
+    pub fn normalize_predicates(&self) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let id_to_type: HashMap<i64, String> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.clone()))
+            .collect();
+
+        let mut updated = 0usize;
+        for r in &relations {
+            if !is_generic_predicate(&r.predicate) {
+                continue;
+            }
+            let subj_type = id_to_type
+                .get(&r.subject_id)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            let obj_type = id_to_type
+                .get(&r.object_id)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+
+            let new_pred = match (r.predicate.as_str(), subj_type, obj_type) {
+                ("is", "person", "concept") => Some("instance_of"),
+                ("is", "person", "organization") => Some("member_of"),
+                ("is", "organization", "concept") => Some("classified_as"),
+                ("is", "place", "concept") => Some("classified_as"),
+                ("is", "concept", "concept") => Some("subclass_of"),
+                ("is", _, "place") => Some("located_in"),
+                ("has", "person", "concept") => Some("possesses"),
+                ("has", "organization", "concept") => Some("features"),
+                ("was", "person", "concept") => Some("formerly"),
+                ("was", "person", "organization") => Some("formerly_at"),
+                _ => None,
+            };
+
+            if let Some(np) = new_pred {
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE relations SET predicate = ?1 WHERE subject_id = ?2 AND object_id = ?3 AND predicate = ?4",
+                        params![np, r.subject_id, r.object_id, r.predicate],
+                    )?;
+                    Ok(())
+                })?;
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
+    /// Reconnect island entities to the main graph using exact name matching.
+    /// If an island entity's name appears as a substring of a connected entity
+    /// (or vice versa), create a "same_as" or "related_to" relation.
+    /// Returns count of new connections made.
+    pub fn reconnect_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Build lookup: lowercase name → connected entity id
+        let mut name_to_connected: HashMap<String, i64> = HashMap::new();
+        for e in &entities {
+            if connected.contains(&e.id)
+                && !is_noise_type(&e.entity_type)
+                && !is_noise_name(&e.name)
+            {
+                name_to_connected.insert(e.name.to_lowercase(), e.id);
+            }
+        }
+
+        // Find islands with exact name matches to connected entities
+        let mut reconnected = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) || is_noise_type(&e.entity_type) || is_noise_name(&e.name)
+            {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            // Exact match with a connected entity (different ID, same name)
+            if let Some(&hub_id) = name_to_connected.get(&lower) {
+                if hub_id != e.id {
+                    // Merge: island → hub
+                    self.brain.merge_entities(e.id, hub_id)?;
+                    reconnected += 1;
+                    continue;
+                }
+            }
+        }
+        Ok(reconnected)
     }
 
     pub fn report_markdown(&self, report: &DiscoveryReport) -> String {
