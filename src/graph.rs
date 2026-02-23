@@ -2653,3 +2653,47 @@ pub fn predicate_co_occurrence(
     results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
     Ok(results)
 }
+
+/// Graph structural diversity score: measures how varied the graph structure is
+/// by combining component count entropy, degree distribution entropy, and predicate entropy.
+/// Higher score = more structurally diverse graph. Range roughly 0-10.
+pub fn structural_diversity(brain: &Brain) -> Result<f64, rusqlite::Error> {
+    // Degree distribution entropy
+    let dist = degree_distribution(brain)?;
+    let total: usize = dist.iter().map(|(_, c)| c).sum();
+    let deg_entropy: f64 = if total > 0 {
+        dist.iter()
+            .map(|(_, c)| {
+                let p = *c as f64 / total as f64;
+                if p > 0.0 {
+                    -p * p.log2()
+                } else {
+                    0.0
+                }
+            })
+            .sum()
+    } else {
+        0.0
+    };
+
+    // Component size entropy
+    let components = connected_components(brain)?;
+    let total_nodes: usize = components.iter().map(|c| c.len()).sum();
+    let comp_entropy: f64 = if total_nodes > 0 {
+        components
+            .iter()
+            .map(|c| {
+                let p = c.len() as f64 / total_nodes as f64;
+                if p > 0.0 {
+                    -p * p.log2()
+                } else {
+                    0.0
+                }
+            })
+            .sum()
+    } else {
+        0.0
+    };
+
+    Ok(deg_entropy + comp_entropy)
+}

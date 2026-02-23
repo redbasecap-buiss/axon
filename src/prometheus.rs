@@ -273,6 +273,48 @@ fn is_noise_name(name: &str) -> bool {
     if word_count > 6 {
         return true;
     }
+    // Names starting with adverbs/conjunctions — NLP extraction errors (e.g. "Eventually Pierre", "Conversely West Berlin")
+    if word_count >= 2 {
+        let first_word = lower_trimmed.split_whitespace().next().unwrap_or("");
+        let adverb_starts = [
+            "eventually",
+            "conversely",
+            "subsequently",
+            "additionally",
+            "alternatively",
+            "approximately",
+            "essentially",
+            "historically",
+            "immediately",
+            "increasingly",
+            "particularly",
+            "primarily",
+            "significantly",
+            "specifically",
+            "traditionally",
+            "ultimately",
+            "apparently",
+            "presumably",
+            "supposedly",
+            "meanwhile",
+            "similarly",
+            "likewise",
+            "initially",
+            "originally",
+            "typically",
+            "generally",
+            "basically",
+            "naturally",
+            "notably",
+            "merely",
+            "largely",
+            "partly",
+            "partly",
+        ];
+        if adverb_starts.contains(&first_word) {
+            return true;
+        }
+    }
     // Names starting with gerunds/verbs — NLP extraction errors (e.g. "Using Hilbert", "Subscribe Soviet")
     if word_count >= 2 {
         let first_word = lower_trimmed.split_whitespace().next().unwrap_or("");
@@ -2477,6 +2519,15 @@ impl<'a> Prometheus<'a> {
                 let s_first = h.subject.split_whitespace().next().unwrap_or("");
                 let o_first = h.object.split_whitespace().next().unwrap_or("");
                 if !s_first.is_empty() && s_first == o_first {
+                    return false;
+                }
+            }
+            // Skip hypotheses where both entities share the same last word (categorical, not insightful)
+            // e.g., "Caroline Islands" ↔ "Faroe Islands" — same-suffix entities cluster trivially
+            if h.object != "?" {
+                let s_last = h.subject.split_whitespace().last().unwrap_or("");
+                let o_last = h.object.split_whitespace().last().unwrap_or("");
+                if !s_last.is_empty() && s_last.len() > 3 && s_last == o_last {
                     return false;
                 }
             }
