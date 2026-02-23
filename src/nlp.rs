@@ -2384,6 +2384,15 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         if lower.contains(' ') && leading_verbs.contains(&first_word) {
             return false;
         }
+        // Reject verb-phrase entities like "Uses MapReduce", "Has Many", "Is Known"
+        let verb_prefixes: &[&str] = &[
+            "uses", "has", "is", "was", "are", "were", "can", "could", "would", "should", "does",
+            "did", "will", "shall", "may", "might", "must", "needs", "gets", "makes", "takes",
+            "gives", "keeps", "lets", "shows", "says", "tells", "asks", "runs", "sets", "puts",
+        ];
+        if lower.contains(' ') && verb_prefixes.contains(&first_word) {
+            return false;
+        }
     }
 
     // All-uppercase check: reject unless it's a short acronym (≤6 chars)
@@ -3535,6 +3544,52 @@ fn classify_entity_type(name: &str) -> &'static str {
                 "nubian",
                 "mitteilungen",
                 "pacific",
+                "art",
+                "glacier",
+                "station",
+                "manor",
+                "horn",
+                "girls",
+                "groups",
+                "phase",
+                "need",
+                "one",
+                "chase",
+                "legion",
+                "saga",
+                "papyrus",
+                "horde",
+                "conspiracy",
+                "campaign",
+                "expedition",
+                "rebellion",
+                "revolution",
+                "massacre",
+                "crisis",
+                "conflict",
+                "conquest",
+                "siege",
+                "famine",
+                "plague",
+                "canal",
+                "strait",
+                "peninsula",
+                "archipelago",
+                "corridor",
+                "frontier",
+                "border",
+                "dynasty",
+                "empire",
+                "kingdom",
+                "republic",
+                "federation",
+                "commonwealth",
+                "caliphate",
+                "sultanate",
+                "khanate",
+                "principality",
+                "oblast",
+                "voivodeship",
             ];
             // Also reject if any word is a common English word (not a name)
             let has_common_word = words.iter().any(|w| {
