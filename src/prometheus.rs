@@ -3127,7 +3127,7 @@ impl<'a> Prometheus<'a> {
                         && lower.ends_with('s')
                         && !lower.ends_with("ss")
                         && lower.len() <= 10
-                        && lower.chars().next().map_or(false, |c| c.is_lowercase());
+                        && lower.chars().next().is_some_and(|c| c.is_lowercase());
                     // Only purge generic-looking single words for concepts
                     (is_concept_or_unknown && too_generic && lower.len() < 15) || is_plural_common
                 }
@@ -7538,8 +7538,15 @@ impl<'a> Prometheus<'a> {
                 .iter()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             {
-                // Require higher minimum score to avoid spurious matches
-                if best_score < 3.0 {
+                // Require minimum score (lower for person-type since surname sharing is strong signal)
+                let min_score = if entity_map.get(&island_id).map(|e| e.entity_type.as_str())
+                    == Some("person")
+                {
+                    2.0
+                } else {
+                    3.0
+                };
+                if best_score < min_score {
                     continue;
                 }
                 let island_name = entity_map
@@ -7848,6 +7855,52 @@ impl<'a> Prometheus<'a> {
             "virtual",
             "mobile",
             "wireless",
+            "syndrome",
+            "doctrine",
+            "ideology",
+            "heresy",
+            "orthodoxy",
+            "islam",
+            "christianity",
+            "buddhism",
+            "hinduism",
+            "judaism",
+            "crown",
+            "throne",
+            "dynasty",
+            "braid",
+            "golden",
+            "eternal",
+            "sacred",
+            "holy",
+            "divine",
+            "celestial",
+            "infernal",
+            "captains",
+            "great",
+            "grand",
+            "royal",
+            "imperial",
+            "nuovo",
+            "cimento",
+            "prinzipien",
+            "physikalische",
+            "friedhöfen",
+            "minería",
+            "sublemma",
+            "raspberry",
+            "powerful",
+            "dissenting",
+            "academies",
+            "academy",
+            "penny",
+            "post",
+            "exchange",
+            "steam",
+            "power",
+            "fire",
+            "trials",
+            "brothers",
         ]
         .into_iter()
         .collect();
@@ -7911,9 +7964,27 @@ impl<'a> Prometheus<'a> {
                 .any(|w| concept_words.contains(w.as_str()));
             let has_place_word = lower_words.iter().any(|w| place_words.contains(w.as_str()));
 
-            if has_concept_word || has_place_word {
-                // Double check: does it look like "Firstname ConceptWord"? (e.g., "Ada Works" is noise)
-                // But "Isaac Newton" should NOT match — "Newton" isn't in concept_words
+            // Names with non-ASCII characters that look like non-English phrases (not person names)
+            let has_non_english_phrase = e
+                .name
+                .chars()
+                .any(|c| matches!(c, 'ü' | 'ö' | 'ä' | 'é' | 'è' | 'ñ' | 'í'))
+                && lower_words.len() >= 2
+                && !lower_words.iter().all(|w| {
+                    w.chars()
+                        .next()
+                        .is_some_and(|c| c.is_uppercase() || w.len() <= 3)
+                });
+            // Check for all-lowercase multi-word (sentence fragment, not a name)
+            let all_lowercase_words = words
+                .iter()
+                .all(|w| w.chars().next().is_some_and(|c| c.is_lowercase()));
+
+            if has_concept_word
+                || has_place_word
+                || (has_non_english_phrase && e.confidence < 0.8)
+                || (all_lowercase_words && words.len() >= 2)
+            {
                 eprintln!(
                     "  [mistyped-person-purge] deleting island '{}' (id={})",
                     e.name, e.id
