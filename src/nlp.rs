@@ -1748,15 +1748,63 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     }
 
     // Reject Wikipedia language sidebar entries (e.g. "Afrikaans Alemannisch", "Lombard Latviešu")
-    if lower.contains("afrikaans")
-        || lower.contains("alemannisch")
-        || lower.contains("azərbaycanca")
-        || lower.contains("беларус")
-        || lower.contains("čeština")
-        || lower.contains("latviešu")
-        || lower.contains("lombard")
-    {
-        return false;
+    const WIKI_LANG_FRAGMENTS: &[&str] = &[
+        "afrikaans",
+        "alemannisch",
+        "azərbaycanca",
+        "беларус",
+        "čeština",
+        "latviešu",
+        "lombard",
+        "bosanski",
+        "català",
+        "nedersaksies",
+        "plattdüütsch",
+        "asturianu",
+        "esperanto",
+        "galego",
+        "interlingua",
+        "occitan",
+        "piemontèis",
+        "sardu",
+        "scots",
+        "shqip",
+        "sicilianu",
+        "ślůnski",
+        "srpskohrvatski",
+        "tatarça",
+        "walon",
+        "žemaitėška",
+    ];
+    for frag in WIKI_LANG_FRAGMENTS {
+        if lower.contains(frag) {
+            return false;
+        }
+    }
+
+    // Reject citation/reference fragments commonly misidentified as person names
+    const CITATION_FRAGMENTS: &[&str] = &[
+        "chapter",
+        "vol ",
+        " vol",
+        "théorie",
+        "abhandlungen",
+        "gesammelte",
+        "handbuch",
+        "integrals",
+        "operators",
+        "thermodynamik",
+        "annalen",
+        "zeitschrift",
+        "proceedings",
+        "transactions",
+        "bulletin",
+        "comptes rendus",
+    ];
+    for frag in CITATION_FRAGMENTS {
+        if lower.contains(frag) {
+            return false;
+        }
     }
 
     // Reject single long CamelCase words (code identifiers, not knowledge entities)
