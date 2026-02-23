@@ -1239,6 +1239,139 @@ pub fn inter_community_density(brain: &Brain) -> Result<(usize, usize, f64), rus
     Ok((intra, inter, ratio))
 }
 
+/// Save a snapshot of graph health metrics for historical trend tracking.
+/// Creates the snapshots table if needed, then inserts current metrics.
+/// Returns the snapshot id.
+pub fn save_graph_snapshot(brain: &Brain) -> Result<i64, rusqlite::Error> {
+    brain.with_conn(|conn| {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS graph_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                taken_at TEXT NOT NULL,
+                entities INTEGER NOT NULL,
+                relations INTEGER NOT NULL,
+                components INTEGER NOT NULL,
+                largest_component_pct REAL NOT NULL,
+                avg_degree REAL NOT NULL,
+                isolated INTEGER NOT NULL,
+                density REAL NOT NULL,
+                fragmentation REAL NOT NULL DEFAULT 0.0,
+                modularity REAL NOT NULL DEFAULT 0.0
+            );",
+        )?;
+        Ok(())
+    })?;
+
+    let health = graph_health(brain)?;
+    let density_val = graph_density(brain)?;
+    let frag = fragmentation_score(brain).unwrap_or(1.0);
+    let communities = louvain_communities(brain)?;
+    let mod_val = modularity(brain, &communities).unwrap_or(0.0);
+
+    let entities = health.get("entities").copied().unwrap_or(0.0) as i64;
+    let relations = health.get("relations").copied().unwrap_or(0.0) as i64;
+    let components = health.get("components").copied().unwrap_or(0.0) as i64;
+    let largest_pct = health.get("largest_component_pct").copied().unwrap_or(0.0);
+    let avg_deg = health.get("avg_degree").copied().unwrap_or(0.0);
+    let isolated = health.get("isolated_entities").copied().unwrap_or(0.0) as i64;
+
+    brain.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO graph_snapshots (taken_at, entities, relations, components, largest_component_pct, avg_degree, isolated, density, fragmentation, modularity)
+             VALUES (datetime('now'), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![entities, relations, components, largest_pct, avg_deg, isolated, density_val, frag, mod_val],
+        )?;
+        Ok(conn.last_insert_rowid())
+    })
+}
+
+/// Get recent graph snapshots for trend analysis.
+/// Returns Vec of (taken_at, entities, relations, components, largest_pct, avg_degree, isolated, density, fragmentation, modularity).
+pub fn get_graph_snapshots(
+    brain: &Brain,
+    limit: usize,
+) -> Result<Vec<(String, i64, i64, i64, f64, f64, i64, f64, f64, f64)>, rusqlite::Error> {
+    brain.with_conn(|conn| {
+        // Table might not exist yet
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='graph_snapshots'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(vec![]);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT taken_at, entities, relations, components, largest_component_pct, avg_degree, isolated, density, fragmentation, modularity
+             FROM graph_snapshots ORDER BY id DESC LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, f64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, f64>(7)?,
+                row.get::<_, f64>(8)?,
+                row.get::<_, f64>(9)?,
+            ))
+        })?;
+        rows.collect()
+    })
+}
+
+/// Format a trend comparison between two snapshots.
+pub fn format_trend(
+    current: &(String, i64, i64, i64, f64, f64, i64, f64, f64, f64),
+    previous: &(String, i64, i64, i64, f64, f64, i64, f64, f64, f64),
+) -> String {
+    let delta = |curr: f64, prev: f64| -> String {
+        let d = curr - prev;
+        if d.abs() < 0.001 {
+            "→".to_string()
+        } else if d > 0.0 {
+            format!("↑{:.1}", d)
+        } else {
+            format!("↓{:.1}", d.abs())
+        }
+    };
+    let delta_i = |curr: i64, prev: i64| -> String {
+        let d = curr - prev;
+        if d == 0 {
+            "→".to_string()
+        } else if d > 0 {
+            format!("↑{}", d)
+        } else {
+            format!("↓{}", d.abs())
+        }
+    };
+    format!(
+        "Since {}: entities {} ({}), relations {} ({}), components {} ({}), \
+         largest {:.1}% ({}), avg_degree {:.2} ({}), isolated {} ({}), \
+         density {:.6} ({}), fragmentation {:.4} ({})",
+        previous.0,
+        current.1,
+        delta_i(current.1, previous.1),
+        current.2,
+        delta_i(current.2, previous.2),
+        current.3,
+        delta_i(current.3, previous.3),
+        current.4,
+        delta(current.4, previous.4),
+        current.5,
+        delta(current.5, previous.5),
+        current.6,
+        delta_i(current.6, previous.6),
+        current.7,
+        delta(current.7, previous.7),
+        current.8,
+        delta(current.8, previous.8),
+    )
+}
+
 /// Graph fragmentation score: 0.0 = perfectly connected, 1.0 = completely fragmented.
 /// Based on fraction of node pairs that are unreachable from each other.
 pub fn fragmentation_score(brain: &Brain) -> Result<f64, rusqlite::Error> {

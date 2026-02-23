@@ -1678,6 +1678,133 @@ impl<'a> Prometheus<'a> {
         })
     }
 
+    /// Get calibrated initial confidence for a pattern source.
+    /// Uses historical confirmation rate as Bayesian prior, with smoothing.
+    /// New/unknown sources get 0.5 (neutral), proven sources get boosted,
+    /// unreliable sources get suppressed.
+    pub fn calibrated_confidence(&self, pattern_source: &str, base: f64) -> Result<f64> {
+        let weight = self.get_pattern_weight(pattern_source)?;
+        // Blend base confidence with historical weight using Bayesian update.
+        // Weight of 1.0 = no data (neutral), so don't adjust.
+        // Weight close to 0.0 = unreliable source, suppress.
+        // Weight close to 1.0 = no data or very good.
+        let weights = self.get_pattern_weights()?;
+        let source_data = weights.iter().find(|w| w.pattern_type == pattern_source);
+        let total_observations = source_data
+            .map(|w| w.confirmations + w.rejections)
+            .unwrap_or(0);
+
+        if total_observations < 3 {
+            // Too few data points — use base confidence
+            return Ok(base);
+        }
+        // Bayesian blend: shift base toward observed weight
+        let alpha = (total_observations as f64 / (total_observations as f64 + 10.0)).min(0.7);
+        let calibrated = base * (1.0 - alpha) + weight * alpha;
+        Ok(calibrated.clamp(0.05, 0.95))
+    }
+
+    /// Deduplicate hypotheses by entity pair: if multiple hypotheses exist about
+    /// the same (subject, object) pair, keep only the highest-confidence one.
+    /// Returns count of hypotheses removed.
+    pub fn dedup_hypotheses_by_pair(&self) -> Result<usize> {
+        let hyps = self.list_hypotheses(None)?;
+        let mut by_pair: HashMap<(String, String), Vec<(i64, f64, String)>> = HashMap::new();
+
+        for h in &hyps {
+            // Normalize pair order
+            let pair = if h.subject <= h.object {
+                (h.subject.clone(), h.object.clone())
+            } else {
+                (h.object.clone(), h.subject.clone())
+            };
+            by_pair.entry(pair).or_default().push((
+                h.id,
+                h.confidence,
+                h.status.as_str().to_string(),
+            ));
+        }
+
+        let mut removed = 0usize;
+        for (_pair, mut entries) in by_pair {
+            if entries.len() < 2 {
+                continue;
+            }
+            // Sort: confirmed first, then by confidence descending
+            entries.sort_by(|a, b| {
+                let status_ord = |s: &str| -> i32 {
+                    match s {
+                        "confirmed" => 0,
+                        "testing" => 1,
+                        "proposed" => 2,
+                        _ => 3,
+                    }
+                };
+                status_ord(&a.2)
+                    .cmp(&status_ord(&b.2))
+                    .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            // Keep the best, remove the rest
+            for &(id, _, _) in &entries[1..] {
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM hypotheses WHERE id = ?1", params![id])?;
+                    Ok(())
+                })?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Track discovery velocity: count of new patterns, hypotheses, and confirmations
+    /// per discovery run. Persists to a tracking table for trend analysis.
+    pub fn track_discovery_velocity(
+        &self,
+        patterns: usize,
+        hypotheses: usize,
+        confirmed: usize,
+        rejected: usize,
+    ) -> Result<()> {
+        self.brain.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS discovery_velocity (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_at TEXT NOT NULL,
+                    patterns_found INTEGER NOT NULL,
+                    hypotheses_generated INTEGER NOT NULL,
+                    confirmed INTEGER NOT NULL,
+                    rejected INTEGER NOT NULL
+                );"
+            )?;
+            conn.execute(
+                "INSERT INTO discovery_velocity (run_at, patterns_found, hypotheses_generated, confirmed, rejected) VALUES (datetime('now'), ?1, ?2, ?3, ?4)",
+                params![patterns as i64, hypotheses as i64, confirmed as i64, rejected as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Get discovery velocity trend (recent runs).
+    pub fn get_velocity_trend(&self, limit: usize) -> Result<Vec<(String, i64, i64, i64, i64)>> {
+        self.brain.with_conn(|conn| {
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='discovery_velocity'",
+                [],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(vec![]);
+            }
+            let mut stmt = conn.prepare(
+                "SELECT run_at, patterns_found, hypotheses_generated, confirmed, rejected FROM discovery_velocity ORDER BY id DESC LIMIT ?1"
+            )?;
+            let rows = stmt.query_map(params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?))
+            })?;
+            rows.collect::<Result<Vec<_>>>()
+        })
+    }
+
     /// Discovery score: how many confirmed hypotheses involve each entity.
     pub fn discovery_scores(&self) -> Result<HashMap<String, i64>> {
         let confirmed = self.list_hypotheses(Some(HypothesisStatus::Confirmed))?;
@@ -1841,6 +1968,13 @@ impl<'a> Prometheus<'a> {
         let bridges = self.find_bridge_entities().unwrap_or_default();
         let island_clusters = self.cluster_islands_for_crawl().unwrap_or_default();
 
+        // Apply calibrated confidence to all hypotheses before scoring
+        for h in all_hypotheses.iter_mut() {
+            if let Ok(cal) = self.calibrated_confidence(&h.pattern_source, h.confidence) {
+                h.confidence = cal;
+            }
+        }
+
         // Decay old hypotheses (meta-learning)
         let decayed = self.decay_old_hypotheses(7).unwrap_or(0);
 
@@ -1920,9 +2054,36 @@ impl<'a> Prometheus<'a> {
         // Fragment island purging (remove single-word fragments like "Lovelace", "Hopper")
         let fragment_purged = self.purge_fragment_islands().unwrap_or(0);
 
+        // Hypothesis pair deduplication (prevent bloat from multiple runs)
+        let pair_deduped = self.dedup_hypotheses_by_pair().unwrap_or(0);
+
         // K-core analysis: find the dense backbone
         let (max_k, core_members) =
             crate::graph::densest_core(self.brain, 3).unwrap_or((0, vec![]));
+
+        // Save graph snapshot for trend tracking
+        let _snapshot_id = crate::graph::save_graph_snapshot(self.brain).unwrap_or(0);
+
+        // Track discovery velocity
+        let _ = self.track_discovery_velocity(
+            all_patterns.len(),
+            all_hypotheses.len(),
+            confirmed,
+            rejected,
+        );
+
+        // Get trend comparison if previous snapshots exist
+        let trend_line = {
+            let snapshots = crate::graph::get_graph_snapshots(self.brain, 2).unwrap_or_default();
+            if snapshots.len() >= 2 {
+                format!(
+                    ", trend: {}",
+                    crate::graph::format_trend(&snapshots[0], &snapshots[1])
+                )
+            } else {
+                String::new()
+            }
+        };
 
         let summary = format!(
             "Discovered {} patterns, generated {} new hypotheses ({} confirmed, {} rejected), \
@@ -1936,7 +2097,7 @@ impl<'a> Prometheus<'a> {
              {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected, \
              {} fact-inferred relations, {} name cross-references, \
              {} compound relations + {} compound merged, {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
-             {} fragment-purged, k-core: k={} with {} entities in dense backbone",
+             {} fragment-purged, {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1979,8 +2140,10 @@ impl<'a> Prometheus<'a> {
             suffix_merged,
             word_merged,
             fragment_purged,
+            pair_deduped,
             max_k,
             core_members.len(),
+            trend_line,
         );
 
         Ok(DiscoveryReport {

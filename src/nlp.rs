@@ -1707,6 +1707,46 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject "Category:" prefixed entries (Wikipedia metadata)
+    if lower.starts_with("category:") {
+        return false;
+    }
+
+    // Reject "-language" suffix entries (Wikipedia language metadata like "French-language")
+    if lower.ends_with("-language") {
+        return false;
+    }
+
+    // Reject compound adjectives used as standalone entities (e.g. "Self-supervised", "Object-oriented")
+    if !lower.contains(' ') && lower.contains('-') {
+        let parts: Vec<&str> = lower.split('-').collect();
+        if let Some(last) = parts.last() {
+            let adjective_suffixes = [
+                "oriented",
+                "supported",
+                "influenced",
+                "specific",
+                "supervised",
+                "augmented",
+                "based",
+                "driven",
+                "related",
+                "powered",
+                "enabled",
+                "aware",
+                "like",
+                "ready",
+                "free",
+                "rich",
+                "poor",
+                "dependent",
+            ];
+            if adjective_suffixes.iter().any(|s| last == s) {
+                return false;
+            }
+        }
+    }
+
     // Reject Wikipedia language sidebar entries (e.g. "Afrikaans Alemannisch", "Lombard Latviešu")
     if lower.contains("afrikaans")
         || lower.contains("alemannisch")
