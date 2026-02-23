@@ -2021,6 +2021,11 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject "See X" cross-references (e.g. "See Gibbs", "See Analytic")
+    if lower.starts_with("see ") && lower.split_whitespace().count() <= 3 {
+        return false;
+    }
+
     // Reject "-language" suffix entries (Wikipedia language metadata like "French-language")
     if lower.ends_with("-language") {
         return false;
@@ -2269,6 +2274,32 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     // Reject single-word entities classified as "person" — real people have at least two words
     if etype == "person" && !lower.contains(' ') {
         return false;
+    }
+
+    // Reject "person" entities containing publishing/academic terms
+    if etype == "person" {
+        let person_blacklist_words = [
+            "publishers",
+            "verlag",
+            "buchverlag",
+            "thesis",
+            "github",
+            "sourceforge",
+            "youtube",
+            "proquest",
+            "docs",
+            "robot",
+            "stack",
+            "chip",
+            "monthly",
+            "notices",
+            "recurrent",
+            "falcon",
+            "mirror",
+        ];
+        if person_blacklist_words.iter().any(|w| lower.contains(w)) {
+            return false;
+        }
     }
 
     // Reject "person" entities containing tech acronyms (3+ consecutive uppercase letters)
