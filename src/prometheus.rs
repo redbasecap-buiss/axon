@@ -1229,10 +1229,14 @@ impl<'a> Prometheus<'a> {
             connected.insert(key);
         }
 
+        // Hub penalty: entities appearing in too many sources produce noisy PMI.
+        // Cap at 30% of all sources — beyond that, co-occurrence is expected, not surprising.
+        let hub_threshold = (n * 0.3).max(5.0) as usize;
+
         // Only consider entities appearing in ≥2 sources (reduces noise + O(n²) cost)
         let mut candidates: Vec<(i64, &HashSet<String>)> = entity_sources
             .iter()
-            .filter(|(_, sources)| sources.len() >= 2)
+            .filter(|(_, sources)| sources.len() >= 2 && sources.len() <= hub_threshold)
             .map(|(&id, sources)| (id, sources))
             .collect();
         // Cap at 1000 entities with most sources to avoid O(n²) blowup
@@ -2273,6 +2277,42 @@ impl<'a> Prometheus<'a> {
                         sname, pred, oname, conf
                     ));
                     h.confidence = (h.confidence + 0.2).min(1.0);
+                }
+            }
+        }
+
+        // Check for shared neighbors (indirect evidence of relatedness)
+        if h.object != "?" {
+            if let (Some(s_ent), Some(o_ent)) = (
+                self.brain.get_entity_by_name(&h.subject)?,
+                self.brain.get_entity_by_name(&h.object)?,
+            ) {
+                let s_rels = self.brain.get_relations_for(s_ent.id)?;
+                let o_rels = self.brain.get_relations_for(o_ent.id)?;
+                let s_neighbors: HashSet<String> = s_rels
+                    .iter()
+                    .flat_map(|(sn, _, on, _)| [sn.clone(), on.clone()])
+                    .collect();
+                let o_neighbors: HashSet<String> = o_rels
+                    .iter()
+                    .flat_map(|(sn, _, on, _)| [sn.clone(), on.clone()])
+                    .collect();
+                let shared: Vec<&String> = s_neighbors
+                    .intersection(&o_neighbors)
+                    .filter(|n| *n != &h.subject && *n != &h.object)
+                    .collect();
+                if shared.len() >= 2 {
+                    h.evidence_for.push(format!(
+                        "Shared {} neighbors: {}",
+                        shared.len(),
+                        shared
+                            .iter()
+                            .take(3)
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                    h.confidence = (h.confidence + 0.05 * shared.len() as f64).min(1.0);
                 }
             }
         }

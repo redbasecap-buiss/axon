@@ -2967,3 +2967,103 @@ pub fn knowledge_deserts(brain: &Brain) -> Result<Vec<(String, usize, f64, f64)>
     deserts.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
     Ok(deserts)
 }
+
+/// Neighborhood cosine similarity for link prediction.
+/// cos(u,v) = |Γ(u) ∩ Γ(v)| / sqrt(|Γ(u)| * |Γ(v)|)
+/// More robust than Jaccard for heterogeneous degree distributions — doesn't penalize
+/// high-degree nodes as heavily, which matters in scale-free knowledge graphs.
+/// Returns top `limit` pairs above `min_sim` threshold.
+pub fn cosine_similarity_predict(
+    brain: &Brain,
+    min_sim: f64,
+    limit: usize,
+) -> Result<Vec<(i64, i64, f64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let relations = brain.all_relations()?;
+    let mut connected: HashSet<(i64, i64)> = HashSet::new();
+    for r in &relations {
+        let key = if r.subject_id < r.object_id {
+            (r.subject_id, r.object_id)
+        } else {
+            (r.object_id, r.subject_id)
+        };
+        connected.insert(key);
+    }
+
+    // Only consider nodes with degree >= 3 (need overlap to be meaningful)
+    let mut candidates: Vec<(i64, usize)> = adj
+        .iter()
+        .filter(|(_, nb)| nb.len() >= 3)
+        .map(|(&id, nb)| (id, nb.len()))
+        .collect();
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.truncate(800);
+
+    let nb_sets: HashMap<i64, HashSet<i64>> = candidates
+        .iter()
+        .map(|&(id, _)| {
+            let set: HashSet<i64> = adj[&id].iter().copied().collect();
+            (id, set)
+        })
+        .collect();
+
+    let mut results: Vec<(i64, i64, f64)> = Vec::new();
+    for i in 0..candidates.len() {
+        let (a, da) = candidates[i];
+        let na = &nb_sets[&a];
+        for j in (i + 1)..candidates.len() {
+            let (b, db) = candidates[j];
+            let key = if a < b { (a, b) } else { (b, a) };
+            if connected.contains(&key) {
+                continue;
+            }
+            let nb = &nb_sets[&b];
+            let intersection = na.intersection(nb).count() as f64;
+            if intersection == 0.0 {
+                continue;
+            }
+            let denom = (da as f64 * db as f64).sqrt();
+            let sim = intersection / denom;
+            if sim >= min_sim {
+                results.push((a, b, sim));
+            }
+        }
+    }
+    results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    Ok(results)
+}
+
+/// Hub authority analysis: identify entities that are critical connectors between
+/// different entity types. Returns (entity_id, type_diversity, degree, authority_score).
+/// Entities connecting many different types are more valuable bridge nodes.
+pub fn type_bridge_authority(
+    brain: &Brain,
+    limit: usize,
+) -> Result<Vec<(i64, usize, usize, f64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let entities = brain.all_entities()?;
+    let id_to_type: HashMap<i64, String> = entities
+        .iter()
+        .map(|e| (e.id, e.entity_type.clone()))
+        .collect();
+
+    let mut results: Vec<(i64, usize, usize, f64)> = Vec::new();
+    for (&node, neighbors) in &adj {
+        if neighbors.len() < 3 {
+            continue;
+        }
+        let neighbor_types: HashSet<&String> =
+            neighbors.iter().filter_map(|n| id_to_type.get(n)).collect();
+        let type_div = neighbor_types.len();
+        if type_div < 2 {
+            continue;
+        }
+        // Authority = degree * type_diversity_bonus
+        let authority = neighbors.len() as f64 * (type_div as f64).ln();
+        results.push((node, type_div, neighbors.len(), authority));
+    }
+    results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    Ok(results)
+}
