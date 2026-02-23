@@ -1673,11 +1673,17 @@ impl<'a> Prometheus<'a> {
         // Name subsumption detection (abbreviated entity forms)
         let subsumptions = self.find_name_subsumptions().unwrap_or_default();
 
+        // Fix misclassified entity types
+        let types_fixed = self.fix_entity_types().unwrap_or(0);
+
         // Purge noise entities (cleanup)
         let purged = self.purge_noise_entities().unwrap_or(0);
 
         // Bulk quality cleanup (aggressive isolated noise removal)
         let bulk_cleaned = self.bulk_quality_cleanup().unwrap_or(0);
+
+        // Deep island cleanup (remove low-confidence isolated entities without facts)
+        let deep_cleaned = self.deep_island_cleanup(0.6).unwrap_or(0);
 
         // Predicate normalization (reduce "is" overuse)
         let normalized = self.normalize_predicates().unwrap_or(0);
@@ -1692,8 +1698,8 @@ impl<'a> Prometheus<'a> {
              {} prioritized gaps, {} decayed, {} island clusters, \
              predicate diversity: {}/{} ({:.0}% diverse), \
              {} fuzzy duplicates ({} auto-merge, {} auto-merged), {} sparse topic domains, \
-             {} name subsumptions found, {} noise entities purged, \
-             {} bulk cleaned, {} predicates normalized, {} islands reconnected",
+             {} name subsumptions found, {} types fixed, {} noise entities purged, \
+             {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1718,8 +1724,10 @@ impl<'a> Prometheus<'a> {
             auto_merged,
             sparse_topics,
             subsumptions.len(),
+            types_fixed,
             purged,
             bulk_cleaned,
+            deep_cleaned,
             normalized,
             reconnected,
         );
@@ -2850,6 +2858,70 @@ impl<'a> Prometheus<'a> {
         Ok(analysis)
     }
 
+    /// Fix misclassified entity types based on name heuristics.
+    /// E.g., "Middle East" as person → place, "Deep Neural Networks" as organization → concept.
+    /// Returns count of entities re-typed.
+    pub fn fix_entity_types(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let mut fixed = 0usize;
+
+        for e in &entities {
+            let lower = e.name.to_lowercase();
+            let words: Vec<&str> = lower.split_whitespace().collect();
+            let new_type = detect_correct_type(&lower, &words, &e.entity_type);
+            if let Some(nt) = new_type {
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE entities SET entity_type = ?1 WHERE id = ?2",
+                        params![nt, e.id],
+                    )?;
+                    Ok(())
+                })?;
+                fixed += 1;
+            }
+        }
+        Ok(fixed)
+    }
+
+    /// Deep island cleanup: remove isolated entities that provide no discovery value.
+    /// More aggressive than bulk_quality_cleanup — removes ALL isolated entities
+    /// with confidence below a threshold and no facts stored.
+    /// Returns count removed.
+    pub fn deep_island_cleanup(&self, min_confidence: f64) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        let mut removed = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            // Keep high-confidence entities and those with stored facts
+            if e.confidence >= min_confidence {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+            // Keep entities with well-known names (proper nouns, 2-3 word person names)
+            if is_likely_real_entity(&e.name, &e.entity_type) {
+                continue;
+            }
+            self.brain.with_conn(|conn| {
+                conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                Ok(())
+            })?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     pub fn report_markdown(&self, report: &DiscoveryReport) -> String {
         let mut md = String::new();
         md.push_str("# 🔬 PROMETHEUS Discovery Report\n\n");
@@ -2938,10 +3010,8 @@ fn is_extraction_noise(name: &str, entity_type: &str) -> bool {
     }
 
     // Names with mixed case patterns suggesting concatenated references
-    // e.g., "Browning Robert International Journal"
     if word_count >= 3 {
         let words: Vec<&str> = name.split_whitespace().collect();
-        // Check if it looks like "LastName FirstName SomethingElse" pattern
         let has_trailing_noise = [
             "During",
             "Resting",
@@ -2970,6 +3040,300 @@ fn is_extraction_noise(name: &str, entity_type: &str) -> bool {
 
     // Starts with "The " followed by a single generic word
     if lower.starts_with("the ") && word_count == 2 {
+        return true;
+    }
+
+    // Multi-word fragments containing prepositions/articles mid-name suggest sentence chunks
+    let filler_words = [
+        "of", "the", "and", "in", "on", "for", "to", "by", "from", "with", "at", "an", "or",
+    ];
+    if word_count >= 3 {
+        let words: Vec<&str> = lower.split_whitespace().collect();
+        let filler_count = words.iter().filter(|w| filler_words.contains(w)).count();
+        // If >40% of words are fillers + total is long, it's a sentence fragment
+        if filler_count >= 2 && filler_count as f64 / word_count as f64 > 0.35 {
+            return true;
+        }
+    }
+
+    // Names that look like "Topic1 Topic2 Topic3" — concatenated unrelated words
+    // Heuristic: 4+ capitalized words with no filler words = keyword salad
+    if word_count >= 4 {
+        let words: Vec<&str> = name.split_whitespace().collect();
+        let cap_count = words
+            .iter()
+            .filter(|w| w.starts_with(|c: char| c.is_uppercase()))
+            .count();
+        let filler = words
+            .iter()
+            .filter(|w| filler_words.contains(&w.to_lowercase().as_str()))
+            .count();
+        if cap_count >= 4 && filler == 0 {
+            return true;
+        }
+    }
+
+    // Entity names containing "MacTutor", "Archive", "ISBN" — reference noise
+    let ref_noise = ["mactutor", "archive", "isbn", "doi:", "arxiv", "springer"];
+    if ref_noise.iter().any(|r| lower.contains(r)) {
+        return true;
+    }
+
+    // Single generic words that got capitalized by NLP extractors
+    let generic_singles = [
+        "actor",
+        "areas",
+        "unity",
+        "proof",
+        "lieutenant",
+        "terminology",
+        "calinger",
+        "estreicher",
+        "improvement",
+        "superchip",
+        "location",
+        "outcome",
+        "abolition",
+        "pickwick",
+        "ruffini",
+        "newton",
+        "historically",
+        "politically",
+        "coalition",
+    ];
+    if word_count == 1 && generic_singles.contains(&lower.as_str()) {
+        return true;
+    }
+
+    // Type mismatches: places classified as persons, etc.
+    // "Crystal Palace" as person, "Middle East" as person, etc.
+    let place_indicators = [
+        "palace",
+        "east",
+        "west",
+        "north",
+        "south",
+        "island",
+        "ocean",
+        "mountain",
+        "valley",
+        "river",
+        "lake",
+        "strait",
+        "peninsula",
+        "gulf",
+        "bay",
+        "coast",
+        "border",
+        "frontier",
+        "colony",
+        "republic",
+        "kingdom",
+        "empire",
+    ];
+    if entity_type == "person" && word_count >= 2 {
+        let has_place_word = lower
+            .split_whitespace()
+            .any(|w| place_indicators.contains(&w));
+        if has_place_word {
+            return true;
+        }
+    }
+
+    // Names starting with "Source " — extraction artifact
+    if lower.starts_with("source ") {
+        return true;
+    }
+
+    // Names that are clearly descriptions, not entities: contain "Years", "Survey", "Overview"
+    let desc_words = [
+        "survey",
+        "overview",
+        "übersicht",
+        "origins",
+        "recognition",
+        "processing",
+        "diagnosing",
+        "improvement",
+        "dependability",
+        "embedded",
+        "quantum",
+        "symposium",
+    ];
+    if word_count >= 2 && desc_words.iter().any(|d| lower.contains(d)) {
+        return true;
+    }
+
+    // Entity name == entity type (e.g. entity "Actor" of type "concept")
+    if lower == entity_type {
+        return true;
+    }
+
+    false
+}
+
+/// Detect if an entity type is wrong based on name patterns.
+/// Returns Some(correct_type) or None if current type seems fine.
+fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Option<&'static str> {
+    let word_count = words.len();
+
+    // Place-like names classified as person/concept
+    let place_words = [
+        "east",
+        "west",
+        "north",
+        "south",
+        "island",
+        "ocean",
+        "sea",
+        "mountain",
+        "valley",
+        "river",
+        "lake",
+        "strait",
+        "peninsula",
+        "gulf",
+        "bay",
+        "colony",
+        "palace",
+        "castle",
+        "tower",
+        "bridge",
+        "airport",
+        "harbor",
+        "harbour",
+        "province",
+        "canton",
+        "county",
+        "district",
+        "territory",
+    ];
+    if current_type == "person" || current_type == "concept" {
+        if word_count >= 2 && words.iter().any(|w| place_words.contains(w)) {
+            return Some("place");
+        }
+    }
+
+    // Technology-like names classified as organization
+    let tech_words = [
+        "network",
+        "networks",
+        "algorithm",
+        "protocol",
+        "framework",
+        "neural",
+        "processor",
+        "architecture",
+        "compiler",
+        "runtime",
+        "kernel",
+        "driver",
+    ];
+    if current_type == "organization" && word_count >= 2 {
+        if words.iter().any(|w| tech_words.contains(w)) {
+            return Some("technology");
+        }
+    }
+
+    // Concept-like names classified as person (multi-word abstractions)
+    let concept_indicators = [
+        "theory",
+        "theorem",
+        "principle",
+        "effect",
+        "law",
+        "paradox",
+        "hypothesis",
+        "equation",
+        "conjecture",
+        "inequality",
+        "transform",
+        "function",
+        "distribution",
+        "constant",
+        "number",
+        "formula",
+    ];
+    if current_type == "person" && word_count >= 2 {
+        if words.iter().any(|w| concept_indicators.contains(w)) {
+            // But "Euler's theorem" should be concept, "Leonhard Euler" should stay person
+            // Check: if the last word is a concept indicator, it's probably a concept
+            if let Some(last) = words.last() {
+                if concept_indicators.contains(last) {
+                    return Some("concept");
+                }
+            }
+        }
+    }
+
+    // GDP/statistics entities are concepts, not persons
+    if current_type == "person"
+        && (lower.contains("gdp") || lower.contains("population") || lower.contains("statistics"))
+    {
+        return Some("concept");
+    }
+
+    None
+}
+
+/// Heuristic: is this likely a real, notable entity worth keeping even if isolated?
+fn is_likely_real_entity(name: &str, entity_type: &str) -> bool {
+    let lower = name.to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let word_count = words.len();
+
+    // Already filtered by noise checks
+    if is_noise_name(name) {
+        return false;
+    }
+
+    // Person names: 2-3 words, each capitalized, no noise words
+    if entity_type == "person" && (word_count == 2 || word_count == 3) {
+        let all_cap = name
+            .split_whitespace()
+            .all(|w| w.starts_with(|c: char| c.is_uppercase()));
+        if all_cap {
+            return true;
+        }
+    }
+
+    // Well-known organization patterns
+    if entity_type == "organization" && word_count <= 4 {
+        let org_suffixes = [
+            "inc",
+            "corp",
+            "ltd",
+            "gmbh",
+            "ag",
+            "llc",
+            "foundation",
+            "institute",
+            "university",
+            "college",
+            "party",
+            "association",
+        ];
+        if let Some(last) = words.last() {
+            if org_suffixes.iter().any(|s| last.ends_with(s)) {
+                return true;
+            }
+        }
+    }
+
+    // Places: 1-3 words, capitalized
+    if entity_type == "place" && word_count <= 3 {
+        let all_cap = name
+            .split_whitespace()
+            .all(|w| w.starts_with(|c: char| c.is_uppercase()));
+        if all_cap {
+            return true;
+        }
+    }
+
+    // Single well-capitalized words that are proper nouns
+    if word_count == 1 && name.starts_with(|c: char| c.is_uppercase()) && name.len() >= 4 {
+        // Likely a proper noun if it's not a common English word
+        // (imperfect heuristic, but keeps names like "Euler", "Zurich")
         return true;
     }
 
