@@ -2562,6 +2562,14 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject incomplete institutional fragments (e.g. "University Press", "Fellow of X")
+    if lower == "university press"
+        || lower.starts_with("fellow of ")
+        || lower.starts_with("physics of ")
+    {
+        return false;
+    }
+
     // Reject publisher/journal names (citation noise, not knowledge entities)
     const PUBLISHER_NAMES: &[&str] = &[
         "routledge",
@@ -2612,13 +2620,15 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
-    // Reject entities containing brackets or special parsing artifacts
+    // Reject entities containing brackets, special parsing artifacts, or fragment markers
     if trimmed.contains('[')
         || trimmed.contains(']')
         || trimmed.contains('{')
         || trimmed.contains('}')
         || trimmed.contains('(')
         || trimmed.contains(')')
+        || trimmed.contains('#')
+        || trimmed.contains('=')
     {
         return false;
     }
