@@ -319,6 +319,36 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "accessed",
     "published",
     "original",
+    // German Wikipedia UI
+    "abstimmungen",
+    "agglomerationen",
+    "anmelden",
+    "bearbeiten",
+    "benutzerkonto",
+    "diskussion",
+    "druckversion",
+    "einzelnachweise",
+    "hauptseite",
+    "kategorien",
+    "literatur",
+    "mitmachen",
+    "quellenangaben",
+    "quelltext",
+    "seiteninformationen",
+    "spenden",
+    "verlinkte",
+    "versionsgeschichte",
+    "weblinks",
+    "werkzeuge",
+    "zufälliger artikel",
+    // French Wikipedia UI
+    "accueil",
+    "afficher",
+    "contributions",
+    "historique",
+    "modifier",
+    "outils",
+    "portail",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -398,6 +428,24 @@ const PLACE_INDICATORS: &[&str] = &[
     "church",
     "mosque",
     "temple",
+    "canton",
+    "republic",
+    "kingdom",
+    "empire",
+    "territory",
+    "colony",
+    "prefecture",
+    "coast",
+    "cape",
+    "creek",
+    "plateau",
+    "basin",
+    "gorge",
+    "glacier",
+    "springs",
+    "falls",
+    "heights",
+    "hills",
 ];
 
 /// Words that indicate a concept/thing rather than a person.
@@ -1504,6 +1552,33 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "vital",
     "volatile",
     "wealthy",
+    // Additional single-word noise
+    "absolute",
+    "acoustic",
+    "adventure",
+    "algorithm",
+    "capture",
+    "cockade",
+    "cookery",
+    "highway",
+    "viewer",
+    "reference",
+    "reflections",
+    "breakup",
+    "breakout",
+    "emperors",
+    "subtitle",
+    "aftermath",
+    "wave",
+    "edge",
+    "fame",
+    "flag",
+    "gate",
+    "horn",
+    "look",
+    "mind",
+    "coat",
+    "tool",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -2047,6 +2122,16 @@ fn classify_entity_type(name: &str) -> &'static str {
     ];
     if let Some(first) = words.first() {
         if nationality_prefixes.contains(first) && words.len() >= 2 {
+            // Check if remaining words indicate place/org before defaulting to concept
+            if let Some(last) = words.last() {
+                let clean = last.trim_matches(|c: char| !c.is_alphanumeric());
+                if PLACE_INDICATORS.contains(&clean) {
+                    return "place";
+                }
+                if ORG_INDICATORS.contains(&clean) {
+                    return "organization";
+                }
+            }
             return "concept";
         }
     }
