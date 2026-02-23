@@ -3148,3 +3148,165 @@ pub fn community_leaders(
     results.truncate(limit);
     Ok(results)
 }
+
+/// Jaccard coefficient link prediction: J(x,y) = |Γ(x) ∩ Γ(y)| / |Γ(x) ∪ Γ(y)|.
+/// Normalizes for degree, so high-degree nodes don't dominate.
+/// Returns top `limit` predicted links as (entity_a, entity_b, score).
+pub fn jaccard_predict(
+    brain: &Brain,
+    limit: usize,
+) -> Result<Vec<(i64, i64, f64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let degree: HashMap<i64, usize> = adj
+        .iter()
+        .map(|(&id, neighbors)| (id, neighbors.len()))
+        .collect();
+
+    let relations = brain.all_relations()?;
+    let mut connected: HashSet<(i64, i64)> = HashSet::new();
+    for r in &relations {
+        let key = if r.subject_id < r.object_id {
+            (r.subject_id, r.object_id)
+        } else {
+            (r.object_id, r.subject_id)
+        };
+        connected.insert(key);
+    }
+
+    let candidates: Vec<i64> = degree
+        .iter()
+        .filter(|(_, &d)| d >= 2)
+        .map(|(&id, _)| id)
+        .collect();
+
+    let nb_sets: HashMap<i64, HashSet<i64>> = candidates
+        .iter()
+        .map(|&id| {
+            let set: HashSet<i64> = adj
+                .get(&id)
+                .map(|v| v.iter().copied().collect())
+                .unwrap_or_default();
+            (id, set)
+        })
+        .collect();
+
+    let mut sorted_candidates = candidates.clone();
+    sorted_candidates.sort_by(|a, b| {
+        degree
+            .get(b)
+            .unwrap_or(&0)
+            .cmp(&degree.get(a).unwrap_or(&0))
+    });
+
+    let mut scores: Vec<(i64, i64, f64)> = Vec::new();
+    let top: Vec<i64> = sorted_candidates.into_iter().take(500).collect();
+    for (i, &a) in top.iter().enumerate() {
+        let na = &nb_sets[&a];
+        for &b in &top[i + 1..] {
+            let key = if a < b { (a, b) } else { (b, a) };
+            if connected.contains(&key) {
+                continue;
+            }
+            let nb = &nb_sets[&b];
+            let intersection = na.intersection(nb).count();
+            if intersection == 0 {
+                continue;
+            }
+            let union = na.union(nb).count();
+            let score = intersection as f64 / union as f64;
+            scores.push((a, b, score));
+        }
+    }
+    scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    scores.truncate(limit);
+    Ok(scores)
+}
+
+/// Preferential attachment link prediction: PA(x,y) = |Γ(x)| * |Γ(y)|.
+/// Models "rich get richer" — high-degree nodes are more likely to form links.
+/// Returns top `limit` predicted links among unconnected pairs.
+pub fn preferential_attachment_predict(
+    brain: &Brain,
+    limit: usize,
+) -> Result<Vec<(i64, i64, f64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let degree: HashMap<i64, usize> = adj
+        .iter()
+        .map(|(&id, neighbors)| (id, neighbors.len()))
+        .collect();
+
+    let relations = brain.all_relations()?;
+    let mut connected: HashSet<(i64, i64)> = HashSet::new();
+    for r in &relations {
+        let key = if r.subject_id < r.object_id {
+            (r.subject_id, r.object_id)
+        } else {
+            (r.object_id, r.subject_id)
+        };
+        connected.insert(key);
+    }
+
+    // Only consider top-degree nodes (high-degree * high-degree = strongest signal)
+    let mut sorted: Vec<(i64, usize)> = degree.iter().map(|(&id, &d)| (id, d)).collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    let top: Vec<i64> = sorted.into_iter().take(300).map(|(id, _)| id).collect();
+
+    let mut scores: Vec<(i64, i64, f64)> = Vec::new();
+    for (i, &a) in top.iter().enumerate() {
+        let da = degree.get(&a).copied().unwrap_or(0);
+        for &b in &top[i + 1..] {
+            let key = if a < b { (a, b) } else { (b, a) };
+            if connected.contains(&key) {
+                continue;
+            }
+            let db = degree.get(&b).copied().unwrap_or(0);
+            scores.push((a, b, (da * db) as f64));
+        }
+    }
+    scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    scores.truncate(limit);
+    Ok(scores)
+}
+
+/// Katz centrality: sums paths of all lengths with exponential decay β^k.
+/// More robust than PageRank for small/sparse graphs.
+/// Returns (entity_id, katz_score) for top `limit` entities.
+pub fn katz_centrality(
+    brain: &Brain,
+    beta: f64,
+    max_depth: usize,
+    limit: usize,
+) -> Result<Vec<(i64, f64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let all_nodes: Vec<i64> = adj.keys().copied().collect();
+    let mut scores: HashMap<i64, f64> = HashMap::new();
+
+    // For each source, BFS up to max_depth, accumulating β^k for each reachable node
+    for &source in all_nodes.iter().take(500) {
+        let mut frontier: Vec<i64> = vec![source];
+        let mut visited: HashSet<i64> = HashSet::new();
+        visited.insert(source);
+        let mut depth = 0;
+        while depth < max_depth && !frontier.is_empty() {
+            depth += 1;
+            let weight = beta.powi(depth as i32);
+            let mut next_frontier = Vec::new();
+            for &node in &frontier {
+                if let Some(neighbors) = adj.get(&node) {
+                    for &nb in neighbors {
+                        *scores.entry(nb).or_insert(0.0) += weight;
+                        if visited.insert(nb) {
+                            next_frontier.push(nb);
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+        }
+    }
+
+    let mut result: Vec<(i64, f64)> = scores.into_iter().collect();
+    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    result.truncate(limit);
+    Ok(result)
+}

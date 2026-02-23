@@ -539,6 +539,50 @@ fn is_noise_name(name: &str) -> bool {
     if lower_trimmed.ends_with(" et al") || lower_trimmed.ends_with(" et al.") {
         return true;
     }
+    // Concatenated country/place lists (e.g. "Britain Prussia Russia Saxony", "France Spain Italy")
+    if word_count >= 3 {
+        let countries = [
+            "britain",
+            "france",
+            "germany",
+            "spain",
+            "italy",
+            "russia",
+            "prussia",
+            "austria",
+            "hungary",
+            "poland",
+            "sweden",
+            "norway",
+            "denmark",
+            "portugal",
+            "netherlands",
+            "belgium",
+            "switzerland",
+            "england",
+            "scotland",
+            "ireland",
+            "saxony",
+            "bavaria",
+            "bohemia",
+            "moravia",
+            "ottoman",
+            "byzantine",
+            "persia",
+            "china",
+            "japan",
+            "india",
+            "egypt",
+            "greece",
+            "rome",
+            "turkey",
+        ];
+        let words: Vec<&str> = lower_trimmed.split_whitespace().collect();
+        let country_count = words.iter().filter(|w| countries.contains(w)).count();
+        if country_count >= 2 && country_count as f64 / word_count as f64 >= 0.5 {
+            return true;
+        }
+    }
     // Entities that are just adjectives/demonyms (e.g. "German-speaking", "British", "Jewish")
     let demonym_suffixes = ["ish", "ian", "ese", "ean", "speaking"];
     if word_count == 1
@@ -2941,6 +2985,13 @@ impl<'a> Prometheus<'a> {
         if sf_weight >= 0.05 {
             let sf_hyps = self.generate_hypotheses_from_semantic_similarity()?;
             all_hypotheses.extend(sf_hyps);
+        }
+
+        // 2m. Jaccard coefficient link prediction (degree-normalized neighbor overlap)
+        let jc_weight = self.get_pattern_weight("jaccard")?;
+        if jc_weight >= 0.05 {
+            let jc_hyps = self.generate_hypotheses_from_jaccard()?;
+            all_hypotheses.extend(jc_hyps);
         }
 
         // 3. Island entities as gaps
@@ -8291,6 +8342,131 @@ impl<'a> Prometheus<'a> {
             });
         }
         Ok(hypotheses)
+    }
+
+    /// Jaccard coefficient link prediction: hypotheses from normalized neighbor overlap.
+    /// Better than raw shared-neighbor count because it controls for hub-degree bias.
+    pub fn generate_hypotheses_from_jaccard(&self) -> Result<Vec<Hypothesis>> {
+        let predictions = crate::graph::jaccard_predict(self.brain, 30)?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let entities = self.brain.all_entities()?;
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        let mut hypotheses = Vec::new();
+        for (a, b, score) in &predictions {
+            if !meaningful.contains(a) || !meaningful.contains(b) {
+                continue;
+            }
+            let a_name = id_name.get(a).copied().unwrap_or("?");
+            let b_name = id_name.get(b).copied().unwrap_or("?");
+            if is_noise_name(a_name) || is_noise_name(b_name) {
+                continue;
+            }
+            let a_type = id_type.get(a).copied().unwrap_or("unknown");
+            let b_type = id_type.get(b).copied().unwrap_or("unknown");
+            let predicate = match (a_type, b_type) {
+                ("person", "person") => "contemporary_of",
+                ("concept", "concept") => "related_concept",
+                ("person", "organization") | ("organization", "person") => "affiliated_with",
+                _ => "related_to",
+            };
+            let confidence = self
+                .calibrated_confidence("jaccard", 0.35 + (score * 0.5).min(0.45))
+                .unwrap_or(0.5);
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.to_string(),
+                predicate: predicate.to_string(),
+                object: b_name.to_string(),
+                confidence,
+                evidence_for: vec![format!("Jaccard neighbor similarity: {:.3}", score)],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!(
+                        "{} and {} have Jaccard coefficient {:.3}",
+                        a_name, b_name, score
+                    ),
+                    "High normalized neighbor overlap suggests a missing link".to_string(),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "jaccard".to_string(),
+            });
+        }
+        Ok(hypotheses)
+    }
+
+    /// Compute surprise/novelty score for a hypothesis.
+    /// Cross-domain hypotheses (different entity types, different communities) get higher scores.
+    /// Returns value 0.0 (expected) to 1.0 (highly surprising).
+    pub fn novelty_score(&self, h: &Hypothesis) -> Result<f64> {
+        let entities = self.brain.all_entities()?;
+        let name_to_ent: HashMap<String, &crate::db::Entity> = entities
+            .iter()
+            .map(|e| (e.name.to_lowercase(), e))
+            .collect();
+
+        let mut score = 0.0;
+
+        let s_ent = name_to_ent.get(&h.subject.to_lowercase());
+        let o_ent = name_to_ent.get(&h.object.to_lowercase());
+
+        // Different entity types → more surprising
+        if let (Some(s), Some(o)) = (s_ent, o_ent) {
+            if s.entity_type != o.entity_type {
+                score += 0.3;
+            }
+            // Check if in different communities
+            let communities = crate::graph::louvain_communities(self.brain)?;
+            if let (Some(&cs), Some(&co)) = (communities.get(&s.id), communities.get(&o.id)) {
+                if cs != co {
+                    score += 0.3;
+                }
+            }
+            // Low shared-neighbor count → more surprising
+            let all_rels = self.brain.all_relations()?;
+            let s_rels: HashSet<i64> = all_rels
+                .iter()
+                .filter(|r| r.subject_id == s.id || r.object_id == s.id)
+                .flat_map(|r| [r.subject_id, r.object_id])
+                .collect();
+            let o_rels: HashSet<i64> = all_rels
+                .iter()
+                .filter(|r| r.subject_id == o.id || r.object_id == o.id)
+                .flat_map(|r| [r.subject_id, r.object_id])
+                .collect();
+            let shared = s_rels.intersection(&o_rels).count();
+            if shared == 0 {
+                score += 0.3;
+            } else if shared <= 2 {
+                score += 0.1;
+            }
+        }
+
+        // Novel predicate (rare in the graph) → more surprising
+        let pred_count: i64 = self.brain.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM relations WHERE predicate = ?1",
+                params![h.predicate],
+                |row| row.get(0),
+            )
+        })?;
+        let total_rels: i64 = self.brain.with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM relations", [], |row| row.get(0))
+        })?;
+        if total_rels > 0 {
+            let pred_freq = pred_count as f64 / total_rels as f64;
+            if pred_freq < 0.01 {
+                score += 0.1; // rare predicate
+            }
+        }
+
+        Ok((score as f64).min(1.0))
     }
 
     /// Aggressively purge single-word island entities that are clearly generic English words,
