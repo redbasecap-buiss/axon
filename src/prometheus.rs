@@ -154,6 +154,46 @@ const NOISE_NAMES: &[&str] = &[
     "next",
     "major",
     "minor",
+    "resources",
+    "papers",
+    "encounters",
+    "bits",
+    "college",
+    "nature",
+    "online",
+    "links",
+    "related",
+    "archives",
+    "works",
+    "press",
+    "images",
+    "media",
+    "events",
+    "topics",
+    "articles",
+    "reports",
+    "documents",
+    "files",
+    "records",
+    "entries",
+    "items",
+    "details",
+    "options",
+    "updates",
+    "features",
+    "tools",
+    "services",
+    "further",
+    "reading",
+    "external",
+    "official",
+    "website",
+    "webpage",
+    "homepage",
+    "galleries",
+    "collections",
+    "publications",
+    "editions",
 ];
 
 fn is_noise_type(t: &str) -> bool {
@@ -377,6 +417,41 @@ fn is_noise_name(name: &str) -> bool {
     ];
     if word_count == 1 && generic_caps.contains(&lower_trimmed) {
         return true;
+    }
+    // Multi-word names ending with generic nouns that aren't real entities
+    let trailing_generic = [
+        "resources",
+        "papers",
+        "encounters",
+        "bits",
+        "links",
+        "archives",
+        "works",
+        "images",
+        "media",
+        "articles",
+        "reports",
+        "documents",
+        "files",
+        "records",
+        "entries",
+        "items",
+        "details",
+        "options",
+        "updates",
+        "features",
+        "tools",
+        "services",
+        "publications",
+        "editions",
+        "galleries",
+        "collections",
+    ];
+    if word_count >= 2 {
+        let last_word = lower_trimmed.split_whitespace().last().unwrap_or("");
+        if trailing_generic.contains(&last_word) {
+            return true;
+        }
     }
     // Names ending with "Journal", "During", "Resting", "Commentary" etc. — citation/fragment noise
     let trailing_noise = [
@@ -5270,7 +5345,7 @@ impl<'a> Prometheus<'a> {
     /// Always merges into the entity with higher degree (more connections).
     /// Returns count of merges performed.
     pub fn merge_name_variants(&self) -> Result<usize> {
-        eprintln!("NAME_VARIANT_START: entering merge_name_variants");
+        // eprintln!("NAME_VARIANT_START: entering merge_name_variants");
         let entities = self.brain.all_entities()?;
         let cs_count = entities
             .iter()
@@ -5453,13 +5528,13 @@ impl<'a> Prometheus<'a> {
                 if trailing_noise.contains(&last_lower.as_str()) {
                     let prefix: String = words[..words.len() - 1].join(" ");
                     let lower_prefix = prefix.to_lowercase();
-                    eprintln!(
-                        "TRAILING_STRIP: '{}' → trailing='{}' prefix='{}' lookup={:?}",
-                        e.name,
-                        last_lower,
-                        lower_prefix,
-                        name_to_info.get(&lower_prefix)
-                    );
+                    // eprintln!(
+                    //     "TRAILING_STRIP: '{}' → trailing='{}' prefix='{}' lookup={:?}",
+                    //     e.name,
+                    //     last_lower,
+                    //     lower_prefix,
+                    //     name_to_info.get(&lower_prefix)
+                    // );
                     if let Some(&(target_id, _target_deg)) = name_to_info.get(&lower_prefix) {
                         if target_id != e.id {
                             eprintln!(
@@ -7077,7 +7152,7 @@ impl<'a> Prometheus<'a> {
                 }
             }
         }
-        eprintln!("  [dissolve] total candidates with deg>=5: {}", dbg_count);
+        // eprintln!("  [dissolve] total candidates with deg>=5: {}", dbg_count);
 
         for e in &entities {
             if is_noise_type(&e.entity_type) {
