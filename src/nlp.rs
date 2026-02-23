@@ -2229,6 +2229,16 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject taxonomic/scientific family names (e.g. Candonidae, Baicaliinae, Spongillidae)
+    if !lower.contains(' ') {
+        let suffixes = [
+            "aceae", "idae", "inae", "ales", "oidea", "iformes", "opsida",
+        ];
+        if suffixes.iter().any(|s| lower.ends_with(s)) && trimmed.len() > 6 {
+            return false;
+        }
+    }
+
     // Reject single-word person titles used alone (President, Queen, etc.)
     if !lower.contains(' ') && PERSON_TITLES.contains(&lower.as_str()) {
         return false;
