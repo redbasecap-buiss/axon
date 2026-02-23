@@ -79,6 +79,21 @@ const NOISE_NAMES: &[&str] = &[
     "already",
     "often",
     "never",
+    "because",
+    "although",
+    "therefore",
+    "moreover",
+    "furthermore",
+    "nevertheless",
+    "nonetheless",
+    "whereas",
+    "meanwhile",
+    "otherwise",
+    "accordingly",
+    "consequently",
+    "hence",
+    "thus",
+    "thereby",
     "pages",
     "adding",
     "besides",
@@ -242,6 +257,14 @@ fn is_noise_name(name: &str) -> bool {
     if lower_trimmed.starts_with("pdf ")
         || lower_trimmed.starts_with("the original")
         || lower_trimmed.starts_with("archived")
+        || lower_trimmed.starts_with("because ")
+        || lower_trimmed.starts_with("although ")
+        || lower_trimmed.starts_with("therefore ")
+        || lower_trimmed.starts_with("whereas ")
+        || lower_trimmed.starts_with("furthermore ")
+        || lower_trimmed.starts_with("moreover ")
+        || lower_trimmed.ends_with(" because")
+        || lower_trimmed.ends_with(" although")
     {
         return true;
     }
@@ -510,6 +533,14 @@ fn is_noise_name(name: &str) -> bool {
     // Names starting with "Sir" followed by a single letter (e.g. "Sir I")
     if lower_trimmed.starts_with("sir ") && word_count <= 2 {
         return true;
+    }
+    // Names containing single-letter words interspersed (citation fragments like "Symanzik K Schrödinger")
+    if word_count >= 3 {
+        let words: Vec<&str> = lower_trimmed.split_whitespace().collect();
+        let single_letter_count = words.iter().filter(|w| w.len() == 1).count();
+        if single_letter_count >= 1 && single_letter_count as f64 / word_count as f64 >= 0.25 {
+            return true;
+        }
     }
     // Names that are just titles/honorifics
     let title_only = ["sir", "mr", "mrs", "ms", "dr", "prof", "lord", "lady"];
@@ -2483,8 +2514,9 @@ impl<'a> Prometheus<'a> {
         let name_containment_reconnected =
             self.reconnect_islands_by_name_containment().unwrap_or(0);
 
-        // Refine associated_with predicates using entity type pairs
+        // Refine generic predicates using entity type pairs
         let predicates_refined = self.refine_associated_with().unwrap_or(0);
+        let contributed_refined = self.refine_contributed_to().unwrap_or(0);
 
         // Promote mature testing hypotheses (>3 days, confidence >= 0.65)
         let promoted = self.promote_mature_hypotheses(3, 0.65).unwrap_or(0);
@@ -2535,7 +2567,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} token-reconnected, {} name-containment reconnected, {} predicates refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} token-reconnected, {} name-containment reconnected, {} predicates refined, {} contributed_to refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -2599,6 +2631,7 @@ impl<'a> Prometheus<'a> {
             token_reconnected,
             name_containment_reconnected,
             predicates_refined,
+            contributed_refined,
             promoted,
             pair_deduped,
             max_k,
@@ -2632,19 +2665,23 @@ impl<'a> Prometheus<'a> {
         let noise_types: HashSet<&str> = ["phrase", "source", "url"].iter().copied().collect();
         let mut component_types: Vec<(Vec<String>, HashMap<String, usize>)> = Vec::new();
         for comp in &components {
+            // Skip tiny components (likely noise fragments)
+            if comp.len() < 3 {
+                continue;
+            }
             let mut types: HashMap<String, usize> = HashMap::new();
             let mut names: Vec<String> = Vec::new();
             for &id in comp {
                 if let Some(e) = id_to_entity.get(&id) {
-                    if !noise_types.contains(e.entity_type.as_str()) {
+                    if !noise_types.contains(e.entity_type.as_str()) && !is_noise_name(&e.name) {
                         *types.entry(e.entity_type.clone()).or_insert(0) += 1;
-                        if names.len() < 5 {
+                        if names.len() < 5 && !is_noise_name(&e.name) {
                             names.push(e.name.clone());
                         }
                     }
                 }
             }
-            if !types.is_empty() {
+            if !types.is_empty() && names.len() >= 2 {
                 component_types.push((names, types));
             }
         }
@@ -6892,6 +6929,47 @@ impl<'a> Prometheus<'a> {
                 ("concept", "concept") => "related_concept",
                 ("concept", "place") | ("place", "concept") => "relevant_to",
                 ("event", "place") | ("place", "event") => "held_in",
+                _ => continue,
+            };
+            self.brain.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE relations SET predicate = ?1 WHERE id = ?2",
+                    params![new_pred, r.id],
+                )?;
+                Ok(())
+            })?;
+            updated += 1;
+        }
+        Ok(updated)
+    }
+
+    /// Refine overly generic `contributed_to` predicates into more specific ones
+    /// based on entity types. `contributed_to` makes up ~33% of all relations —
+    /// specializing it improves semantic precision and discovery quality.
+    pub fn refine_contributed_to(&self) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let id_to_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        let mut updated = 0usize;
+        for r in &relations {
+            if r.predicate != "contributed_to" {
+                continue;
+            }
+            let s_type = id_to_type.get(&r.subject_id).copied().unwrap_or("unknown");
+            let o_type = id_to_type.get(&r.object_id).copied().unwrap_or("unknown");
+            let new_pred = match (s_type, o_type) {
+                ("person", "concept") => "pioneered",
+                ("person", "organization") => "affiliated_with",
+                ("person", "place") => "active_in",
+                ("person", "event") => "participated_in",
+                ("organization", "concept") => "works_on",
+                ("organization", "event") => "organized",
+                ("concept", "concept") => "influenced",
+                ("place", "concept") | ("concept", "place") => "relevant_to",
                 _ => continue,
             };
             self.brain.with_conn(|conn| {
