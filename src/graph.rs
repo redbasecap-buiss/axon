@@ -2536,3 +2536,120 @@ pub fn neighborhood_overlap(
     results.truncate(limit);
     Ok(results)
 }
+
+/// Semantic similarity via shared predicate-object fingerprints.
+/// Two entities are semantically similar if they share the same (predicate, object) pairs.
+/// Returns (entity_a, entity_b, shared_count, jaccard) sorted by jaccard desc.
+pub fn semantic_fingerprint_similarity(
+    brain: &Brain,
+    min_shared: usize,
+    limit: usize,
+) -> Result<Vec<(i64, i64, usize, f64)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let mut fingerprints: HashMap<i64, HashSet<(String, i64)>> = HashMap::new();
+    for r in &relations {
+        fingerprints
+            .entry(r.subject_id)
+            .or_default()
+            .insert((r.predicate.clone(), r.object_id));
+    }
+    let candidates: Vec<(i64, &HashSet<(String, i64)>)> = fingerprints
+        .iter()
+        .filter(|(_, fp)| fp.len() >= min_shared)
+        .map(|(&id, fp)| (id, fp))
+        .collect();
+    let mut inv: HashMap<(String, i64), Vec<usize>> = HashMap::new();
+    for (idx, &(_, fp)) in candidates.iter().enumerate() {
+        for key in fp {
+            inv.entry(key.clone()).or_default().push(idx);
+        }
+    }
+    let mut pair_shared: HashMap<(usize, usize), usize> = HashMap::new();
+    for posting in inv.values() {
+        if posting.len() < 2 || posting.len() > 100 {
+            continue;
+        }
+        for i in 0..posting.len() {
+            for j in (i + 1)..posting.len() {
+                let key = (posting[i].min(posting[j]), posting[i].max(posting[j]));
+                *pair_shared.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut results = Vec::new();
+    for ((i, j), shared) in &pair_shared {
+        if *shared >= min_shared {
+            let (a, fp_a) = candidates[*i];
+            let (b, fp_b) = candidates[*j];
+            let union_size = fp_a.union(fp_b).count();
+            let jaccard = if union_size > 0 {
+                *shared as f64 / union_size as f64
+            } else {
+                0.0
+            };
+            results.push((a, b, *shared, jaccard));
+        }
+    }
+    results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    Ok(results)
+}
+
+/// Predicate co-occurrence matrix: which predicates tend to appear together on the same entity.
+/// Returns (pred_a, pred_b, co_occurrence_count, pmi) sorted by PMI desc.
+pub fn predicate_co_occurrence(
+    brain: &Brain,
+    min_count: usize,
+) -> Result<Vec<(String, String, usize, f64)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let total_entities = brain.all_entities()?.len() as f64;
+    if total_entities < 2.0 {
+        return Ok(vec![]);
+    }
+    let mut entity_preds: HashMap<i64, HashSet<String>> = HashMap::new();
+    for r in &relations {
+        entity_preds
+            .entry(r.subject_id)
+            .or_default()
+            .insert(r.predicate.clone());
+    }
+    let mut pred_freq: HashMap<String, usize> = HashMap::new();
+    for preds in entity_preds.values() {
+        for p in preds {
+            *pred_freq.entry(p.clone()).or_insert(0) += 1;
+        }
+    }
+    let mut pair_count: HashMap<(String, String), usize> = HashMap::new();
+    for preds in entity_preds.values() {
+        let preds_vec: Vec<&String> = preds.iter().collect();
+        for i in 0..preds_vec.len() {
+            for j in (i + 1)..preds_vec.len() {
+                let key = if preds_vec[i] <= preds_vec[j] {
+                    (preds_vec[i].clone(), preds_vec[j].clone())
+                } else {
+                    (preds_vec[j].clone(), preds_vec[i].clone())
+                };
+                *pair_count.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+    let n = total_entities;
+    let mut results = Vec::new();
+    for ((p1, p2), count) in &pair_count {
+        if *count >= min_count {
+            let f1 = pred_freq.get(p1).copied().unwrap_or(1) as f64;
+            let f2 = pred_freq.get(p2).copied().unwrap_or(1) as f64;
+            let p_ab = *count as f64 / n;
+            let p_a = f1 / n;
+            let p_b = f2 / n;
+            let pmi = if p_a > 0.0 && p_b > 0.0 {
+                (p_ab / (p_a * p_b)).log2()
+            } else {
+                0.0
+            };
+            results.push((p1.clone(), p2.clone(), *count, pmi));
+        }
+    }
+    results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(results)
+}

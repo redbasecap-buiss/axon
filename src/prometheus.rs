@@ -2399,6 +2399,13 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(tc_hyps);
         }
 
+        // 2l. Semantic fingerprint similarity (entities sharing same predicate-object patterns)
+        let sf_weight = self.get_pattern_weight("semantic_fingerprint")?;
+        if sf_weight >= 0.05 {
+            let sf_hyps = self.generate_hypotheses_from_semantic_similarity()?;
+            all_hypotheses.extend(sf_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -6919,6 +6926,81 @@ impl<'a> Prometheus<'a> {
     /// Triadic closure hypothesis generation: if A→B and B→C but not A→C,
     /// and A and C are of compatible types, hypothesize A→C.
     /// Weighted by number of distinct intermediaries (more paths = higher confidence).
+    /// Generate hypotheses from semantic fingerprint similarity.
+    /// Entities sharing the same (predicate, object) patterns are likely related
+    /// even if not directly connected.
+    pub fn generate_hypotheses_from_semantic_similarity(&self) -> Result<Vec<Hypothesis>> {
+        let similar = crate::graph::semantic_fingerprint_similarity(self.brain, 2, 30)?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let entities = self.brain.all_entities()?;
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Check direct connections
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            let key = if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            };
+            connected.insert(key);
+        }
+
+        let mut hypotheses = Vec::new();
+        for (a, b, shared, jaccard) in &similar {
+            if !meaningful.contains(a) || !meaningful.contains(b) {
+                continue;
+            }
+            let key = if a < b { (*a, *b) } else { (*b, *a) };
+            if connected.contains(&key) {
+                continue;
+            }
+            let a_name = id_name.get(a).copied().unwrap_or("?");
+            let b_name = id_name.get(b).copied().unwrap_or("?");
+            if is_noise_name(a_name) || is_noise_name(b_name) {
+                continue;
+            }
+            let a_type = id_type.get(a).copied().unwrap_or("?");
+            let b_type = id_type.get(b).copied().unwrap_or("?");
+            let predicate = match (a_type, b_type) {
+                ("person", "person") => "contemporary_of",
+                ("concept", "concept") => "related_concept",
+                ("organization", "organization") => "partner_of",
+                _ => "related_to",
+            };
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.to_string(),
+                predicate: predicate.to_string(),
+                object: b_name.to_string(),
+                confidence: 0.40 + (*jaccard * 0.4).min(0.4),
+                evidence_for: vec![format!(
+                    "Semantic fingerprint similarity: {} shared (pred,obj) patterns, Jaccard {:.2}",
+                    shared, jaccard
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!(
+                        "{} and {} share {} predicate-object patterns",
+                        a_name, b_name, shared
+                    ),
+                    format!("Jaccard similarity: {:.2}", jaccard),
+                    "Entities with similar relational patterns are likely related".to_string(),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "semantic_fingerprint".to_string(),
+            });
+        }
+        Ok(hypotheses)
+    }
+
     pub fn generate_hypotheses_from_triadic_closure(&self) -> Result<Vec<Hypothesis>> {
         let relations = self.brain.all_relations()?;
         let meaningful = meaningful_ids(self.brain)?;
