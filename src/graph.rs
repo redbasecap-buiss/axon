@@ -760,6 +760,52 @@ pub fn louvain_communities(brain: &Brain) -> Result<HashMap<i64, usize>, rusqlit
     Ok(community)
 }
 
+/// Compute modularity Q for a given community assignment.
+/// Q = (1/2m) Σ [A_ij - k_i*k_j/(2m)] δ(c_i, c_j)
+pub fn modularity(
+    brain: &Brain,
+    communities: &HashMap<i64, usize>,
+) -> Result<f64, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let m = relations.len() as f64;
+    if m == 0.0 {
+        return Ok(0.0);
+    }
+    let mut degree: HashMap<i64, f64> = HashMap::new();
+    for r in &relations {
+        *degree.entry(r.subject_id).or_insert(0.0) += 1.0;
+        *degree.entry(r.object_id).or_insert(0.0) += 1.0;
+    }
+    let m2 = 2.0 * m;
+    let mut q = 0.0_f64;
+    for r in &relations {
+        let ci = communities
+            .get(&r.subject_id)
+            .copied()
+            .unwrap_or(usize::MAX);
+        let cj = communities.get(&r.object_id).copied().unwrap_or(usize::MAX);
+        if ci == cj {
+            let ki = degree.get(&r.subject_id).copied().unwrap_or(0.0);
+            let kj = degree.get(&r.object_id).copied().unwrap_or(0.0);
+            q += 1.0 - ki * kj / m2;
+        }
+    }
+    Ok(q / m2)
+}
+
+/// Graph compaction ratio: what fraction of entities are in the largest connected component.
+/// Higher = more connected graph. Useful for tracking improvement over time.
+pub fn compaction_ratio(brain: &Brain) -> Result<f64, rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let n = entities.len();
+    if n == 0 {
+        return Ok(0.0);
+    }
+    let components = connected_components(brain)?;
+    let largest = components.first().map(|c| c.len()).unwrap_or(0);
+    Ok(largest as f64 / n as f64)
+}
+
 /// Global clustering coefficient (average of local coefficients).
 pub fn global_clustering(brain: &Brain) -> Result<f64, rusqlite::Error> {
     let coeffs = clustering_coefficients(brain)?;

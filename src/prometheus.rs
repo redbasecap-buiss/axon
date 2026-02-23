@@ -1605,6 +1605,10 @@ impl<'a> Prometheus<'a> {
         let analogy_hyps = self.generate_hypotheses_from_analogies()?;
         all_hypotheses.extend(analogy_hyps);
 
+        // 2c. Hub-spoke hypotheses: hubs should connect to nearby same-type entities
+        let hub_hyps = self.generate_hypotheses_from_hubs()?;
+        all_hypotheses.extend(hub_hyps);
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -1691,6 +1695,12 @@ impl<'a> Prometheus<'a> {
         // Island reconnection
         let reconnected = self.reconnect_islands().unwrap_or(0);
 
+        // Fact-based relation inference (new: creates relations from facts)
+        let fact_inferred = self.infer_relations_from_facts().unwrap_or(0);
+
+        // Entity name cross-referencing (new: links entities mentioned in other entity names)
+        let name_crossrefs = self.crossref_entity_names().unwrap_or(0);
+
         let summary = format!(
             "Discovered {} patterns, generated {} new hypotheses ({} confirmed, {} rejected), \
              auto-resolved {} existing ({}✓ {}✗), {} island entities, {} meaningful relations, \
@@ -1699,7 +1709,8 @@ impl<'a> Prometheus<'a> {
              predicate diversity: {}/{} ({:.0}% diverse), \
              {} fuzzy duplicates ({} auto-merge, {} auto-merged), {} sparse topic domains, \
              {} name subsumptions found, {} types fixed, {} noise entities purged, \
-             {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected",
+             {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected, \
+             {} fact-inferred relations, {} name cross-references",
             all_patterns.len(),
             all_hypotheses.len(),
             confirmed,
@@ -1730,6 +1741,8 @@ impl<'a> Prometheus<'a> {
             deep_cleaned,
             normalized,
             reconnected,
+            fact_inferred,
+            name_crossrefs,
         );
 
         Ok(DiscoveryReport {
@@ -2960,6 +2973,271 @@ impl<'a> Prometheus<'a> {
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
+
+    /// Generate hypotheses from hub entities: if a high-degree entity of type T exists,
+    /// suggest it should connect to nearby isolated entities of the same type or related types.
+    pub fn generate_hypotheses_from_hubs(&self) -> Result<Vec<Hypothesis>> {
+        let hubs = crate::graph::find_hubs(self.brain, 10)?;
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Build adjacency for quick lookup
+        let mut adj: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            adj.insert((r.subject_id, r.object_id));
+            adj.insert((r.object_id, r.subject_id));
+        }
+
+        let id_to_entity: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+
+        let mut hypotheses = Vec::new();
+        for (hub_id, _degree) in &hubs {
+            let hub = match id_to_entity.get(hub_id) {
+                Some(e) => e,
+                None => continue,
+            };
+            if is_noise_type(&hub.entity_type) || is_noise_name(&hub.name) {
+                continue;
+            }
+
+            // Find islands of the same type that might relate to this hub
+            for e in &entities {
+                if e.id == *hub_id
+                    || !meaningful.contains(&e.id)
+                    || connected.contains(&e.id)
+                    || is_noise_name(&e.name)
+                {
+                    continue;
+                }
+                // Same type AND name word overlap (at least one shared word ≥4 chars)
+                if e.entity_type == hub.entity_type {
+                    let hub_words: HashSet<String> = hub
+                        .name
+                        .to_lowercase()
+                        .split_whitespace()
+                        .filter(|w| w.len() >= 4)
+                        .map(|w| w.to_string())
+                        .collect();
+                    let e_words: HashSet<String> = e
+                        .name
+                        .to_lowercase()
+                        .split_whitespace()
+                        .filter(|w| w.len() >= 4)
+                        .map(|w| w.to_string())
+                        .collect();
+                    let shared: Vec<&String> = hub_words.intersection(&e_words).collect();
+                    if !shared.is_empty() {
+                        hypotheses.push(Hypothesis {
+                            id: 0,
+                            subject: hub.name.clone(),
+                            predicate: "related_to".to_string(),
+                            object: e.name.clone(),
+                            confidence: 0.3 + (shared.len() as f64 * 0.1).min(0.3),
+                            evidence_for: vec![format!(
+                                "Hub '{}' shares words [{}] with isolated '{}' (type '{}')",
+                                hub.name,
+                                shared
+                                    .iter()
+                                    .map(|s| s.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                e.name,
+                                e.entity_type
+                            )],
+                            evidence_against: vec![],
+                            reasoning_chain: vec![
+                                format!(
+                                    "'{}' is a hub entity of type '{}'",
+                                    hub.name, hub.entity_type
+                                ),
+                                format!("'{}' is isolated but shares words with hub", e.name),
+                                "Name overlap + hub-spoke pattern suggests likely relation"
+                                    .to_string(),
+                            ],
+                            status: HypothesisStatus::Proposed,
+                            discovered_at: now_str(),
+                            pattern_source: "hub_spoke".to_string(),
+                        });
+                        if hypotheses.len() >= 100 {
+                            return Ok(hypotheses);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(hypotheses)
+    }
+
+    /// Fact-based relation inference: create relations from facts that reference other entities.
+    /// E.g., entity "France" has fact "capital: Paris" and entity "Paris" exists → create relation.
+    /// Returns count of new relations created.
+    pub fn infer_relations_from_facts(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        // Build name→id lookup (case-insensitive)
+        let mut name_to_id: HashMap<String, i64> = HashMap::new();
+        for e in &entities {
+            if meaningful.contains(&e.id) {
+                name_to_id.insert(e.name.to_lowercase(), e.id);
+            }
+        }
+
+        // Build existing relation set for dedup
+        let relations = self.brain.all_relations()?;
+        let mut existing: HashSet<(i64, String, i64)> = HashSet::new();
+        for r in &relations {
+            existing.insert((r.subject_id, r.predicate.clone(), r.object_id));
+        }
+
+        // Predicate mapping: fact key → relation predicate
+        let key_to_pred: HashMap<&str, &str> = [
+            ("capital", "has_capital"),
+            ("headquarters", "headquartered_in"),
+            ("founded_by", "founded_by"),
+            ("creator", "created_by"),
+            ("author", "authored_by"),
+            ("inventor", "invented_by"),
+            ("born_in", "born_in"),
+            ("died_in", "died_in"),
+            ("located_in", "located_in"),
+            ("part_of", "part_of"),
+            ("member_of", "member_of"),
+            ("parent", "child_of"),
+            ("subsidiary", "subsidiary_of"),
+            ("language", "uses_language"),
+            ("currency", "uses_currency"),
+            ("president", "led_by"),
+            ("ceo", "led_by"),
+            ("founder", "founded_by"),
+            ("nationality", "nationality"),
+            ("country", "located_in"),
+            ("continent", "located_in"),
+            ("region", "located_in"),
+            ("city", "located_in"),
+        ]
+        .iter()
+        .cloned()
+        .collect();
+
+        let mut created = 0usize;
+        for e in &entities {
+            if !meaningful.contains(&e.id) {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            for f in &facts {
+                let pred = key_to_pred
+                    .get(f.key.to_lowercase().as_str())
+                    .copied()
+                    .unwrap_or("related_to");
+
+                // Check if fact value matches an entity name
+                let value_lower = f.value.to_lowercase();
+                if let Some(&target_id) = name_to_id.get(&value_lower) {
+                    if target_id != e.id && !existing.contains(&(e.id, pred.to_string(), target_id))
+                    {
+                        self.brain
+                            .upsert_relation(e.id, pred, target_id, &f.source_url)?;
+                        existing.insert((e.id, pred.to_string(), target_id));
+                        created += 1;
+                    }
+                }
+            }
+        }
+        Ok(created)
+    }
+
+    /// Entity name cross-reference: find entities whose names contain other entity names.
+    /// E.g., "Swiss Federal Council" contains "Swiss" → link to Switzerland if it exists.
+    /// Only matches high-value entities with names ≥ 5 chars to avoid false positives.
+    /// Returns count of new relations created.
+    pub fn crossref_entity_names(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        // Build candidate targets: meaningful entities with short-ish names (2-4 words)
+        let targets: Vec<(i64, String)> = entities
+            .iter()
+            .filter(|e| {
+                meaningful.contains(&e.id)
+                    && !is_noise_name(&e.name)
+                    && e.name.len() >= 5
+                    && e.name.split_whitespace().count() <= 3
+                    && HIGH_VALUE_TYPES.contains(&e.entity_type.as_str())
+            })
+            .map(|e| (e.id, e.name.clone()))
+            .collect();
+
+        // Build existing relation set
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            let key = if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            };
+            connected.insert(key);
+        }
+
+        let mut created = 0usize;
+        for e in &entities {
+            if !meaningful.contains(&e.id) || is_noise_name(&e.name) {
+                continue;
+            }
+            let e_lower = e.name.to_lowercase();
+            let e_words: Vec<&str> = e_lower.split_whitespace().collect();
+            if e_words.len() < 2 {
+                continue; // only multi-word entities can contain references
+            }
+
+            for (tid, tname) in &targets {
+                if *tid == e.id {
+                    continue;
+                }
+                let t_lower = tname.to_lowercase();
+                // Check if entity name contains the target name as a word boundary match
+                if e_lower.contains(&t_lower) && e_lower != t_lower {
+                    // Verify word boundary (not just substring within a word)
+                    let idx = e_lower.find(&t_lower).unwrap();
+                    let before_ok = idx == 0
+                        || e_lower.as_bytes()[idx - 1] == b' '
+                        || e_lower.as_bytes()[idx - 1] == b'-';
+                    let end = idx + t_lower.len();
+                    let after_ok = end == e_lower.len()
+                        || e_lower.as_bytes()[end] == b' '
+                        || e_lower.as_bytes()[end] == b'-';
+
+                    if before_ok && after_ok {
+                        let key = if e.id < *tid {
+                            (e.id, *tid)
+                        } else {
+                            (*tid, e.id)
+                        };
+                        if !connected.contains(&key) {
+                            self.brain
+                                .upsert_relation(e.id, "associated_with", *tid, "")?;
+                            connected.insert(key);
+                            created += 1;
+                            if created >= 200 {
+                                return Ok(created);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(created)
+    }
 
     fn entity_name(&self, id: i64) -> Result<String> {
         Ok(self
