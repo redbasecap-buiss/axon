@@ -477,6 +477,26 @@ const PLACE_INDICATORS: &[&str] = &[
     "falls",
     "heights",
     "hills",
+    // German/Swiss place terms
+    "stadt",
+    "altstadt",
+    "stadtteil",
+    "gemeinde",
+    "bezirk",
+    "kanton",
+    "bundesland",
+    "tal",
+    "see",
+    "fluss",
+    "berg",
+    "gebirge",
+    "wald",
+    "feld",
+    "hafen",
+    "platz",
+    "strasse",
+    "gasse",
+    "brücke",
 ];
 
 /// Words that indicate a concept/thing rather than a person.
