@@ -7528,13 +7528,14 @@ impl<'a> Prometheus<'a> {
                 }
             }
 
-            // Find best candidate — require minimum score (at least 1 significant shared token)
+            // Find best candidate — require significant shared tokens
             if let Some((&best_id, &best_score)) = candidates
                 .iter()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             {
-                if best_score < 1.5 {
-                    continue; // Not significant enough
+                // Require higher minimum score to avoid spurious matches
+                if best_score < 3.0 {
+                    continue;
                 }
                 let island_name = entity_map
                     .get(&island_id)
@@ -7552,6 +7553,34 @@ impl<'a> Prometheus<'a> {
                     .get(&best_id)
                     .map(|e| e.entity_type.as_str())
                     .unwrap_or("?");
+
+                // For person-person matches, require shared LAST name (not just first name).
+                // "Frank Sinatra" and "Denis Frank" share "frank" but are unrelated.
+                // Require that the shared tokens include the last token of at least one name.
+                if island_type == "person" && target_type == "person" {
+                    let island_last = island_name
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or("")
+                        .to_lowercase();
+                    let target_last = target_name
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or("")
+                        .to_lowercase();
+                    let target_toks = entity_tokens.get(&best_id);
+                    let shared_toks: Vec<&String> = island_toks
+                        .iter()
+                        .filter(|t| target_toks.map(|tt| tt.contains(t)).unwrap_or(false))
+                        .collect();
+                    // Must share a last name token, not just first names
+                    let shares_surname = shared_toks
+                        .iter()
+                        .any(|t| **t == island_last || **t == target_last);
+                    if !shares_surname {
+                        continue;
+                    }
+                }
 
                 // Determine predicate based on types
                 let predicate = match (island_type, target_type) {

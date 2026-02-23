@@ -934,6 +934,21 @@ const CONCEPT_INDICATORS: &[&str] = &[
     "jewish",
     "buddhist",
     "hindu",
+    "fellow",
+    "fellows",
+    "caliphate",
+    "sultanate",
+    "emirate",
+    "khanate",
+    "shogunate",
+    "speech",
+    "speeches",
+    "awardees",
+    "prizes",
+    "chronicles",
+    "divergence",
+    "hippie",
+    "containers",
 ];
 
 /// Common organization suffixes for entity classification.
@@ -986,6 +1001,25 @@ const ORG_INDICATORS: &[&str] = &[
     "services",
     "industries",
     "enterprises",
+    "senate",
+    "parliament",
+    "congress",
+    "centre",
+    "center",
+    "forces",
+    "corps",
+    "command",
+    "authority",
+    "tribunal",
+    "court",
+    "exchange",
+    "trust",
+    "board",
+    "observatory",
+    "conservatory",
+    "seminary",
+    "consortium",
+    "cooperative",
 ];
 
 const ABBREVIATIONS: &[&str] = &[
@@ -1886,6 +1920,21 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     // Length bounds
     if trimmed.len() < 3 || trimmed.len() > 100 {
         return false;
+    }
+
+    // Reject fragments where any word is a single letter (e.g. "B It", "K It", "Q Pa")
+    {
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        if words.len() >= 2
+            && words
+                .iter()
+                .any(|w| w.len() == 1 && w.chars().next().is_some_and(|c| c.is_alphabetic()))
+        {
+            // Allow well-known patterns like "C++" or initials in names with 3+ words
+            if words.len() <= 2 {
+                return false;
+            }
+        }
     }
 
     // Structured types (dates, urls, emails, currency, number_unit) skip text-based filters
