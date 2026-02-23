@@ -2285,8 +2285,13 @@ impl<'a> Prometheus<'a> {
         }
 
         // Update status based on confidence
+        let was_confirmed = h.status == HypothesisStatus::Confirmed;
         if h.confidence >= 0.8 {
             h.status = HypothesisStatus::Confirmed;
+            // Record discovery if newly confirmed
+            if !was_confirmed && h.id > 0 {
+                let _ = self.save_discovery(h.id, &h.evidence_for);
+            }
         } else if h.confidence <= 0.1 {
             h.status = HypothesisStatus::Rejected;
         } else {
@@ -2471,6 +2476,53 @@ impl<'a> Prometheus<'a> {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?))
             })?;
             rows.collect::<Result<Vec<_>>>()
+        })
+    }
+
+    /// Strategy effectiveness report: shows which discovery strategies are working.
+    /// Returns Vec of (strategy_name, confirmations, rejections, weight, recommendation).
+    pub fn strategy_effectiveness(&self) -> Result<Vec<(String, i64, i64, f64, String)>> {
+        let weights = self.get_pattern_weights()?;
+        let mut report = Vec::new();
+        for w in &weights {
+            let total = w.confirmations + w.rejections;
+            let rec = if total < 10 {
+                "insufficient data".to_string()
+            } else if w.weight >= 0.9 {
+                "excellent — keep".to_string()
+            } else if w.weight >= 0.7 {
+                "good".to_string()
+            } else if w.weight >= 0.3 {
+                "mediocre — review".to_string()
+            } else if w.weight >= 0.1 {
+                "poor — consider disabling".to_string()
+            } else {
+                "failing — disable".to_string()
+            };
+            report.push((
+                w.pattern_type.clone(),
+                w.confirmations,
+                w.rejections,
+                w.weight,
+                rec,
+            ));
+        }
+        report.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(report)
+    }
+
+    /// Get total discovery count (confirmed hypotheses that were recorded).
+    pub fn discovery_count(&self) -> Result<i64> {
+        self.brain.with_conn(|conn| {
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='discoveries'",
+                [],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(0);
+            }
+            conn.query_row("SELECT COUNT(*) FROM discoveries", [], |row| row.get(0))
         })
     }
 
@@ -4106,6 +4158,12 @@ impl<'a> Prometheus<'a> {
                         if new_conf >= CONFIRMATION_THRESHOLD {
                             self.update_hypothesis_status(h.id, HypothesisStatus::Confirmed)?;
                             self.record_outcome(&h.pattern_source, true)?;
+                            // Record as discovery
+                            let evidence = vec![
+                                format!("Path of length {} found between entities", p.len()),
+                                format!("Pattern source: {}", h.pattern_source),
+                            ];
+                            let _ = self.save_discovery(h.id, &evidence);
                             confirmed += 1;
                             continue;
                         }
@@ -8336,6 +8394,16 @@ impl<'a> Prometheus<'a> {
             .naive_utc()
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
+        // First, collect IDs of hypotheses that will be promoted so we can record discoveries
+        let to_promote: Vec<(i64, String)> = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, pattern_source FROM hypotheses WHERE status = 'testing' AND confidence >= ?1 AND discovered_at < ?2",
+            )?;
+            let rows = stmt.query_map(params![min_conf, cutoff], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>>>()
+        })?;
         let count = self.brain.with_conn(|conn| {
             let updated = conn.execute(
                 "UPDATE hypotheses SET status = 'confirmed' WHERE status = 'testing' AND confidence >= ?1 AND discovered_at < ?2",
@@ -8343,6 +8411,17 @@ impl<'a> Prometheus<'a> {
             )?;
             Ok(updated)
         })?;
+        // Record discoveries and outcomes for promoted hypotheses
+        for (id, source) in &to_promote {
+            let _ = self.save_discovery(
+                *id,
+                &[format!(
+                    "Mature promotion (>{} days, conf>={:.2})",
+                    min_days, min_conf
+                )],
+            );
+            let _ = self.record_outcome(source, true);
+        }
         Ok(count)
     }
 

@@ -2120,6 +2120,22 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "therefore",
     "today",
     "together",
+    // Added 2026-02-23 round 6: more generic words from DB cleanup
+    "beauty",
+    "congress",
+    "theology",
+    "slavery",
+    "dispel",
+    "swamp",
+    "conversely",
+    "remnants",
+    "fokker",
+    "gegenwart",
+    "komfortrouten",
+    "conventionnels",
+    "deepest",
+    "predecessor",
+    "bronze",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -3157,6 +3173,15 @@ fn classify_entity_type(name: &str) -> &'static str {
         "paris",
         "moscow",
         "kyiv",
+        // Added 2026-02-23: more cities/places
+        "perth",
+        "malaga",
+        "schengen",
+        "ferrara",
+        "ionia",
+        "wallachia",
+        "chalcedon",
+        "piombino",
     ];
     if !lower.contains(' ') && KNOWN_PLACES.contains(&lower.as_str()) {
         return "place";
