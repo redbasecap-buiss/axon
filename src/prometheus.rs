@@ -2206,6 +2206,7 @@ impl<'a> Prometheus<'a> {
             pass_merges += self.purge_fragment_islands().unwrap_or(0);
             pass_merges += self.prefix_strip_island_merge().unwrap_or(0);
             pass_merges += self.merge_name_variants().unwrap_or(0);
+            pass_merges += self.aggressive_prefix_dedup().unwrap_or(0);
             if pass_merges == 0 {
                 break;
             }
@@ -2214,6 +2215,9 @@ impl<'a> Prometheus<'a> {
 
         // Merge connected entities where one name contains the other
         let containment_merged = self.merge_connected_containment().unwrap_or(0);
+
+        // Aggressive same-type prefix deduplication
+        let aggressive_deduped = self.aggressive_prefix_dedup().unwrap_or(0);
 
         // Purge generic single-word islands (adverbs, adjectives, citation surnames)
         let generic_purged = self.purge_generic_single_word_islands().unwrap_or(0);
@@ -2275,7 +2279,7 @@ impl<'a> Prometheus<'a> {
              {} compound relations + {} compound merged, {} concat split ({}r/{}c), {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} convergence-pass merges, \
-             {} connected-containment merged, \
+             {} connected-containment merged, {} aggressive-prefix deduped, \
              {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} predicates refined, {} hypotheses promoted, \
              {} hypothesis pairs deduped, k-core: k={} with {} entities in dense backbone{}",
             all_patterns.len(),
@@ -2328,6 +2332,7 @@ impl<'a> Prometheus<'a> {
             auto_consolidated,
             convergence_merges,
             containment_merged,
+            aggressive_deduped,
             generic_purged,
             multiword_purged,
             fragment_islands_purged,
@@ -4904,6 +4909,24 @@ impl<'a> Prometheus<'a> {
             "working",
             "linux",
             "dm",
+            "online",
+            "resources",
+            "imdb",
+            "first",
+            "start",
+            "women",
+            "past",
+            "prestige",
+            "no",
+            "lwn",
+            "there",
+            "yesugei",
+            "inc",
+            "apsnews",
+            "boingboing",
+            "ratified",
+            "ancien",
+            "clark",
         ];
 
         let mut merged = 0usize;
@@ -6019,6 +6042,82 @@ impl<'a> Prometheus<'a> {
                     self.brain.merge_entities(longer.id, shorter.id)?;
                     absorbed.insert(longer.id);
                     merged += 1;
+                }
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Aggressive same-type prefix deduplication: merge entities whose name starts
+    /// with a known shorter entity name of the SAME type. Unlike suffix_strip which
+    /// only handles islands, this works on all entities and doesn't require the
+    /// extra words to be in a noise list. For example:
+    /// - "Byzantine Empire Diocletian" (concept) → "Byzantine Empire" (concept)
+    /// - "Emmy Noether APSNews" (person) → "Emmy Noether" (person)
+    /// - "Ada Lovelace WIRED" (person) → "Ada Lovelace" (person)
+    /// Only merges when the target (shorter name) has strictly more connections.
+    pub fn aggressive_prefix_dedup(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Build (lowercase_name → (id, degree, word_count, type)) for entities with 2+ words
+        let mut name_index: HashMap<String, (i64, usize, usize, String)> = HashMap::new();
+        for e in &entities {
+            if is_noise_type(&e.entity_type) {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            let wc = lower.split_whitespace().count();
+            if wc < 2 {
+                continue;
+            }
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            let existing = name_index.get(&lower);
+            if existing.is_none() || existing.is_some_and(|(_, d, _, _)| deg > *d) {
+                name_index.insert(lower, (e.id, deg, wc, e.entity_type.clone()));
+            }
+        }
+
+        // For each entity with 3+ words, check if a 2-word prefix exists with same type
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<i64> = HashSet::new();
+
+        for e in &entities {
+            if absorbed.contains(&e.id) || is_noise_type(&e.entity_type) {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 3 {
+                continue;
+            }
+            let my_deg = degree.get(&e.id).copied().unwrap_or(0);
+
+            // Try progressively shorter prefixes (keep at least 2 words)
+            for take in (2..words.len()).rev() {
+                let prefix: String = words[..take].join(" ").to_lowercase();
+                if let Some(&(target_id, target_deg, _, ref target_type)) = name_index.get(&prefix)
+                {
+                    if target_id == e.id || absorbed.contains(&target_id) {
+                        continue;
+                    }
+                    // Same type or compatible
+                    if target_type != &e.entity_type {
+                        continue;
+                    }
+                    // Target must be more connected (canonical)
+                    if target_deg <= my_deg && my_deg > 0 {
+                        continue;
+                    }
+                    self.brain.merge_entities(e.id, target_id)?;
+                    absorbed.insert(e.id);
+                    merged += 1;
+                    break;
                 }
             }
         }
