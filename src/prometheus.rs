@@ -5568,24 +5568,27 @@ impl<'a> Prometheus<'a> {
         let relations = self.brain.all_relations()?;
         let meaningful = meaningful_ids(self.brain)?;
 
-        let mut connected: HashSet<i64> = HashSet::new();
-        for r in &relations {
-            connected.insert(r.subject_id);
-            connected.insert(r.object_id);
-        }
-
         // Build adjacency for quick lookup
         let mut adj: HashSet<(i64, i64)> = HashSet::new();
+        let mut neighbors: HashMap<i64, HashSet<i64>> = HashMap::new();
         for r in &relations {
             adj.insert((r.subject_id, r.object_id));
             adj.insert((r.object_id, r.subject_id));
+            neighbors
+                .entry(r.subject_id)
+                .or_default()
+                .insert(r.object_id);
+            neighbors
+                .entry(r.object_id)
+                .or_default()
+                .insert(r.subject_id);
         }
 
         let id_to_entity: HashMap<i64, &crate::db::Entity> =
             entities.iter().map(|e| (e.id, e)).collect();
 
         let mut hypotheses = Vec::new();
-        for (hub_id, _degree) in &hubs {
+        for (hub_id, hub_degree) in &hubs {
             let hub = match id_to_entity.get(hub_id) {
                 Some(e) => e,
                 None => continue,
@@ -5593,69 +5596,84 @@ impl<'a> Prometheus<'a> {
             if is_noise_type(&hub.entity_type) || is_noise_name(&hub.name) {
                 continue;
             }
+            let hub_nbrs = match neighbors.get(hub_id) {
+                Some(n) => n,
+                None => continue,
+            };
 
-            // Find islands of the same type that might relate to this hub
-            for e in &entities {
-                if e.id == *hub_id
-                    || !meaningful.contains(&e.id)
-                    || connected.contains(&e.id)
-                    || is_noise_name(&e.name)
-                {
-                    continue;
-                }
-                // Same type AND name word overlap (at least one shared word ≥4 chars)
-                if e.entity_type == hub.entity_type {
-                    let hub_words: HashSet<String> = hub
-                        .name
-                        .to_lowercase()
-                        .split_whitespace()
-                        .filter(|w| w.len() >= 4)
-                        .map(|w| w.to_string())
-                        .collect();
-                    let e_words: HashSet<String> = e
-                        .name
-                        .to_lowercase()
-                        .split_whitespace()
-                        .filter(|w| w.len() >= 4)
-                        .map(|w| w.to_string())
-                        .collect();
-                    let shared: Vec<&String> = hub_words.intersection(&e_words).collect();
-                    if !shared.is_empty() {
-                        hypotheses.push(Hypothesis {
-                            id: 0,
-                            subject: hub.name.clone(),
-                            predicate: "related_to".to_string(),
-                            object: e.name.clone(),
-                            confidence: 0.3 + (shared.len() as f64 * 0.1).min(0.3),
-                            evidence_for: vec![format!(
-                                "Hub '{}' shares words [{}] with isolated '{}' (type '{}')",
-                                hub.name,
-                                shared
-                                    .iter()
-                                    .map(|s| s.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                                e.name,
-                                e.entity_type
-                            )],
-                            evidence_against: vec![],
-                            reasoning_chain: vec![
-                                format!(
-                                    "'{}' is a hub entity of type '{}'",
-                                    hub.name, hub.entity_type
-                                ),
-                                format!("'{}' is isolated but shares words with hub", e.name),
-                                "Name overlap + hub-spoke pattern suggests likely relation"
-                                    .to_string(),
-                            ],
-                            status: HypothesisStatus::Proposed,
-                            discovered_at: now_str(),
-                            pattern_source: "hub_spoke".to_string(),
-                        });
-                        if hypotheses.len() >= 100 {
-                            return Ok(hypotheses);
+            // Strategy: find 2-hop neighbors of the hub that share many neighbors
+            // with the hub but aren't directly connected — triadic closure via hubs
+            let mut two_hop: HashMap<i64, usize> = HashMap::new();
+            for &nbr in hub_nbrs {
+                if let Some(nbr_nbrs) = neighbors.get(&nbr) {
+                    for &nn in nbr_nbrs {
+                        if nn != *hub_id && !hub_nbrs.contains(&nn) && meaningful.contains(&nn) {
+                            *two_hop.entry(nn).or_insert(0) += 1;
                         }
                     }
+                }
+            }
+
+            // Sort by shared neighbor count (descending)
+            let mut candidates: Vec<(i64, usize)> = two_hop.into_iter().collect();
+            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+            for (cand_id, shared_count) in candidates.iter().take(10) {
+                if *shared_count < 2 {
+                    break;
+                }
+                let cand = match id_to_entity.get(cand_id) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                if is_noise_name(&cand.name) || is_noise_type(&cand.entity_type) {
+                    continue;
+                }
+                // Determine likely predicate from shared neighbors' predicates
+                let mut pred_counts: HashMap<String, usize> = HashMap::new();
+                for r in &relations {
+                    if r.subject_id == *hub_id || r.object_id == *hub_id {
+                        if !is_generic_predicate(&r.predicate) {
+                            *pred_counts.entry(r.predicate.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                let best_pred = pred_counts
+                    .into_iter()
+                    .max_by_key(|(_, c)| *c)
+                    .map(|(p, _)| p)
+                    .unwrap_or_else(|| "related_to".to_string());
+
+                let base_conf = 0.4 + (*shared_count as f64 * 0.1).min(0.4);
+                hypotheses.push(Hypothesis {
+                    id: 0,
+                    subject: hub.name.clone(),
+                    predicate: best_pred,
+                    object: cand.name.clone(),
+                    confidence: base_conf,
+                    evidence_for: vec![format!(
+                        "Hub '{}' (degree {}) shares {} neighbors with '{}' but no direct link",
+                        hub.name, hub_degree, shared_count, cand.name
+                    )],
+                    evidence_against: vec![],
+                    reasoning_chain: vec![
+                        format!(
+                            "'{}' is a hub entity (degree {}) of type '{}'",
+                            hub.name, hub_degree, hub.entity_type
+                        ),
+                        format!(
+                            "'{}' is 2 hops away with {} shared neighbors",
+                            cand.name, shared_count
+                        ),
+                        "High shared-neighbor count suggests missing direct link (triadic closure)"
+                            .to_string(),
+                    ],
+                    status: HypothesisStatus::Proposed,
+                    discovered_at: now_str(),
+                    pattern_source: "hub_spoke".to_string(),
+                });
+                if hypotheses.len() >= 100 {
+                    return Ok(hypotheses);
                 }
             }
         }
@@ -7779,13 +7797,28 @@ impl<'a> Prometheus<'a> {
                 }
             }
 
-            // Entities reachable via 3+ distinct 2-hop paths are strong candidates
+            // Entities reachable via 2+ distinct 2-hop paths are candidates
             for (&target, &count) in &two_hop_count {
-                if count >= 3 {
+                if count >= 2 {
                     let src_name = self.entity_name(src)?;
                     let tgt_name = self.entity_name(target)?;
-                    // Suggest predicate based on most common predicate in shared neighbourhood
-                    let suggested = "related_to".to_string();
+                    if is_noise_name(&src_name) || is_noise_name(&tgt_name) {
+                        continue;
+                    }
+                    // Suggest predicate from most common predicate between src's neighbors and target
+                    let mut pred_freq: HashMap<String, usize> = HashMap::new();
+                    for r in &relations {
+                        if (r.subject_id == src || r.object_id == src)
+                            && !is_generic_predicate(&r.predicate)
+                        {
+                            *pred_freq.entry(r.predicate.clone()).or_insert(0) += 1;
+                        }
+                    }
+                    let suggested = pred_freq
+                        .into_iter()
+                        .max_by_key(|(_, c)| *c)
+                        .map(|(p, _)| p)
+                        .unwrap_or_else(|| "related_to".to_string());
                     near_misses.push((src_name, tgt_name, count, 2, suggested));
                 }
             }
