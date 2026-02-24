@@ -4672,6 +4672,9 @@ impl<'a> Prometheus<'a> {
         // Prune stranger contemporary_of (no shared non-contemporary neighbors)
         let stranger_contemporary_pruned = self.prune_stranger_contemporary().unwrap_or(0);
 
+        // Prune low-degree contemporary_of (both endpoints have ≤2 non-contemporary rels)
+        let low_degree_contemporary_pruned = self.prune_low_degree_contemporary(2).unwrap_or(0);
+
         // Predicate normalization (reduce "is" overuse)
         let normalized = self.normalize_predicates().unwrap_or(0);
 
@@ -5152,14 +5155,15 @@ impl<'a> Prometheus<'a> {
         } else {
             String::new()
         };
-        let stranger_line = if stranger_contemporary_pruned > 0 {
-            format!(
-                ", {} stranger contemporary_of pruned",
-                stranger_contemporary_pruned
-            )
-        } else {
-            String::new()
-        };
+        let stranger_line =
+            if stranger_contemporary_pruned > 0 || low_degree_contemporary_pruned > 0 {
+                format!(
+                    ", {} stranger contemporary_of pruned, {} low-degree contemporary_of pruned",
+                    stranger_contemporary_pruned, low_degree_contemporary_pruned
+                )
+            } else {
+                String::new()
+            };
         let summary = format!(
             "{}{}{}{}{}{}{}",
             summary,
@@ -5438,7 +5442,7 @@ impl<'a> Prometheus<'a> {
 
         let contemporary_rels: Vec<_> = relations
             .iter()
-            .filter(|r| r.predicate == "contemporary_of" && r.confidence <= 0.35)
+            .filter(|r| r.predicate == "contemporary_of" && r.confidence <= 0.50)
             .collect();
 
         let mut pruned = 0usize;
@@ -5448,6 +5452,41 @@ impl<'a> Prometheus<'a> {
             let mutual = s_neighbors.intersection(&o_neighbors).count();
             if mutual == 0 {
                 // No shared neighbors via meaningful predicates — pure temporal noise
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                    Ok(())
+                })?;
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
+
+    /// Prune contemporary_of relations where both endpoints are low-degree
+    /// (≤ max_other_degree non-contemporary relations each). These are weak
+    /// temporal inferences that inflate edge count without real knowledge.
+    pub fn prune_low_degree_contemporary(&self, max_other_degree: usize) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+
+        // Count non-contemporary degree for each entity
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            if r.predicate != "contemporary_of" {
+                *degree.entry(r.subject_id).or_insert(0) += 1;
+                *degree.entry(r.object_id).or_insert(0) += 1;
+            }
+        }
+
+        let contemporary_rels: Vec<_> = relations
+            .iter()
+            .filter(|r| r.predicate == "contemporary_of")
+            .collect();
+
+        let mut pruned = 0usize;
+        for r in &contemporary_rels {
+            let s_deg = degree.get(&r.subject_id).copied().unwrap_or(0);
+            let o_deg = degree.get(&r.object_id).copied().unwrap_or(0);
+            if s_deg <= max_other_degree && o_deg <= max_other_degree {
                 self.brain.with_conn(|conn| {
                     conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
                     Ok(())
