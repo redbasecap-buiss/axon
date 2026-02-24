@@ -4103,3 +4103,126 @@ pub fn hub_quality(
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     Ok(results)
 }
+
+/// Approximate betweenness centrality via random-source BFS sampling.
+/// `samples` controls accuracy vs speed (e.g. 100-500).
+/// Returns vec of (entity_id, betweenness_score) sorted descending.
+pub fn approx_betweenness(
+    brain: &Brain,
+    samples: usize,
+) -> Result<Vec<(i64, f64)>, rusqlite::Error> {
+    use std::collections::VecDeque;
+
+    let relations = brain.all_relations()?;
+    // Build undirected adjacency list
+    let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
+    for r in &relations {
+        adj.entry(r.subject_id).or_default().push(r.object_id);
+        adj.entry(r.object_id).or_default().push(r.subject_id);
+    }
+    let nodes: Vec<i64> = adj.keys().copied().collect();
+    if nodes.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut bc: HashMap<i64, f64> = HashMap::new();
+    let step = (nodes.len() / samples).max(1);
+
+    // Brandes-style single-source BFS for sampled sources
+    for &source in nodes.iter().step_by(step) {
+        let mut stack: Vec<i64> = Vec::new();
+        let mut pred: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut sigma: HashMap<i64, f64> = HashMap::new();
+        let mut dist: HashMap<i64, i64> = HashMap::new();
+
+        sigma.insert(source, 1.0);
+        dist.insert(source, 0);
+        let mut queue = VecDeque::new();
+        queue.push_back(source);
+
+        while let Some(v) = queue.pop_front() {
+            stack.push(v);
+            let dv = dist[&v];
+            if let Some(neighbors) = adj.get(&v) {
+                for &w in neighbors {
+                    // First visit?
+                    if !dist.contains_key(&w) {
+                        dist.insert(w, dv + 1);
+                        queue.push_back(w);
+                    }
+                    if dist[&w] == dv + 1 {
+                        *sigma.entry(w).or_insert(0.0) += sigma[&v];
+                        pred.entry(w).or_default().push(v);
+                    }
+                }
+            }
+        }
+
+        let mut delta: HashMap<i64, f64> = HashMap::new();
+        while let Some(w) = stack.pop() {
+            if let Some(preds) = pred.get(&w) {
+                let sw = sigma.get(&w).copied().unwrap_or(1.0);
+                let dw = delta.get(&w).copied().unwrap_or(0.0);
+                for &v in preds {
+                    let sv = sigma.get(&v).copied().unwrap_or(1.0);
+                    let d = (sv / sw) * (1.0 + dw);
+                    *delta.entry(v).or_insert(0.0) += d;
+                }
+            }
+            if w != source {
+                *bc.entry(w).or_insert(0.0) += delta.get(&w).copied().unwrap_or(0.0);
+            }
+        }
+    }
+
+    // Normalize by number of samples
+    let scale = nodes.len() as f64 / (step * samples).max(1) as f64;
+    let mut result: Vec<(i64, f64)> = bc.into_iter().map(|(k, v)| (k, v * scale)).collect();
+    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(result)
+}
+
+/// Structural hole score: entities that bridge otherwise disconnected clusters.
+/// Uses Burt's constraint metric approximation: low constraint = structural hole.
+/// Returns (entity_id, constraint, degree) sorted by constraint ascending (best holes first).
+pub fn structural_holes(
+    brain: &Brain,
+    min_degree: usize,
+) -> Result<Vec<(i64, f64, usize)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+    for r in &relations {
+        adj.entry(r.subject_id).or_default().insert(r.object_id);
+        adj.entry(r.object_id).or_default().insert(r.subject_id);
+    }
+
+    let mut results: Vec<(i64, f64, usize)> = Vec::new();
+    for (&ego, neighbors) in &adj {
+        let deg = neighbors.len();
+        if deg < min_degree {
+            continue;
+        }
+        // Constraint for ego: sum over all neighbors j of (p_ij + sum_q p_iq * p_qj)^2
+        // where p_ij = 1/degree(ego) for unweighted
+        let p_direct = 1.0 / deg as f64;
+        let mut total_constraint = 0.0;
+        for &j in neighbors {
+            let mut indirect = 0.0;
+            for &q in neighbors {
+                if q == j {
+                    continue;
+                }
+                // Does q connect to j?
+                if adj.get(&q).map(|s| s.contains(&j)).unwrap_or(false) {
+                    indirect += p_direct * (1.0 / adj.get(&q).map(|s| s.len()).unwrap_or(1) as f64);
+                }
+            }
+            let c_j = (p_direct + indirect).powi(2);
+            total_constraint += c_j;
+        }
+        results.push((ego, total_constraint, deg));
+    }
+
+    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(results)
+}

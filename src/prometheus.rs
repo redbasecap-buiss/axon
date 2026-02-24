@@ -14718,6 +14718,139 @@ impl<'a> Prometheus<'a> {
     /// (e.g., entity connected to many others only via "contemporary_of").
     /// Removes relations from the dominant predicate if they're low confidence,
     /// keeping the entity but reducing its artificial inflation.
+    /// Detect discovery plateau: returns (is_plateau, recent_rate, trend).
+    /// A plateau means the last 5 runs show declining or flat confirmation rate.
+    pub fn detect_plateau(&self) -> Result<(bool, f64, f64)> {
+        let rows: Vec<(i64, i64)> = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT hypotheses_generated, confirmed FROM discovery_velocity ORDER BY id DESC LIMIT 10"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+            Ok(rows)
+        })?;
+
+        if rows.len() < 5 {
+            return Ok((false, 0.0, 0.0));
+        }
+
+        let rates: Vec<f64> = rows
+            .iter()
+            .map(|(gen, conf)| {
+                if *gen == 0 {
+                    0.0
+                } else {
+                    *conf as f64 / *gen as f64
+                }
+            })
+            .collect();
+
+        let recent_avg = rates[..5].iter().sum::<f64>() / 5.0;
+        let older_avg = if rates.len() >= 10 {
+            rates[5..10].iter().sum::<f64>() / 5.0
+        } else {
+            rates[5..].iter().sum::<f64>() / rates[5..].len().max(1) as f64
+        };
+
+        let trend = recent_avg - older_avg;
+        let is_plateau = trend <= 0.0 && recent_avg < 0.5;
+
+        Ok((is_plateau, recent_avg, trend))
+    }
+
+    /// Use structural holes to find bridge entities and generate cross-domain hypotheses.
+    pub fn generate_hypotheses_from_structural_holes(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<Hypothesis>> {
+        let holes = crate::graph::structural_holes(self.brain, 5)?;
+        let entities = self.brain.all_entities()?;
+        let id_name: HashMap<i64, String> =
+            entities.iter().map(|e| (e.id, e.name.clone())).collect();
+        let relations = self.brain.all_relations()?;
+
+        // For top structural hole entities, look at their neighborhoods and propose cross-cluster links
+        let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
+        for r in &relations {
+            adj.entry(r.subject_id).or_default().push(r.object_id);
+            adj.entry(r.object_id).or_default().push(r.subject_id);
+        }
+
+        let mut hypotheses = Vec::new();
+        for (eid, constraint, _deg) in holes.iter().take(limit.min(20)) {
+            let bridge_name = match id_name.get(eid) {
+                Some(n) => n.clone(),
+                None => continue,
+            };
+            if is_noise_name(&bridge_name) {
+                continue;
+            }
+
+            // Get neighbors and check if any pair of them might be related
+            let neighbors = match adj.get(eid) {
+                Some(n) => n,
+                None => continue,
+            };
+            if neighbors.len() < 3 {
+                continue;
+            }
+
+            // Sample up to 20 neighbor pairs
+            let sample: Vec<i64> = neighbors.iter().take(20).copied().collect();
+            for i in 0..sample.len().min(10) {
+                for j in (i + 1)..sample.len().min(10) {
+                    let a = sample[i];
+                    let b = sample[j];
+                    // Skip if already connected
+                    if adj.get(&a).map(|v| v.contains(&b)).unwrap_or(false) {
+                        continue;
+                    }
+
+                    let name_a = match id_name.get(&a) {
+                        Some(n) => n.as_str(),
+                        None => continue,
+                    };
+                    let name_b = match id_name.get(&b) {
+                        Some(n) => n.as_str(),
+                        None => continue,
+                    };
+                    if is_noise_name(name_a) || is_noise_name(name_b) {
+                        continue;
+                    }
+
+                    let conf = (0.6 - constraint * 0.5).max(0.25).min(0.75);
+                    hypotheses.push(Hypothesis {
+                        id: 0,
+                        subject: name_a.to_string(),
+                        predicate: "related_to".to_string(),
+                        object: name_b.to_string(),
+                        confidence: conf,
+                        evidence_for: vec![format!("structural_hole_bridge={bridge_name},constraint={constraint:.3}")],
+                        evidence_against: vec![],
+                        reasoning_chain: vec![format!(
+                            "Both {name_a} and {name_b} connect through structural hole bridge \
+                             '{bridge_name}' (constraint={constraint:.3}), suggesting potential cross-domain link"
+                        )],
+                        status: HypothesisStatus::Testing,
+                        discovered_at: Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                        pattern_source: "structural_hole".to_string(),
+                    });
+                    if hypotheses.len() >= limit {
+                        break;
+                    }
+                }
+                if hypotheses.len() >= limit {
+                    break;
+                }
+            }
+            if hypotheses.len() >= limit {
+                break;
+            }
+        }
+        Ok(hypotheses)
+    }
+
     pub fn demote_uniform_hubs(&self, min_degree: usize, max_dominant_frac: f64) -> Result<usize> {
         let entropy_data = crate::graph::per_entity_predicate_entropy(self.brain, min_degree)?;
         let entities = self.brain.all_entities()?;
