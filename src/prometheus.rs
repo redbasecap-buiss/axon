@@ -9385,8 +9385,7 @@ impl<'a> Prometheus<'a> {
                 "co_researchers"
             } else if shared_types.get("event").copied().unwrap_or(0) > 0 {
                 "co_participants"
-            } else if shared_types.get("place").copied().unwrap_or(0) > 0
-                && shared_types.len() == 1
+            } else if shared_types.get("place").copied().unwrap_or(0) > 0 && shared_types.len() == 1
             {
                 "co_located_in"
             } else {
@@ -11363,37 +11362,135 @@ impl<'a> Prometheus<'a> {
 
             // 6. Organization-like suffixes ("Firefly Aerospace", "Circolo Matematico", "Matematica Italiana")
             let org_suffixes: HashSet<&str> = [
-                "aerospace", "airlines", "airways", "associates", "automotive",
-                "bank", "brewing", "brothers", "capital", "chemicals", "clinic",
-                "club", "co", "college", "comics", "commission", "committee",
-                "communications", "company", "consortium", "consulting", "corp",
-                "corporation", "council", "dynamics", "electronics", "energy",
-                "engineering", "ensemble", "entertainment", "enterprises", "factory",
-                "federation", "films", "foundation", "fund", "gallery", "games",
-                "group", "healthcare", "holdings", "hospital", "inc", "incorporated",
-                "industries", "initiative", "instruments", "insurance", "international",
-                "italiana", "italiano", "laboratoire", "laboratorio", "laboratories",
-                "laboratory", "labs", "league", "library", "limited", "llc", "ltd",
-                "manufacturing", "matematica", "matematico", "media", "microsystems",
-                "motors", "museum", "nacional", "network", "networks", "observatory",
-                "orchestra", "organization", "partnership", "pharmaceuticals", "pharmacy",
-                "pictures", "plc", "press", "productions", "programs", "project",
-                "publishing", "records", "research", "restaurant", "robotics", "school",
-                "sciences", "semiconductor", "seminary", "services", "shipping",
-                "software", "solutions", "society", "squadron", "stadium", "station",
-                "studios", "systems", "teatro", "tech", "technologies", "technology",
-                "telecom", "therapeutics", "trust", "union", "university", "ventures",
+                "aerospace",
+                "airlines",
+                "airways",
+                "associates",
+                "automotive",
+                "bank",
+                "brewing",
+                "brothers",
+                "capital",
+                "chemicals",
+                "clinic",
+                "club",
+                "co",
+                "college",
+                "comics",
+                "commission",
+                "committee",
+                "communications",
+                "company",
+                "consortium",
+                "consulting",
+                "corp",
+                "corporation",
+                "council",
+                "dynamics",
+                "electronics",
+                "energy",
+                "engineering",
+                "ensemble",
+                "entertainment",
+                "enterprises",
+                "factory",
+                "federation",
+                "films",
+                "foundation",
+                "fund",
+                "gallery",
+                "games",
+                "group",
+                "healthcare",
+                "holdings",
+                "hospital",
+                "inc",
+                "incorporated",
+                "industries",
+                "initiative",
+                "instruments",
+                "insurance",
+                "international",
+                "italiana",
+                "italiano",
+                "laboratoire",
+                "laboratorio",
+                "laboratories",
+                "laboratory",
+                "labs",
+                "league",
+                "library",
+                "limited",
+                "llc",
+                "ltd",
+                "manufacturing",
+                "matematica",
+                "matematico",
+                "media",
+                "microsystems",
+                "motors",
+                "museum",
+                "nacional",
+                "network",
+                "networks",
+                "observatory",
+                "orchestra",
+                "organization",
+                "partnership",
+                "pharmaceuticals",
+                "pharmacy",
+                "pictures",
+                "plc",
+                "press",
+                "productions",
+                "programs",
+                "project",
+                "publishing",
+                "records",
+                "research",
+                "restaurant",
+                "robotics",
+                "school",
+                "sciences",
+                "semiconductor",
+                "seminary",
+                "services",
+                "shipping",
+                "software",
+                "solutions",
+                "society",
+                "squadron",
+                "stadium",
+                "station",
+                "studios",
+                "systems",
+                "teatro",
+                "tech",
+                "technologies",
+                "technology",
+                "telecom",
+                "therapeutics",
+                "trust",
+                "union",
+                "university",
+                "ventures",
                 "werkstatt",
-            ].into_iter().collect();
-            let ends_org_suffix = words.last().is_some_and(|w| {
-                org_suffixes.contains(w.to_lowercase().as_str())
-            }) && words.len() >= 2;
+            ]
+            .into_iter()
+            .collect();
+            let ends_org_suffix = words
+                .last()
+                .is_some_and(|w| org_suffixes.contains(w.to_lowercase().as_str()))
+                && words.len() >= 2;
 
             // 7. Starts with "St" / "San" / "Santa" / "Nea" / "Syr" — likely place names
-            let place_prefixes = ["st", "san", "santa", "nea", "syr", "fort", "mount", "cape", "port", "lago", "isla"];
-            let starts_place_prefix = words.first().is_some_and(|w| {
-                place_prefixes.contains(&w.to_lowercase().as_str())
-            }) && words.len() >= 2;
+            let place_prefixes = [
+                "st", "san", "santa", "nea", "syr", "fort", "mount", "cape", "port", "lago", "isla",
+            ];
+            let starts_place_prefix = words
+                .first()
+                .is_some_and(|w| place_prefixes.contains(&w.to_lowercase().as_str()))
+                && words.len() >= 2;
 
             if has_concept_word
                 || has_place_word

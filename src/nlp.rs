@@ -2547,13 +2547,13 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
-    // Multi-word concepts over 50 chars are almost always citation/article title fragments
-    if etype == "concept" && trimmed.contains(' ') && trimmed.len() > 50 {
+    // Multi-word concepts over 40 chars are almost always citation/article title fragments
+    if etype == "concept" && trimmed.contains(' ') && trimmed.len() > 40 {
         return false;
     }
 
-    // Person names over 40 chars are typically citation fragments
-    if etype == "person" && trimmed.len() > 40 {
+    // Person names over 35 chars are typically citation fragments
+    if etype == "person" && trimmed.len() > 35 {
         return false;
     }
 
@@ -2845,8 +2845,36 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
                 "rich",
                 "poor",
                 "dependent",
+                "dimensional",
+                "controlled",
+                "martial",
+                "equilibrium",
+                "state",
+                "time",
+                "domain",
+                "level",
+                "scale",
+                "order",
+                "body",
+                "step",
+                "valued",
+                "valued",
+                "connected",
+                "coupled",
+                "resolved",
             ];
             if adjective_suffixes.iter().any(|s| last == s) {
+                return false;
+            }
+        }
+        // Also reject "Nationality-Nationality" patterns (e.g. "Chinese-Soviet", "Sino-American")
+        if let Some(first) = parts.first() {
+            let nationality_stems = [
+                "sino", "anglo", "franco", "russo", "austro", "indo", "chinese", "american",
+                "soviet", "british", "french", "german", "italian", "spanish", "russian",
+                "japanese", "african", "european", "axis", "allied",
+            ];
+            if nationality_stems.contains(first) {
                 return false;
             }
         }
