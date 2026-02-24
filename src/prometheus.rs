@@ -4205,6 +4205,19 @@ impl<'a> Prometheus<'a> {
         );
         all_hypotheses.extend(bridge_hyps);
 
+        // 2d2. Community homophily (same type + same community + shared neighbors)
+        let t1 = std::time::Instant::now();
+        let ch_weight = self.get_pattern_weight("community_homophily")?;
+        if ch_weight >= 0.05 {
+            let ch_hyps = self.generate_hypotheses_from_community_homophily()?;
+            eprintln!(
+                "[PROMETHEUS] community_homophily: {} in {:?}",
+                ch_hyps.len(),
+                t1.elapsed()
+            );
+            all_hypotheses.extend(ch_hyps);
+        }
+
         // 2e. Predicate chain hypotheses
         let t1 = std::time::Instant::now();
         let chain_weight = self.get_pattern_weight("predicate_chain")?;
@@ -10452,6 +10465,105 @@ impl<'a> Prometheus<'a> {
                         status: HypothesisStatus::Proposed,
                         discovered_at: now_str(),
                         pattern_source: "community_bridge".to_string(),
+                    });
+                    if hypotheses.len() >= 50 {
+                        return Ok(hypotheses);
+                    }
+                }
+            }
+        }
+        Ok(hypotheses)
+    }
+
+    /// Community homophily: same-type entities within the same Louvain community
+    /// that are not directly connected. Entities clustered together by community
+    /// detection AND sharing the same type are very likely related — this exploits
+    /// the strong signal that community_bridge already demonstrates (96% weight).
+    pub fn generate_hypotheses_from_community_homophily(&self) -> Result<Vec<Hypothesis>> {
+        let communities = crate::graph::louvain_communities(self.brain)?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let relations = self.brain.all_relations()?;
+
+        // Build adjacency for meaningful entities
+        let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+        for r in &relations {
+            if meaningful.contains(&r.subject_id) && meaningful.contains(&r.object_id) {
+                adj.entry(r.subject_id).or_default().insert(r.object_id);
+                adj.entry(r.object_id).or_default().insert(r.subject_id);
+            }
+        }
+
+        // Group community members by (community, entity_type)
+        let mut comm_type_groups: HashMap<(usize, String), Vec<i64>> = HashMap::new();
+        for (&eid, &comm) in &communities {
+            if !meaningful.contains(&eid) {
+                continue;
+            }
+            // Only consider entities with at least 1 relation (skip total isolates)
+            if !adj.contains_key(&eid) {
+                continue;
+            }
+            if let Ok(Some(ent)) = self.brain.get_entity_by_id(eid) {
+                if HIGH_VALUE_TYPES.contains(&ent.entity_type.as_str()) {
+                    comm_type_groups
+                        .entry((comm, ent.entity_type))
+                        .or_default()
+                        .push(eid);
+                }
+            }
+        }
+
+        let mut hypotheses = Vec::new();
+        let mut seen: HashSet<(i64, i64)> = HashSet::new();
+
+        for ((_comm, etype), members) in &comm_type_groups {
+            // Only groups with 2-20 members (avoid huge/trivial groups)
+            if members.len() < 2 || members.len() > 20 {
+                continue;
+            }
+            for i in 0..members.len() {
+                for j in (i + 1)..members.len() {
+                    let a = members[i];
+                    let b = members[j];
+                    // Skip if already directly connected
+                    if adj.get(&a).is_some_and(|s| s.contains(&b)) {
+                        continue;
+                    }
+                    let key = if a < b { (a, b) } else { (b, a) };
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    // Require at least 1 shared neighbor (structural evidence)
+                    let a_nb = adj.get(&a).cloned().unwrap_or_default();
+                    let b_nb = adj.get(&b).cloned().unwrap_or_default();
+                    let shared: usize = a_nb.intersection(&b_nb).count();
+                    if shared == 0 {
+                        continue;
+                    }
+
+                    let a_name = self.entity_name(a)?;
+                    let b_name = self.entity_name(b)?;
+                    let conf = (0.50 + 0.05 * shared.min(6) as f64).min(0.85);
+
+                    hypotheses.push(Hypothesis {
+                        id: 0,
+                        subject: a_name.clone(),
+                        predicate: "related_to".to_string(),
+                        object: b_name.clone(),
+                        confidence: conf,
+                        evidence_for: vec![format!(
+                            "Same community, same type ({}), {} shared neighbors",
+                            etype, shared
+                        )],
+                        evidence_against: vec![],
+                        reasoning_chain: vec![
+                            format!("{} and {} are both {} entities", a_name, b_name, etype),
+                            format!("Louvain grouped them in the same community"),
+                            format!("{} shared neighbors provide structural evidence", shared),
+                        ],
+                        status: HypothesisStatus::Proposed,
+                        discovered_at: now_str(),
+                        pattern_source: "community_homophily".to_string(),
                     });
                     if hypotheses.len() >= 50 {
                         return Ok(hypotheses);

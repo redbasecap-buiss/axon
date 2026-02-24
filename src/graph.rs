@@ -5598,3 +5598,82 @@ pub fn k_shell_summary(
     sorted.sort_by_key(|&(k, _)| k);
     Ok((max_k, core_size, sorted))
 }
+
+/// Eigenvector centrality via power iteration.
+/// Returns a map of entity_id → centrality score (normalized so max = 1.0).
+/// Eigenvector centrality ranks nodes higher when connected to other
+/// high-centrality nodes — unlike PageRank, it measures influence by
+/// association quality rather than link structure.
+pub fn eigenvector_centrality(
+    brain: &Brain,
+    max_iter: usize,
+    tol: f64,
+) -> Result<HashMap<i64, f64>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let nodes: Vec<i64> = adj.keys().copied().collect();
+    let n = nodes.len();
+    if n == 0 {
+        return Ok(HashMap::new());
+    }
+
+    // Initialize uniformly
+    let mut scores: HashMap<i64, f64> = nodes.iter().map(|&id| (id, 1.0 / n as f64)).collect();
+
+    for _ in 0..max_iter {
+        let mut new_scores: HashMap<i64, f64> = HashMap::with_capacity(n);
+        for &node in &nodes {
+            let mut sum = 0.0;
+            if let Some(neighbors) = adj.get(&node) {
+                for &nb in neighbors {
+                    sum += scores.get(&nb).copied().unwrap_or(0.0);
+                }
+            }
+            new_scores.insert(node, sum);
+        }
+
+        // Normalize by L2 norm
+        let norm: f64 = new_scores.values().map(|v| v * v).sum::<f64>().sqrt();
+        if norm > 0.0 {
+            for v in new_scores.values_mut() {
+                *v /= norm;
+            }
+        }
+
+        // Check convergence
+        let delta: f64 = nodes
+            .iter()
+            .map(|id| {
+                let old = scores.get(id).copied().unwrap_or(0.0);
+                let new = new_scores.get(id).copied().unwrap_or(0.0);
+                (old - new).abs()
+            })
+            .sum();
+
+        scores = new_scores;
+        if delta < tol {
+            break;
+        }
+    }
+
+    // Normalize so max = 1.0
+    let max_val = scores.values().copied().fold(0.0_f64, f64::max);
+    if max_val > 0.0 {
+        for v in scores.values_mut() {
+            *v /= max_val;
+        }
+    }
+
+    Ok(scores)
+}
+
+/// Top-k entities by eigenvector centrality.
+pub fn eigenvector_centrality_top_k(
+    brain: &Brain,
+    k: usize,
+) -> Result<Vec<(i64, f64)>, rusqlite::Error> {
+    let scores = eigenvector_centrality(brain, 100, 1e-6)?;
+    let mut sorted: Vec<(i64, f64)> = scores.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.truncate(k);
+    Ok(sorted)
+}
