@@ -2655,6 +2655,22 @@ const TRAILING_JUNK: &[&str] = &[
     "oct",
     "nov",
     "dec",
+    // Citation/publisher/academic trailing fragments
+    "some",
+    "advances",
+    "birds",
+    "geometry",
+    "notices",
+    "proceedings",
+    "magnitude",
+    "revue",
+    "praeger",
+    "univ",
+    "blackwell",
+    "veit",
+    "jahr",
+    "sometimes",
+    "expression",
 ];
 
 fn is_valid_entity(name: &str, etype: &str) -> bool {
@@ -2932,6 +2948,22 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             "considered",
             "established",
             "published",
+            // Academic/citation leading fragments
+            "pattern",
+            "cultural",
+            "analysis",
+            "glacier",
+            "mathematic",
+            "theory",
+            "history",
+            "given",
+            "publications",
+            "konferenz",
+            "parallellinien",
+            "mengenlehre",
+            "klimabulletin",
+            "bioingenieria",
+            "denver",
         ];
         if lower.contains(' ') && leading_verbs.contains(&first_word) {
             return false;
