@@ -266,6 +266,49 @@ fn is_generic_predicate(p: &str) -> bool {
     GENERIC_PREDICATES.contains(&p)
 }
 
+/// Infer a more specific predicate for a hypothesized relation based on entity types
+/// and optional shared-neighbor context. Returns a predicate string.
+/// `shared_neighbor_types` is a map from entity_type → count of shared neighbors of that type.
+fn infer_predicate(
+    a_type: &str,
+    b_type: &str,
+    shared_neighbor_types: Option<&HashMap<String, usize>>,
+) -> &'static str {
+    // If we have shared-neighbor evidence, use it for person-person refinement
+    if a_type == "person" && b_type == "person" {
+        if let Some(snt) = shared_neighbor_types {
+            if snt.get("organization").copied().unwrap_or(0) > 0 {
+                return "colleagues_at";
+            }
+            if snt.get("concept").copied().unwrap_or(0) >= 2 {
+                return "co_researchers";
+            }
+            if snt.get("event").copied().unwrap_or(0) > 0 {
+                return "co_participants";
+            }
+            if snt.get("technology").copied().unwrap_or(0) > 0 {
+                return "co_researchers";
+            }
+        }
+    }
+
+    // Type-pair defaults
+    match (a_type, b_type) {
+        ("person", "person") => "contemporary_of",
+        ("concept", "concept") => "related_concept",
+        ("organization", "organization") => "partner_of",
+        ("place", "place") => "associated_with",
+        ("person", "organization") | ("organization", "person") => "affiliated_with",
+        ("person", "concept") | ("concept", "person") => "contributed_to",
+        ("person", "place") | ("place", "person") => "active_in",
+        ("person", "technology") | ("technology", "person") => "works_on",
+        ("organization", "concept") | ("concept", "organization") => "relevant_to",
+        ("organization", "place") | ("place", "organization") => "based_in",
+        ("technology", "concept") | ("concept", "technology") => "relevant_to",
+        _ => "related_to",
+    }
+}
+
 /// Verb-heavy words that signal a sentence fragment rather than a real entity name.
 const FRAGMENT_VERBS: &[&str] = &[
     "would",
@@ -468,6 +511,13 @@ fn is_noise_name(name: &str) -> bool {
             "establishing",
             "developing",
             "producing",
+            "officially",
+            "formerly",
+            "previously",
+            "originally",
+            "subsequently",
+            "newly",
+            "recently",
             "creating",
             "building",
             "making",
@@ -8550,12 +8600,7 @@ impl<'a> Prometheus<'a> {
             }
             let a_type = id_type.get(a).copied().unwrap_or("?");
             let b_type = id_type.get(b).copied().unwrap_or("?");
-            let predicate = match (a_type, b_type) {
-                ("person", "person") => "contemporary_of",
-                ("concept", "concept") => "related_concept",
-                ("organization", "organization") => "partner_of",
-                _ => "related_to",
-            };
+            let predicate = infer_predicate(a_type, b_type, None);
             hypotheses.push(Hypothesis {
                 id: 0,
                 subject: a_name.to_string(),
@@ -8661,13 +8706,7 @@ impl<'a> Prometheus<'a> {
                 continue;
             }
 
-            let predicate = match (a_type, c_type) {
-                ("person", "person") => "contemporary_of",
-                ("concept", "concept") => "related_concept",
-                ("place", "place") => "associated_with",
-                ("person", "organization") | ("organization", "person") => "affiliated_with",
-                _ => "related_to",
-            };
+            let predicate = infer_predicate(a_type, c_type, None);
 
             let intermediary_names: Vec<String> = pair_intermediaries[&(a, c)]
                 .iter()
@@ -8727,12 +8766,7 @@ impl<'a> Prometheus<'a> {
             }
             let a_type = id_type.get(a).copied().unwrap_or("unknown");
             let b_type = id_type.get(b).copied().unwrap_or("unknown");
-            let predicate = match (a_type, b_type) {
-                ("person", "person") => "contemporary_of",
-                ("concept", "concept") => "related_concept",
-                ("person", "organization") | ("organization", "person") => "affiliated_with",
-                _ => "related_to",
-            };
+            let predicate = infer_predicate(a_type, b_type, None);
             let confidence = self
                 .calibrated_confidence("jaccard", 0.35 + (score * 0.5).min(0.45))
                 .unwrap_or(0.5);
@@ -11125,14 +11159,7 @@ impl<'a> Prometheus<'a> {
                 }
 
                 // Determine predicate based on types
-                let predicate = match (island_type, target_type) {
-                    ("person", "person") => "contemporary_of",
-                    ("place", "place") => "associated_with",
-                    ("concept", "concept") => "related_concept",
-                    ("person", "organization") | ("organization", "person") => "affiliated_with",
-                    ("person", "place") | ("place", "person") => "associated_with",
-                    _ => "associated_with",
-                };
+                let predicate = infer_predicate(island_type, target_type, None);
 
                 eprintln!(
                     "  [token-reconnect] {} → {} (score: {:.2}, pred: {})",
@@ -15183,5 +15210,49 @@ mod tests {
         assert!(is_contradicting_predicate("is", "is_not"));
         assert!(is_contradicting_predicate("has", "lacks"));
         assert!(!is_contradicting_predicate("is", "has"));
+    }
+
+    #[test]
+    fn test_detect_correct_type_geopolitical() {
+        let cases = vec![
+            ("spanish netherlands", "person", Some("place")),
+            ("austrian netherlands", "person", Some("place")),
+            ("ottoman empire", "person", Some("place")),
+            ("roman republic", "concept", Some("place")),
+            ("ming dynasty", "person", Some("place")),
+            ("soviet union", "person", Some("place")),
+            ("trade union", "person", Some("organization")),
+        ];
+        for (name, current_type, expected) in cases {
+            let words: Vec<&str> = name.split_whitespace().collect();
+            let result = detect_correct_type(name, &words, current_type);
+            assert_eq!(
+                result, expected,
+                "detect_correct_type({:?}, {:?}) = {:?}, expected {:?}",
+                name, current_type, result, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_infer_predicate_basics() {
+        assert_eq!(infer_predicate("person", "person", None), "contemporary_of");
+        assert_eq!(
+            infer_predicate("person", "organization", None),
+            "affiliated_with"
+        );
+        assert_eq!(infer_predicate("person", "place", None), "active_in");
+        assert_eq!(
+            infer_predicate("concept", "concept", None),
+            "related_concept"
+        );
+
+        // With shared neighbor context
+        let mut snt = HashMap::new();
+        snt.insert("organization".to_string(), 1);
+        assert_eq!(
+            infer_predicate("person", "person", Some(&snt)),
+            "colleagues_at"
+        );
     }
 }
