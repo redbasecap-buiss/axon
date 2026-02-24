@@ -2416,6 +2416,31 @@ impl<'a> Prometheus<'a> {
             h.confidence = (h.confidence - 0.3).max(0.0);
         }
 
+        // Type compatibility check: penalize hypotheses linking incompatible entity types
+        if h.object != "?" {
+            if let (Some(s_ent), Some(o_ent)) = (
+                self.brain.get_entity_by_name(&h.subject)?,
+                self.brain.get_entity_by_name(&h.object)?,
+            ) {
+                let incompatible = matches!(
+                    (s_ent.entity_type.as_str(), o_ent.entity_type.as_str(), h.predicate.as_str()),
+                    ("person", "place", "contemporary_of")
+                        | ("place", "person", "contemporary_of")
+                        | ("concept", "person", "located_near")
+                        | ("person", "concept", "located_near")
+                        | ("technology", "place", "contemporary_of")
+                        | ("place", "technology", "contemporary_of")
+                );
+                if incompatible {
+                    h.evidence_against.push(format!(
+                        "Type mismatch: {} ({}) → {} → {} ({})",
+                        h.subject, s_ent.entity_type, h.predicate, h.object, o_ent.entity_type
+                    ));
+                    h.confidence = (h.confidence - 0.2).max(0.0);
+                }
+            }
+        }
+
         // Update status based on confidence
         let was_confirmed = h.status == HypothesisStatus::Confirmed;
         if h.confidence >= 0.8 {
@@ -3507,8 +3532,8 @@ impl<'a> Prometheus<'a> {
         // Refine contemporary_of using shared-neighbor evidence
         let contemporary_refined = self.refine_contemporary_of().unwrap_or(0);
 
-        // Promote mature testing hypotheses (>3 days, confidence >= 0.65)
-        let promoted = self.promote_mature_hypotheses(3, 0.65).unwrap_or(0);
+        // Promote mature testing hypotheses (>7 days, confidence >= 0.75)
+        let promoted = self.promote_mature_hypotheses(7, 0.75).unwrap_or(0);
 
         // Hypothesis pair deduplication (prevent bloat from multiple runs)
         let pair_deduped = self.dedup_hypotheses_by_pair().unwrap_or(0);
@@ -4553,8 +4578,8 @@ impl<'a> Prometheus<'a> {
                     // Only confirm via path if it's a direct connection (len=2) or
                     // a 2-hop path (len=3) with high base confidence
                     let path_boost = match p.len() {
-                        2 => 0.3,                         // direct connection is strong evidence
-                        3 if h.confidence >= 0.5 => 0.15, // 2-hop with existing confidence
+                        2 => 0.25,                        // direct connection is strong evidence
+                        3 if h.confidence >= 0.6 => 0.10, // 2-hop with high existing confidence
                         _ => 0.0,                         // longer paths are too weak
                     };
                     if path_boost > 0.0 {
