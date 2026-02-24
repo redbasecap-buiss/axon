@@ -2301,6 +2301,20 @@ impl<'a> Prometheus<'a> {
 
     /// Validate a hypothesis against existing knowledge.
     pub fn validate_hypothesis(&self, h: &mut Hypothesis) -> Result<()> {
+        // Strategies that already use neighbor overlap as their primary signal —
+        // don't double-count shared neighbors for these.
+        const NEIGHBOR_BASED_STRATEGIES: &[&str] = &[
+            "community_bridge",
+            "resource_allocation",
+            "neighborhood_overlap",
+            "jaccard",
+            "adamic_adar",
+            "triadic_closure",
+            "near_miss",
+            "semantic_fingerprint",
+        ];
+        let skip_neighbor_boost = NEIGHBOR_BASED_STRATEGIES.contains(&h.pattern_source.as_str());
+
         // Search for supporting/contradicting evidence in the graph
         let subj = self.brain.search_entities(&h.subject)?;
         let _obj = if h.object != "?" {
@@ -2310,6 +2324,7 @@ impl<'a> Prometheus<'a> {
         };
 
         // Check if the relation already exists (confirms the hypothesis)
+        let mut direct_evidence = false;
         for s in &subj {
             let rels = self.brain.get_relations_for(s.id)?;
             for (sname, pred, oname, conf) in &rels {
@@ -2321,12 +2336,14 @@ impl<'a> Prometheus<'a> {
                         sname, pred, oname, conf
                     ));
                     h.confidence = (h.confidence + 0.2).min(1.0);
+                    direct_evidence = true;
                 }
             }
         }
 
         // Check for shared neighbors (indirect evidence of relatedness)
-        if h.object != "?" {
+        // Skip this boost for strategies that already used neighbor overlap
+        if h.object != "?" && !skip_neighbor_boost {
             if let (Some(s_ent), Some(o_ent)) = (
                 self.brain.get_entity_by_name(&h.subject)?,
                 self.brain.get_entity_by_name(&h.object)?,
@@ -2358,6 +2375,37 @@ impl<'a> Prometheus<'a> {
                     ));
                     h.confidence = (h.confidence + 0.05 * shared.len() as f64).min(1.0);
                 }
+            }
+        }
+
+        // For neighbor-based strategies without direct evidence, look for
+        // independent corroboration: shared facts or co-occurrence in source URLs
+        if skip_neighbor_boost && !direct_evidence && h.object != "?" {
+            if let (Some(s_ent), Some(o_ent)) = (
+                self.brain.get_entity_by_name(&h.subject)?,
+                self.brain.get_entity_by_name(&h.object)?,
+            ) {
+                // Fact overlap: same key-value pairs across entities
+                let s_facts = self.brain.get_facts_for(s_ent.id)?;
+                let o_facts = self.brain.get_facts_for(o_ent.id)?;
+                let s_keys: HashSet<&str> = s_facts.iter().map(|f| f.key.as_str()).collect();
+                let o_keys: HashSet<&str> = o_facts.iter().map(|f| f.key.as_str()).collect();
+                let shared_keys = s_keys.intersection(&o_keys).count();
+                if shared_keys >= 1 {
+                    h.evidence_for
+                        .push(format!("Shared {} fact keys across entities", shared_keys));
+                    h.confidence = (h.confidence + 0.05 * shared_keys as f64).min(1.0);
+                }
+
+                // Source co-occurrence: both entities appear in the same source URL
+                let s_sources: HashSet<String> = self
+                    .brain
+                    .get_relations_for(s_ent.id)?
+                    .iter()
+                    .filter_map(|(_, _, _, _)| None::<String>) // source_url not in tuple
+                    .collect();
+                // (source URL not easily accessible from relation tuple, skip for now)
+                let _ = s_sources;
             }
         }
 
@@ -3119,6 +3167,17 @@ impl<'a> Prometheus<'a> {
             let rs_hyps = self.generate_hypotheses_from_rising_stars()?;
             eprintln!("[PROMETHEUS] rising_stars: {} hypotheses", rs_hyps.len());
             all_hypotheses.extend(rs_hyps);
+        }
+
+        // 2o. Predicate pattern transfer (entities with similar predicate profiles missing a predicate)
+        let ppt_weight = self.get_pattern_weight("predicate_transfer")?;
+        if ppt_weight >= 0.05 {
+            let ppt_hyps = self.generate_hypotheses_from_predicate_transfer()?;
+            eprintln!(
+                "[PROMETHEUS] predicate_transfer: {} hypotheses",
+                ppt_hyps.len()
+            );
+            all_hypotheses.extend(ppt_hyps);
         }
 
         // 3. Island entities as gaps
@@ -8716,6 +8775,204 @@ impl<'a> Prometheus<'a> {
                         discovered_at: now_str(),
                         pattern_source: "rising_star".to_string(),
                     });
+                }
+            }
+        }
+        hypotheses.truncate(30);
+        Ok(hypotheses)
+    }
+
+    /// Predicate pattern transfer: if two same-type entities share most predicates,
+    /// hypothesize that a predicate present in one but absent in the other should transfer.
+    /// E.g., if Einstein has {pioneered, active_in, affiliated_with} and Bohr has
+    /// {pioneered, active_in} but NOT affiliated_with, suggest Bohr → affiliated_with → ?.
+    pub fn generate_hypotheses_from_predicate_transfer(&self) -> Result<Vec<Hypothesis>> {
+        let entities = self.brain.all_entities()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let relations = self.brain.all_relations()?;
+
+        // Build predicate profile per entity: entity_id → set of (predicate, direction)
+        // Also track (predicate, object_name) for transfer
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Build outgoing predicate profiles
+        let mut out_preds: HashMap<i64, HashSet<String>> = HashMap::new();
+        let mut pred_objects: HashMap<(i64, String), Vec<String>> = HashMap::new();
+        for r in &relations {
+            if !meaningful.contains(&r.subject_id) || !meaningful.contains(&r.object_id) {
+                continue;
+            }
+            if is_generic_predicate(&r.predicate) {
+                continue;
+            }
+            out_preds
+                .entry(r.subject_id)
+                .or_default()
+                .insert(r.predicate.clone());
+            let obj_name = id_name.get(&r.object_id).copied().unwrap_or("?");
+            pred_objects
+                .entry((r.subject_id, r.predicate.clone()))
+                .or_default()
+                .push(obj_name.to_string());
+        }
+
+        // Group entities by type for comparison
+        let mut type_groups: HashMap<&str, Vec<i64>> = HashMap::new();
+        for e in &entities {
+            if !meaningful.contains(&e.id)
+                || is_noise_type(&e.entity_type)
+                || is_noise_name(&e.name)
+            {
+                continue;
+            }
+            let preds = out_preds.get(&e.id);
+            // Only consider entities with at least 2 predicates
+            if preds.map_or(true, |p| p.len() < 2) {
+                continue;
+            }
+            type_groups
+                .entry(id_type.get(&e.id).copied().unwrap_or("?"))
+                .or_default()
+                .push(e.id);
+        }
+
+        let mut hypotheses = Vec::new();
+        let mut seen: HashSet<(i64, String)> = HashSet::new();
+
+        for (_etype, group) in &type_groups {
+            // Only compare within manageable groups
+            let group = if group.len() > 200 {
+                &group[..200]
+            } else {
+                &group[..]
+            };
+            for i in 0..group.len() {
+                if hypotheses.len() >= 30 {
+                    break;
+                }
+                let a = group[i];
+                let a_preds = match out_preds.get(&a) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                for j in (i + 1)..group.len() {
+                    let b = group[j];
+                    let b_preds = match out_preds.get(&b) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+
+                    let shared = a_preds.intersection(b_preds).count();
+                    let total = a_preds.union(b_preds).count();
+                    if total == 0 {
+                        continue;
+                    }
+                    let jaccard = shared as f64 / total as f64;
+                    // Need high overlap (>=0.5) and at least 2 shared predicates
+                    if jaccard < 0.5 || shared < 2 {
+                        continue;
+                    }
+
+                    // Find predicates in A but not B
+                    for missing_pred in a_preds.difference(b_preds) {
+                        let key = (b, missing_pred.clone());
+                        if seen.contains(&key) {
+                            continue;
+                        }
+                        seen.insert(key);
+                        let b_name = id_name.get(&b).copied().unwrap_or("?");
+                        let a_name = id_name.get(&a).copied().unwrap_or("?");
+                        if is_noise_name(b_name) || is_noise_name(a_name) {
+                            continue;
+                        }
+                        // Get an example object from the source entity
+                        let example_obj = pred_objects
+                            .get(&(a, missing_pred.clone()))
+                            .and_then(|objs| objs.first())
+                            .cloned()
+                            .unwrap_or_else(|| "?".to_string());
+                        let confidence = self
+                            .calibrated_confidence(
+                                "predicate_transfer",
+                                (0.3 + jaccard * 0.3).min(0.75),
+                            )
+                            .unwrap_or(0.45);
+                        hypotheses.push(Hypothesis {
+                            id: 0,
+                            subject: b_name.to_string(),
+                            predicate: missing_pred.clone(),
+                            object: "?".to_string(),
+                            confidence,
+                            evidence_for: vec![format!(
+                                "Predicate profile overlap {:.0}% with {} ({} shared predicates); {} has '{}' → {}",
+                                jaccard * 100.0, a_name, shared, a_name, missing_pred, example_obj
+                            )],
+                            evidence_against: vec![],
+                            reasoning_chain: vec![
+                                format!("{} and {} share {} of {} predicates (Jaccard {:.2})", b_name, a_name, shared, total, jaccard),
+                                format!("{} has predicate '{}' but {} does not", a_name, missing_pred, b_name),
+                                "Similar predicate profiles suggest missing predicates should transfer".to_string(),
+                            ],
+                            status: HypothesisStatus::Proposed,
+                            discovered_at: now_str(),
+                            pattern_source: "predicate_transfer".to_string(),
+                        });
+                        if hypotheses.len() >= 30 {
+                            break;
+                        }
+                    }
+                    // Also check B → A direction
+                    for missing_pred in b_preds.difference(a_preds) {
+                        let key = (a, missing_pred.clone());
+                        if seen.contains(&key) {
+                            continue;
+                        }
+                        seen.insert(key);
+                        let a_name = id_name.get(&a).copied().unwrap_or("?");
+                        let b_name = id_name.get(&b).copied().unwrap_or("?");
+                        if is_noise_name(a_name) || is_noise_name(b_name) {
+                            continue;
+                        }
+                        let example_obj = pred_objects
+                            .get(&(b, missing_pred.clone()))
+                            .and_then(|objs| objs.first())
+                            .cloned()
+                            .unwrap_or_else(|| "?".to_string());
+                        let confidence = self
+                            .calibrated_confidence(
+                                "predicate_transfer",
+                                (0.3 + jaccard * 0.3).min(0.75),
+                            )
+                            .unwrap_or(0.45);
+                        hypotheses.push(Hypothesis {
+                            id: 0,
+                            subject: a_name.to_string(),
+                            predicate: missing_pred.clone(),
+                            object: "?".to_string(),
+                            confidence,
+                            evidence_for: vec![format!(
+                                "Predicate profile overlap {:.0}% with {} ({} shared predicates); {} has '{}' → {}",
+                                jaccard * 100.0, b_name, shared, b_name, missing_pred, example_obj
+                            )],
+                            evidence_against: vec![],
+                            reasoning_chain: vec![
+                                format!("{} and {} share {} of {} predicates (Jaccard {:.2})", a_name, b_name, shared, total, jaccard),
+                                format!("{} has predicate '{}' but {} does not", b_name, missing_pred, a_name),
+                                "Similar predicate profiles suggest missing predicates should transfer".to_string(),
+                            ],
+                            status: HypothesisStatus::Proposed,
+                            discovered_at: now_str(),
+                            pattern_source: "predicate_transfer".to_string(),
+                        });
+                        if hypotheses.len() >= 30 {
+                            break;
+                        }
+                    }
                 }
             }
         }
