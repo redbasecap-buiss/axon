@@ -1087,6 +1087,14 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "lecture",
     "worldnews",
     "aridization",
+    // Added 2026-02-24 (brain cleaner round 13): generic/academic noise
+    "anthropology",
+    "characterization",
+    "distribution",
+    "entanglement",
+    "experiment",
+    "flyology",
+    "mutilation",
 ];
 
 /// Common person name prefixes/titles for entity classification.

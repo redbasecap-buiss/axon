@@ -4657,6 +4657,12 @@ impl<'a> Prometheus<'a> {
         // Deep island cleanup (remove low-confidence isolated entities without facts)
         let deep_cleaned = self.deep_island_cleanup(0.8).unwrap_or(0);
 
+        // Prune self-referential relations (object is substring of subject — NLP noise)
+        let self_ref_pruned = self.prune_self_referential_relations().unwrap_or(0);
+
+        // Purge orphaned surname concepts left behind by self-referential cleanup
+        let surname_concepts_purged = self.purge_orphaned_surname_concepts().unwrap_or(0);
+
         // Prune unsupported contemporary_of relations (no other evidence)
         let contemporary_pruned = self.prune_unsupported_contemporary().unwrap_or(0);
 
@@ -4775,6 +4781,9 @@ impl<'a> Prometheus<'a> {
         // Fix country-concatenation entities (e.g., "Netherlands Oskar Klein" → merge into "Oskar Klein")
         let country_concat_fixed = self.fix_country_concatenation_entities().unwrap_or(0);
 
+        // Purge topic-prefix concatenation entities (e.g., "Punic Carthage" → "Carthage")
+        let topic_prefix_purged = self.purge_topic_prefix_entities().unwrap_or(0);
+
         // Merge prefix-noise entities (e.g., "Devastated Tim Berners-Lee" → "Tim Berners-Lee")
         let prefix_noise_merged = self.merge_prefix_noise_entities().unwrap_or(0);
 
@@ -4789,6 +4798,13 @@ impl<'a> Prometheus<'a> {
 
         // Extended concept reclassification (well-known places/tech misclassified as concept)
         let concepts_reclassified = self.reclassify_isolated_concepts_extended().unwrap_or(0);
+
+        // Reclassify connected single-word concepts that match known person surnames
+        let surname_concepts_reclassified =
+            self.reclassify_connected_surname_concepts().unwrap_or(0);
+
+        // Purge isolated person entities with all-common-English-word names
+        let common_english_purged = self.purge_common_english_person_islands().unwrap_or(0);
 
         // Purge NLP concatenation noise ("Examples Yang", "Neumann John Examples")
         let concat_noise_purged = self.purge_concatenation_noise().unwrap_or(0);
@@ -4967,13 +4983,13 @@ impl<'a> Prometheus<'a> {
              {} exact-name deduped, {} reverse-containment merged, {} bulk-rejected stale, \
              {} fuzzy duplicates ({} auto-merge, {} auto-merged), {} sparse topic domains, \
              {} name subsumptions found, {} types fixed, {} types inferred from neighborhood, {} noise entities purged, \
-             {} bulk cleaned, {} deep cleaned, {} contemporary pruned, {} contemporary downgraded, {} predicates normalized, {} uniform-hub demoted, {} islands reconnected, \
+             {} bulk cleaned, {} deep cleaned, {} self-ref pruned, {} surname-concepts purged, {} contemporary pruned, {} contemporary downgraded, {} predicates normalized, {} uniform-hub demoted, {} islands reconnected, \
              {} fact-inferred relations, {} name cross-references, \
              {} compound relations + {} compound merged, {} concat split ({}r/{}c), {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -5011,6 +5027,8 @@ impl<'a> Prometheus<'a> {
             purged,
             bulk_cleaned,
             deep_cleaned,
+            self_ref_pruned,
+            surname_concepts_purged,
             contemporary_pruned,
             contemporary_downgraded,
             normalized,
@@ -5043,11 +5061,14 @@ impl<'a> Prometheus<'a> {
             low_conf_purged,
             concepts_to_places,
             country_concat_fixed,
+            topic_prefix_purged,
             prefix_noise_merged,
             reversed_names_merged,
             nickname_merged,
             translit_merged,
             concepts_reclassified,
+            surname_concepts_reclassified,
+            common_english_purged,
             abbreviation_merged,
             concat_noise_purged,
             token_reconnected,
@@ -5263,6 +5284,69 @@ impl<'a> Prometheus<'a> {
         bridges.sort_by(|a, b| b.2.cmp(&a.2));
         bridges.truncate(20);
         Ok(bridges)
+    }
+
+    /// Prune self-referential relations where the object name is a substring
+    /// of the subject name (NLP surname/fragment extraction errors).
+    /// e.g. "Jeffrey Goldstone" pioneered "Goldstone" — the "concept" is just the surname.
+    pub fn prune_self_referential_relations(&self) -> Result<usize> {
+        let pruned = self.brain.with_conn(|conn| {
+            // Delete relations where LOWER(object.name) is a substring of LOWER(subject.name)
+            // and the object name is short (≤ 2 words) — longer names are more likely real concepts.
+            let count = conn.execute(
+                "DELETE FROM relations WHERE id IN (
+                    SELECT r.id FROM relations r
+                    JOIN entities s ON r.subject_id = s.id
+                    JOIN entities o ON r.object_id = o.id
+                    WHERE LOWER(s.name) LIKE '%' || LOWER(o.name) || '%'
+                    AND LENGTH(o.name) - LENGTH(REPLACE(o.name, ' ', '')) < 2
+                    AND o.name != s.name
+                    AND LENGTH(o.name) >= 2
+                )",
+                [],
+            )?;
+            Ok(count)
+        })?;
+        if pruned > 0 {
+            eprintln!(
+                "[PROMETHEUS] Pruned {} self-referential relations (object is substring of subject)",
+                pruned
+            );
+        }
+        Ok(pruned)
+    }
+
+    /// Prune orphaned concept entities that were only targets of self-referential
+    /// relations (surname fragments like "Goldstone", "Rossby", etc.)
+    pub fn purge_orphaned_surname_concepts(&self) -> Result<usize> {
+        let purged = self.brain.with_conn(|conn| {
+            // Delete concept entities that:
+            // 1. Are single-word
+            // 2. Have no remaining relations (subject or object)
+            // 3. Have no facts
+            // 4. Are typed as "concept"
+            let count = conn.execute(
+                "DELETE FROM entities WHERE id IN (
+                    SELECT e.id FROM entities e
+                    WHERE e.entity_type = 'concept'
+                    AND e.name NOT LIKE '% %'
+                    AND LENGTH(e.name) BETWEEN 3 AND 20
+                    AND e.id NOT IN (SELECT subject_id FROM relations)
+                    AND e.id NOT IN (SELECT object_id FROM relations)
+                    AND e.id NOT IN (SELECT entity_id FROM facts)
+                    AND e.confidence < 0.8
+                )",
+                [],
+            )?;
+            Ok(count)
+        })?;
+        if purged > 0 {
+            eprintln!(
+                "[PROMETHEUS] Purged {} orphaned single-word concept entities (post-relation cleanup)",
+                purged
+            );
+        }
+        Ok(purged)
     }
 
     /// Prune `contemporary_of` relations where neither entity has any other
@@ -6164,6 +6248,53 @@ impl<'a> Prometheus<'a> {
                 let sl = h.subject.to_lowercase();
                 let ol = h.object.to_lowercase();
                 if sl.contains(&ol) || ol.contains(&sl) {
+                    self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                    self.record_outcome(&h.pattern_source, false)?;
+                    rejected += 1;
+                    continue;
+                }
+
+                // Reject hypotheses where either entity looks like a topic-prefix
+                // concatenation artifact (e.g., "Punic Carthage", "Yuan China")
+                let topic_prefixes_check: &[&str] = &[
+                    "punic",
+                    "yuan",
+                    "ming",
+                    "tang",
+                    "han",
+                    "qing",
+                    "song",
+                    "sui",
+                    "byzantine",
+                    "ottoman",
+                    "illyria",
+                    "lancel",
+                    "efficiency",
+                    "devastated",
+                    "celebrated",
+                    "legendary",
+                    "renowned",
+                    "crusader",
+                    "viking",
+                    "celtic",
+                    "gallic",
+                    "frankish",
+                ];
+                let subj_first = h
+                    .subject
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_lowercase();
+                let obj_first = h
+                    .object
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_lowercase();
+                if topic_prefixes_check.contains(&subj_first.as_str())
+                    || (h.object != "?" && topic_prefixes_check.contains(&obj_first.as_str()))
+                {
                     self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
                     self.record_outcome(&h.pattern_source, false)?;
                     rejected += 1;
@@ -11441,7 +11572,7 @@ impl<'a> Prometheus<'a> {
                 .map(|v| v.iter().copied().collect())
                 .unwrap_or_default();
             let shared_neighbors = a_nbrs.intersection(&b_nbrs).count();
-            if shared_neighbors < 2 {
+            if shared_neighbors < 3 {
                 continue;
             }
             let a_type = id_type.get(a).copied().unwrap_or("unknown");
@@ -18264,6 +18395,147 @@ impl<'a> Prometheus<'a> {
     /// Purge isolated entities whose names are clearly non-English extraction noise.
     /// Detects Latin suffixes, non-Latin scripts, and foreign-language fragments
     /// that NLP extractors pull from multilingual Wikipedia articles.
+    /// Purge entities that are NLP concatenation artifacts: a descriptive/historical
+    /// prefix word + a proper entity name. Examples: "Punic Carthage", "Yuan China",
+    /// "Efficiency Carnot", "Illyria Alexander". If the suffix matches a known entity,
+    /// merge relations into that entity; otherwise just purge the island.
+    pub fn purge_topic_prefix_entities(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Build name→id lookup for merging
+        let name_to_id: HashMap<String, i64> = entities
+            .iter()
+            .map(|e| (e.name.to_lowercase(), e.id))
+            .collect();
+
+        // Descriptive/historical prefix words that signal NLP concatenation artifacts.
+        // These are adjectives, demonyms, or topic words that get concatenated with
+        // entity names during extraction from Wikipedia articles.
+        let topic_prefixes: HashSet<&str> = [
+            "punic",
+            "yuan",
+            "ming",
+            "tang",
+            "han",
+            "qing",
+            "song",
+            "sui",
+            "byzantine",
+            "ottoman",
+            "roman",
+            "greek",
+            "persian",
+            "mughal",
+            "illyria",
+            "lancel",
+            "efficiency",
+            "medieval",
+            "ancient",
+            "modern",
+            "imperial",
+            "royal",
+            "colonial",
+            "federal",
+            "national",
+            "central",
+            "devastated",
+            "celebrated",
+            "famous",
+            "notable",
+            "prominent",
+            "legendary",
+            "renowned",
+            "classical",
+            "neolithic",
+            "paleolithic",
+            "mesolithic",
+            "baroque",
+            "gothic",
+            "renaissance",
+            "enlightenment",
+            "crusader",
+            "viking",
+            "celtic",
+            "gallic",
+            "frankish",
+            "visigothic",
+            "moorish",
+            "mamluk",
+            "abbasid",
+            "umayyad",
+            "safavid",
+            "qajar",
+            "joseon",
+            "tokugawa",
+            "meiji",
+            "edo",
+            "heian",
+            "kamakura",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let mut purged = 0usize;
+        for e in &entities {
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 || words.len() > 4 {
+                continue;
+            }
+            let first_lower = words[0].to_lowercase();
+            if !topic_prefixes.contains(first_lower.as_str()) {
+                continue;
+            }
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            // Only purge low-degree entities (likely noise, not well-established)
+            if deg > 10 {
+                continue;
+            }
+            // Check if the suffix (remaining words) matches a known entity
+            let suffix = words[1..].join(" ");
+            let suffix_lower = suffix.to_lowercase();
+            if let Some(&target_id) = name_to_id.get(&suffix_lower) {
+                if target_id != e.id {
+                    // Merge: reassign relations from this entity to the target
+                    self.brain.with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE relations SET subject_id = ?1 WHERE subject_id = ?2",
+                            params![target_id, e.id],
+                        )?;
+                        conn.execute(
+                            "UPDATE relations SET object_id = ?1 WHERE object_id = ?2",
+                            params![target_id, e.id],
+                        )?;
+                        conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                        Ok(())
+                    })?;
+                    purged += 1;
+                    continue;
+                }
+            }
+            // No matching target — purge if island or very low degree
+            if deg <= 2 {
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "DELETE FROM relations WHERE subject_id = ?1 OR object_id = ?1",
+                        params![e.id],
+                    )?;
+                    conn.execute("DELETE FROM facts WHERE entity_id = ?1", params![e.id])?;
+                    conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                    Ok(())
+                })?;
+                purged += 1;
+            }
+        }
+        Ok(purged)
+    }
+
     pub fn purge_foreign_language_islands(&self) -> Result<usize> {
         let entities = self.brain.all_entities()?;
         let relations = self.brain.all_relations()?;
@@ -19945,6 +20217,155 @@ impl<'a> Prometheus<'a> {
         }
 
         Ok(reclassified)
+    }
+
+    /// Reclassify connected single-word concepts as persons when they match
+    /// a surname of an existing person entity in the graph. Also refines
+    /// "pioneered" predicates to "contemporary_of" for person→person pairs.
+    pub fn reclassify_connected_surname_concepts(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        // Build surname set from known person entities (2+ word names)
+        let mut known_surnames: HashSet<String> = HashSet::new();
+        for e in &entities {
+            if e.entity_type == "person" {
+                let words: Vec<&str> = e.name.split_whitespace().collect();
+                if words.len() >= 2 {
+                    if let Some(last) = words.last() {
+                        let lower = last.to_lowercase();
+                        if lower.len() > 3 {
+                            known_surnames.insert(lower);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Find connected single-word concepts that match known surnames
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        let mut reclassified = 0usize;
+        for e in &entities {
+            if e.entity_type != "concept" {
+                continue;
+            }
+            if !connected.contains(&e.id) {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() != 1 {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            if lower.len() <= 3 {
+                continue;
+            }
+            // Skip words that are clearly not surnames
+            if is_common_english_word(&lower) {
+                continue;
+            }
+            if !known_surnames.contains(&lower) {
+                continue;
+            }
+
+            // Reclassify concept → person
+            self.brain.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE entities SET entity_type = 'person' WHERE id = ?1",
+                    params![e.id],
+                )?;
+                Ok(())
+            })?;
+
+            // Refine "pioneered" predicates involving this entity
+            for r in &relations {
+                if r.object_id == e.id && r.predicate == "pioneered" {
+                    let _ = self.brain.with_conn(|conn| {
+                        let res = conn.execute(
+                            "UPDATE relations SET predicate = 'contemporary_of' WHERE id = ?1",
+                            params![r.id],
+                        );
+                        match res {
+                            Ok(_) => Ok(()),
+                            Err(rusqlite::Error::SqliteFailure(err, _))
+                                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                            {
+                                conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        }
+                    });
+                }
+            }
+
+            reclassified += 1;
+        }
+
+        if reclassified > 0 {
+            eprintln!(
+                "  [surname-concept-reclassify] reclassified {} single-word concepts as persons (matched known surnames)",
+                reclassified
+            );
+        }
+        Ok(reclassified)
+    }
+
+    /// Purge isolated person entities whose names consist entirely of common
+    /// English words (not proper names). These are NLP extraction artifacts.
+    pub fn purge_common_english_person_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        let mut purged = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            if e.entity_type != "person" {
+                continue;
+            }
+            // Only target low-confidence islands
+            if e.confidence > 0.7 {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 || words.len() > 3 {
+                continue;
+            }
+            // Check if ALL words are common English words (not names)
+            let all_common = words.iter().all(|w| {
+                let lower = w.to_lowercase();
+                is_common_english_word(&lower)
+            });
+            if !all_common {
+                continue;
+            }
+            self.brain.with_conn(|conn| {
+                conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                Ok(())
+            })?;
+            purged += 1;
+        }
+        if purged > 0 {
+            eprintln!(
+                "  [common-english-person-purge] removed {} isolated person entities with all-common-English-word names",
+                purged
+            );
+        }
+        Ok(purged)
     }
 }
 
