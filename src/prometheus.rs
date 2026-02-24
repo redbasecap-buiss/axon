@@ -4883,6 +4883,9 @@ impl<'a> Prometheus<'a> {
         // Reclassify person islands matching geographic/event/concept patterns
         let geo_reclassified = self.reclassify_geographic_person_islands().unwrap_or(0);
 
+        // Reclassify "CityName RegionName" person islands to place
+        let place_region_reclassified = self.reclassify_place_region_person_islands().unwrap_or(0);
+
         // Reclassify two-word compound concept persons (e.g., "Aneutronic Fusion")
         let compound_reclassified = self.reclassify_compound_concept_persons().unwrap_or(0);
 
@@ -5085,7 +5088,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} geo-person-reclassified, {} compound-concept-reclassified, {} ancient-islands-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} geo-person-reclassified, {} place-region-reclassified, {} compound-concept-reclassified, {} ancient-islands-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -5167,6 +5170,7 @@ impl<'a> Prometheus<'a> {
             surname_concepts_reclassified,
             common_english_purged,
             geo_reclassified,
+            place_region_reclassified,
             compound_reclassified,
             ancient_purged,
             abbreviation_merged,
@@ -12474,7 +12478,9 @@ impl<'a> Prometheus<'a> {
                 };
                 // Cosine similarity (vectors already normalized)
                 let cosine: f64 = va.iter().zip(vb.iter()).map(|(x, y)| x * y).sum();
-                if cosine >= 0.85 {
+                // Concept-concept pairs need higher threshold (historically 88% rejection)
+                let threshold = if at == "concept" { 0.93 } else { 0.85 };
+                if cosine >= threshold {
                     scored.push((a, b, cosine));
                 }
             }
@@ -12806,6 +12812,10 @@ impl<'a> Prometheus<'a> {
             }
             let a_type = id_type.get(a).copied().unwrap_or("?");
             let b_type = id_type.get(b).copied().unwrap_or("?");
+            // Skip concept-concept pairs (100% historical rejection for related_concept)
+            if a_type == "concept" && b_type == "concept" {
+                continue;
+            }
             let predicate = infer_predicate(a_type, b_type, None);
             let base_conf = 0.35 + (score - 0.3) * 0.5; // 0.3→0.35, 1.0→0.70
             let confidence = self
@@ -13268,6 +13278,10 @@ impl<'a> Prometheus<'a> {
             let a_type = name_to_type.get(name_a).map(|s| s.as_str()).unwrap_or("?");
             let b_type = name_to_type.get(name_b).map(|s| s.as_str()).unwrap_or("?");
             if !types_compatible(a_type, b_type) {
+                continue;
+            }
+            // Skip concept-concept (100% historical rejection)
+            if a_type == "concept" && b_type == "concept" {
                 continue;
             }
 
@@ -20738,6 +20752,180 @@ impl<'a> Prometheus<'a> {
     }
 
     /// Purge ancient low-confidence islands: entities that were first seen >30 days ago,
+    /// Reclassify isolated person entities that are actually place+region concatenations
+    /// (e.g., "Annapolis Maryland", "Hucknall Nottinghamshire", "Hennigsdorf Havelland").
+    /// These are NLP extraction artifacts from geographic references like "Annapolis, Maryland".
+    pub fn reclassify_place_region_person_islands(&self) -> Result<usize> {
+        // Known US states, regions, and administrative divisions that appear as second words
+        const REGIONS: &[&str] = &[
+            "alabama",
+            "alaska",
+            "arizona",
+            "arkansas",
+            "california",
+            "colorado",
+            "connecticut",
+            "delaware",
+            "florida",
+            "georgia",
+            "hawaii",
+            "idaho",
+            "illinois",
+            "indiana",
+            "iowa",
+            "kansas",
+            "kentucky",
+            "louisiana",
+            "maine",
+            "maryland",
+            "massachusetts",
+            "michigan",
+            "minnesota",
+            "mississippi",
+            "missouri",
+            "montana",
+            "nebraska",
+            "nevada",
+            "hampshire",
+            "jersey",
+            "mexico",
+            "york",
+            "carolina",
+            "dakota",
+            "ohio",
+            "oklahoma",
+            "oregon",
+            "pennsylvania",
+            "island",
+            "tennessee",
+            "texas",
+            "utah",
+            "vermont",
+            "virginia",
+            "washington",
+            "wisconsin",
+            "wyoming",
+            "columbia",
+            // UK counties / regions
+            "nottinghamshire",
+            "yorkshire",
+            "lancashire",
+            "oxfordshire",
+            "berkshire",
+            "buckinghamshire",
+            "cambridgeshire",
+            "cheshire",
+            "cornwall",
+            "cumbria",
+            "derbyshire",
+            "devon",
+            "dorset",
+            "durham",
+            "essex",
+            "gloucestershire",
+            "hampshire",
+            "herefordshire",
+            "hertfordshire",
+            "kent",
+            "leicestershire",
+            "lincolnshire",
+            "london",
+            "merseyside",
+            "norfolk",
+            "northamptonshire",
+            "northumberland",
+            "somerset",
+            "staffordshire",
+            "suffolk",
+            "surrey",
+            "sussex",
+            "warwickshire",
+            "wiltshire",
+            "worcestershire",
+            // German regions
+            "havelland",
+            "brandenburg",
+            "sachsen",
+            "bayern",
+            "hessen",
+            "thüringen",
+            "westfalen",
+            "württemberg",
+            "pommern",
+            "schlesien",
+            "preussen",
+            "schöneberg",
+            "charlottenburg",
+            "kreuzberg",
+            "neukölln",
+            "spandau",
+            // French/Italian/Spanish regions
+            "provence",
+            "normandie",
+            "bretagne",
+            "aquitaine",
+            "picardie",
+            "lombardia",
+            "toscana",
+            "piemonte",
+            "veneto",
+            "sicilia",
+            "andalucía",
+            "cataluña",
+            "galicia",
+            "asturias",
+            "navarra",
+        ];
+
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        let mut reclassified = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) || e.entity_type != "person" || e.confidence > 0.7 {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() != 2 {
+                continue;
+            }
+            let second_lower = words[1].to_lowercase();
+            if REGIONS.contains(&second_lower.as_str()) {
+                // Check first word starts with uppercase (place name)
+                if words[0]
+                    .chars()
+                    .next()
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false)
+                {
+                    self.brain.with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE entities SET entity_type = 'place' WHERE id = ?1",
+                            params![e.id],
+                        )?;
+                        Ok(())
+                    })?;
+                    reclassified += 1;
+                }
+            }
+        }
+        if reclassified > 0 {
+            eprintln!(
+                "  [place-region-reclassify] reclassified {} 'CityName RegionName' person islands to place",
+                reclassified
+            );
+        }
+        Ok(reclassified)
+    }
+
     /// have confidence ≤0.5, no relations, and no facts. These have had plenty of time
     /// to be connected and haven't been — they're extraction noise.
     pub fn purge_ancient_low_confidence_islands(&self, max_age_days: i64) -> Result<usize> {
@@ -23316,9 +23504,24 @@ fn is_type_incompatible(subject_type: &str, object_type: &str, predicate: &str) 
         return true;
     }
 
-    // pioneered requires person or organization as subject
-    if predicate == "pioneered" && !["person", "organization"].contains(&subject_type) {
-        return true;
+    // pioneered requires person or organization as subject, and concept/technology/event as object
+    if predicate == "pioneered" {
+        if !["person", "organization"].contains(&subject_type) {
+            return true;
+        }
+        if !["concept", "technology", "event"].contains(&object_type) {
+            return true;
+        }
+    }
+
+    // pioneered_by is the inverse: concept/technology → person/organization
+    if predicate == "pioneered_by" {
+        if !["concept", "technology", "event"].contains(&subject_type) {
+            return true;
+        }
+        if !["person", "organization"].contains(&object_type) {
+            return true;
+        }
     }
 
     false

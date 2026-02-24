@@ -4800,6 +4800,70 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         }
     }
 
+    // Reject multi-word person entities (3+ words) that contain known noise/topic words
+    // e.g. "Cosmo Ancient China", "Afghanistan President Carter"
+    if etype == "person" && lower.contains(' ') {
+        let words: Vec<&str> = lower.split_whitespace().collect();
+        if words.len() >= 3 {
+            let topic_words = [
+                "ancient",
+                "modern",
+                "medieval",
+                "colonial",
+                "imperial",
+                "classical",
+                "early",
+                "late",
+                "great",
+                "old",
+                "new",
+                "upper",
+                "lower",
+                "north",
+                "south",
+                "east",
+                "west",
+                "central",
+                "coastal",
+                "rural",
+                "urban",
+                "rome",
+                "china",
+                "india",
+                "egypt",
+                "greece",
+                "persia",
+                "africa",
+                "europe",
+                "asia",
+                "america",
+                "britain",
+                "france",
+                "germany",
+                "spain",
+                "italy",
+                "russia",
+                "japan",
+                "turkey",
+                "iran",
+                "iraq",
+                "syria",
+                "geography",
+                "history",
+                "nature",
+                "science",
+                "philosophy",
+                "computational",
+                "descriptive",
+                "abandoned",
+                "manuscripts",
+            ];
+            if words.iter().any(|w| topic_words.contains(w)) {
+                return false;
+            }
+        }
+    }
+
     true
 }
 
