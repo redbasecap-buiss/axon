@@ -3772,6 +3772,17 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(tcd_hyps);
         }
 
+        // 2t. Shared predicate-object inverse inference
+        let spo_weight = self.get_pattern_weight("shared_predicate_object")?;
+        if spo_weight >= 0.05 {
+            let spo_hyps = self.generate_hypotheses_from_shared_predicate_object()?;
+            eprintln!(
+                "[PROMETHEUS] shared_predicate_object: {} hypotheses",
+                spo_hyps.len()
+            );
+            all_hypotheses.extend(spo_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -5295,6 +5306,43 @@ impl<'a> Prometheus<'a> {
                             self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
                             self.record_outcome(&h.pattern_source, false)?;
                             rejected += 1;
+                        }
+                    }
+                }
+            } else {
+                // object == "?" — predicate-existence hypotheses (e.g. predicate_transfer)
+                // Confirm if the entity has since gained the predicted predicate;
+                // reject if the entity no longer exists or has been idle too long.
+                let subj = self.brain.get_entity_by_name(&h.subject)?;
+                match subj {
+                    None => {
+                        // Entity deleted — reject
+                        self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                        self.record_outcome(&h.pattern_source, false)?;
+                        rejected += 1;
+                    }
+                    Some(s_ent) => {
+                        let rels = self.brain.get_relations_for(s_ent.id)?;
+                        // Tuple: (subject_name, predicate, object_name, confidence)
+                        let has_predicate =
+                            rels.iter().any(|r| r.0 == h.subject && r.1 == h.predicate);
+                        if has_predicate {
+                            // Entity acquired the predicted predicate — confirmed!
+                            self.update_hypothesis_status(h.id, HypothesisStatus::Confirmed)?;
+                            self.record_outcome(&h.pattern_source, true)?;
+                            let evidence = vec![
+                                format!("{} now has predicate '{}'", h.subject, h.predicate),
+                                format!("Pattern source: {}", h.pattern_source),
+                            ];
+                            let _ = self.save_discovery(h.id, &evidence);
+                            confirmed += 1;
+                        } else if rels.is_empty() {
+                            // Entity is completely isolated — reject low-confidence ones
+                            if h.confidence < 0.5 {
+                                self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                                self.record_outcome(&h.pattern_source, false)?;
+                                rejected += 1;
+                            }
                         }
                     }
                 }
@@ -10281,6 +10329,125 @@ impl<'a> Prometheus<'a> {
             }
             if hypotheses.len() >= 40 {
                 break;
+            }
+        }
+
+        hypotheses.truncate(40);
+        Ok(hypotheses)
+    }
+
+    /// Shared-predicate-object inverse inference: if A→pred→X and B→pred→X
+    /// (multiple subjects share the same predicate+object), infer A and B
+    /// are related. Higher signal than co-occurrence because it's predicate-specific.
+    pub fn generate_hypotheses_from_shared_predicate_object(&self) -> Result<Vec<Hypothesis>> {
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let entities = self.brain.all_entities()?;
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Group: (predicate, object_id) → Vec<subject_id>
+        let mut pred_obj_subjects: HashMap<(String, i64), Vec<i64>> = HashMap::new();
+        for r in &relations {
+            if !meaningful.contains(&r.subject_id) || !meaningful.contains(&r.object_id) {
+                continue;
+            }
+            if is_generic_predicate(&r.predicate) {
+                continue;
+            }
+            pred_obj_subjects
+                .entry((r.predicate.clone(), r.object_id))
+                .or_default()
+                .push(r.subject_id);
+        }
+
+        // Build existing-edge set for dedup
+        let mut existing: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            let pair = if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            };
+            existing.insert(pair);
+        }
+
+        let mut hypotheses = Vec::new();
+        let mut seen: HashSet<(i64, i64)> = HashSet::new();
+
+        for ((predicate, obj_id), subjects) in &pred_obj_subjects {
+            if subjects.len() < 2 || subjects.len() > 50 {
+                continue; // Too small or too generic
+            }
+            let obj_name = id_name.get(obj_id).copied().unwrap_or("?");
+            if is_noise_name(obj_name) {
+                continue;
+            }
+            // Generate pairs from subjects
+            for i in 0..subjects.len().min(20) {
+                for j in (i + 1)..subjects.len().min(20) {
+                    if hypotheses.len() >= 40 {
+                        break;
+                    }
+                    let a = subjects[i];
+                    let b = subjects[j];
+                    let pair = if a < b { (a, b) } else { (b, a) };
+                    if existing.contains(&pair) || !seen.insert(pair) {
+                        continue;
+                    }
+                    let a_name = id_name.get(&a).copied().unwrap_or("?");
+                    let b_name = id_name.get(&b).copied().unwrap_or("?");
+                    if is_noise_name(a_name) || is_noise_name(b_name) {
+                        continue;
+                    }
+                    let a_type = id_type.get(&a).copied().unwrap_or("?");
+                    let b_type = id_type.get(&b).copied().unwrap_or("?");
+                    // Count how many objects they share (across all predicates)
+                    let mut shared_count = 0usize;
+                    for ((_, oid), subs) in &pred_obj_subjects {
+                        if subs.contains(&a) && subs.contains(&b) {
+                            shared_count += 1;
+                            if *oid != *obj_id {
+                                // Extra signal: multiple shared objects
+                            }
+                        }
+                    }
+                    let base_conf = (0.35 + 0.10 * shared_count as f64).min(0.75);
+                    let confidence = self
+                        .calibrated_confidence("shared_predicate_object", base_conf)
+                        .unwrap_or(base_conf);
+                    let inferred_pred = infer_predicate(a_type, b_type, None);
+                    hypotheses.push(Hypothesis {
+                        id: 0,
+                        subject: a_name.to_string(),
+                        predicate: inferred_pred.to_string(),
+                        object: b_name.to_string(),
+                        confidence,
+                        evidence_for: vec![format!(
+                            "Both {} '{}' → {} (shared {} predicate-object pairs)",
+                            predicate, obj_name, predicate, shared_count
+                        )],
+                        evidence_against: vec![],
+                        reasoning_chain: vec![
+                            format!("{} → {} → {}", a_name, predicate, obj_name),
+                            format!("{} → {} → {}", b_name, predicate, obj_name),
+                            format!(
+                                "Shared predicate-object implies {} relationship",
+                                inferred_pred
+                            ),
+                        ],
+                        status: HypothesisStatus::Proposed,
+                        discovered_at: now_str(),
+                        pattern_source: "shared_predicate_object".to_string(),
+                    });
+                }
+                if hypotheses.len() >= 40 {
+                    break;
+                }
             }
         }
 
