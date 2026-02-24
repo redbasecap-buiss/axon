@@ -2774,6 +2774,36 @@ impl<'a> Prometheus<'a> {
             }
         }
 
+        // Source diversity boost: entities corroborated by multiple distinct
+        // source URLs are more reliable — independent verification principle.
+        if hypothesis.object != "?" {
+            if let (Some(s_ent), Some(o_ent)) = (
+                self.brain.get_entity_by_name(&hypothesis.subject)?,
+                self.brain.get_entity_by_name(&hypothesis.object)?,
+            ) {
+                let source_count = |eid: i64| -> i64 {
+                    self.brain
+                        .with_conn(|conn| {
+                            conn.query_row(
+                                "SELECT COUNT(DISTINCT source_url) FROM relations
+                                 WHERE (subject_id = ?1 OR object_id = ?1) AND source_url IS NOT NULL AND source_url != ''",
+                                params![eid],
+                                |row| row.get(0),
+                            )
+                        })
+                        .unwrap_or(0)
+                };
+                let s_sources = source_count(s_ent.id);
+                let o_sources = source_count(o_ent.id);
+                let min_sources = s_sources.min(o_sources);
+                if min_sources >= 5 {
+                    score += 0.08; // strongly corroborated entities
+                } else if min_sources >= 3 {
+                    score += 0.04;
+                }
+            }
+        }
+
         // Apply pattern weight
         let weight = self.get_pattern_weight(&hypothesis.pattern_source)?;
         score *= weight;
@@ -4475,6 +4505,14 @@ impl<'a> Prometheus<'a> {
             let fg_hyps = self.generate_hypotheses_from_fact_gaps()?;
             eprintln!("[PROMETHEUS] fact_gap: {} hypotheses", fg_hyps.len());
             all_hypotheses.extend(fg_hyps);
+        }
+
+        // 2cc. Open triangle completion (strong triadic closure principle)
+        let ot_weight = self.get_pattern_weight("open_triangle")?;
+        if ot_weight >= 0.05 {
+            let ot_hyps = self.generate_hypotheses_from_open_triangles()?;
+            eprintln!("[PROMETHEUS] open_triangle: {} hypotheses", ot_hyps.len());
+            all_hypotheses.extend(ot_hyps);
         }
 
         // 3. Island entities as gaps
@@ -13762,6 +13800,95 @@ impl<'a> Prometheus<'a> {
         }
 
         hypotheses.truncate(60);
+        Ok(hypotheses)
+    }
+
+    /// Strategy: Open triangle completion — find pairs of entities (A, C) that share
+    /// multiple intermediary neighbors B but lack a direct connection.  This implements
+    /// the strong triadic closure principle: if A-B and B-C are strong ties,
+    /// then A-C should exist.  Uses the graph-level `open_triangle_predict` for
+    /// efficient enumeration of candidate pairs.
+    pub fn generate_hypotheses_from_open_triangles(&self) -> Result<Vec<Hypothesis>> {
+        let predictions = crate::graph::open_triangle_predict(self.brain, 2, 200)?;
+
+        if predictions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let entities = self.brain.all_entities()?;
+        let name_map: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let type_map: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+        let meaningful = meaningful_ids(self.brain)?;
+
+        let mut hypotheses = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+
+        for (a_id, c_id, shared_count, weight) in &predictions {
+            if !meaningful.contains(a_id) && !meaningful.contains(c_id) {
+                continue;
+            }
+            let a_name = match name_map.get(a_id) {
+                Some(n) => *n,
+                None => continue,
+            };
+            let c_name = match name_map.get(c_id) {
+                Some(n) => *n,
+                None => continue,
+            };
+            if is_noise_name(a_name) || is_noise_name(c_name) {
+                continue;
+            }
+            let a_type = type_map.get(a_id).copied().unwrap_or("?");
+            let c_type = type_map.get(c_id).copied().unwrap_or("?");
+            if !types_compatible(a_type, c_type) {
+                continue;
+            }
+            let key = if a_name < c_name {
+                (a_name.to_string(), c_name.to_string())
+            } else {
+                (c_name.to_string(), a_name.to_string())
+            };
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+
+            let predicate = infer_predicate(a_type, c_type, None);
+            // Base confidence scales with intermediary count: 3→0.55, 5→0.65, 10→0.75
+            let base_conf = (0.45 + 0.05 * (*shared_count as f64).min(6.0)).min(0.80);
+            let confidence = self
+                .calibrated_confidence("open_triangle", base_conf)
+                .unwrap_or(base_conf);
+
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.to_string(),
+                predicate: predicate.to_string(),
+                object: c_name.to_string(),
+                confidence,
+                evidence_for: vec![format!(
+                    "{} shared intermediary neighbors (weight {:.3})",
+                    shared_count, weight
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![format!(
+                    "Open triangle: {} and {} share {} neighbors but have no direct link",
+                    a_name, c_name, shared_count
+                )],
+                status: HypothesisStatus::Testing,
+                discovered_at: now_str(),
+                pattern_source: "open_triangle".to_string(),
+            });
+
+            if hypotheses.len() >= 80 {
+                break;
+            }
+        }
+
         Ok(hypotheses)
     }
 

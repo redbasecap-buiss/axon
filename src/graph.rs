@@ -5741,6 +5741,102 @@ pub fn community_predicate_entropy(brain: &Brain) -> Result<(f64, f64, f64), rus
 /// Identify predicate bottlenecks: predicates that, if removed, would most
 /// increase graph fragmentation. Returns sorted vec of (predicate, bridge_count)
 /// where bridge_count is the number of inter-component edges using that predicate.
+/// Open triangle link prediction: find pairs (A, C) connected through at least
+/// `min_intermediaries` shared neighbors B but not directly connected themselves.
+/// Returns (entity_a_id, entity_c_id, count_of_shared_intermediaries, avg_weight)
+/// sorted by intermediary count descending.  High shared-intermediary counts are
+/// strong predictors of missing links (triadic closure principle).
+pub fn open_triangle_predict(
+    brain: &Brain,
+    min_intermediaries: usize,
+    limit: usize,
+) -> Result<Vec<(i64, i64, usize, f64)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let entities = brain.all_entities()?;
+    let id_set: HashSet<i64> = entities.iter().map(|e| e.id).collect();
+
+    // Build undirected adjacency + edge set for quick lookup
+    let mut neighbors: HashMap<i64, HashSet<i64>> = HashMap::new();
+    let mut edge_set: HashSet<(i64, i64)> = HashSet::new();
+    for r in &relations {
+        if !id_set.contains(&r.subject_id) || !id_set.contains(&r.object_id) {
+            continue;
+        }
+        if r.subject_id == r.object_id {
+            continue;
+        }
+        neighbors
+            .entry(r.subject_id)
+            .or_default()
+            .insert(r.object_id);
+        neighbors
+            .entry(r.object_id)
+            .or_default()
+            .insert(r.subject_id);
+        let (lo, hi) = if r.subject_id < r.object_id {
+            (r.subject_id, r.object_id)
+        } else {
+            (r.object_id, r.subject_id)
+        };
+        edge_set.insert((lo, hi));
+    }
+
+    // For efficiency, only consider entities with degree >= 2 as potential endpoints
+    let eligible: Vec<i64> = neighbors
+        .iter()
+        .filter(|(_, ns)| ns.len() >= 2)
+        .map(|(&id, _)| id)
+        .collect();
+
+    let mut results: HashMap<(i64, i64), usize> = HashMap::new();
+
+    // For each entity B, enumerate pairs (A, C) in B's neighborhood
+    // Cap per-entity pair enumeration to prevent O(d²) blowup on mega-hubs
+    let max_hub_degree = 200usize;
+    for &b in &eligible {
+        let b_neigh = match neighbors.get(&b) {
+            Some(n) if n.len() <= max_hub_degree => n,
+            _ => continue,
+        };
+        let ns: Vec<i64> = b_neigh.iter().copied().collect();
+        for i in 0..ns.len() {
+            for j in (i + 1)..ns.len() {
+                let (a, c) = if ns[i] < ns[j] {
+                    (ns[i], ns[j])
+                } else {
+                    (ns[j], ns[i])
+                };
+                // Skip if already directly connected
+                if edge_set.contains(&(a, c)) {
+                    continue;
+                }
+                *results.entry((a, c)).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Filter by min intermediaries and sort
+    let mut predictions: Vec<(i64, i64, usize, f64)> = results
+        .into_iter()
+        .filter(|(_, count)| *count >= min_intermediaries)
+        .map(|((a, c), count)| {
+            // Compute average clustering coefficient of intermediaries as weight
+            let a_neigh = neighbors.get(&a).map(|n| n.len()).unwrap_or(1) as f64;
+            let c_neigh = neighbors.get(&c).map(|n| n.len()).unwrap_or(1) as f64;
+            // Score: shared neighbors normalized by geometric mean of degrees
+            let weight = count as f64 / (a_neigh * c_neigh).sqrt();
+            (a, c, count, weight)
+        })
+        .collect();
+
+    predictions.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then(b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    predictions.truncate(limit);
+    Ok(predictions)
+}
+
 pub fn predicate_bridge_analysis(brain: &Brain) -> Result<Vec<(String, usize)>, rusqlite::Error> {
     let communities = louvain_communities(brain)?;
     let relations = brain.all_relations()?;
