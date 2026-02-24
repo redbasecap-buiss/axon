@@ -1226,6 +1226,18 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "italo-byzantine",
     "lateinised",
     "latinization",
+    // Added 2026-02-25 (brain cleaner): gerunds and generic concepts from DB cleanup
+    "classification",
+    "commentary",
+    "derivations",
+    "etymology",
+    "generalizations",
+    "homosexuality",
+    "illustration",
+    "trigonometry",
+    "cryptologia",
+    "chessgames",
+    "dulcarnon",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -6628,6 +6640,17 @@ fn extract_capitalized_inner(
             }
             let name = phrase.join(" ");
             if name.len() > 1 {
+                // Skip single capitalized gerunds (e.g. "Choosing", "Applying")
+                // These are almost always sentence-start verbs, not entities.
+                if !name.contains(' ')
+                    && name.ends_with("ing")
+                    && name.len() > 4
+                    && name.chars().next().is_some_and(|c| c.is_uppercase())
+                    && name.chars().skip(1).all(|c| c.is_lowercase())
+                {
+                    i = j;
+                    continue;
+                }
                 let classified = classify_entity_type(&name);
                 // Long single words default to concept only if classifier returns person
                 // (likely a false positive from the Capitalized heuristic).
