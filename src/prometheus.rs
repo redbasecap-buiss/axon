@@ -4680,6 +4680,9 @@ impl<'a> Prometheus<'a> {
         // Purge foreign-language extraction noise from islands
         let foreign_purged = self.purge_foreign_language_islands().unwrap_or(0);
 
+        // Reconnect high-value isolated entities via surname/source matching
+        let hv_island_reconnected = self.reconnect_high_value_islands_by_surname().unwrap_or(0);
+
         // Boost confidence of well-known entities
         let known_boosted = self.boost_known_entity_confidence().unwrap_or(0);
 
@@ -4796,7 +4799,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -4884,6 +4887,7 @@ impl<'a> Prometheus<'a> {
             pred_obj_reconnected,
             token_type_reclassified,
             foreign_purged,
+            hv_island_reconnected,
             known_boosted,
             predicates_refined,
             contextual_refined,
@@ -18397,6 +18401,184 @@ impl<'a> Prometheus<'a> {
         Ok(reconnected)
     }
 
+    /// Connect isolated high-confidence person entities to the graph by finding
+    /// connected persons who share significant name tokens (surname matching).
+    /// E.g., isolated "Lise Meitner" can connect to "Otto Hahn" if both appear
+    /// in the same source URL, or to "Nuclear Fission" via domain keywords.
+    pub fn reconnect_high_value_islands_by_surname(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        // Build: source_url → set of entity ids mentioned in relations from that source
+        let mut source_entities: HashMap<String, Vec<i64>> = HashMap::new();
+        for r in &relations {
+            if !r.source_url.is_empty() && r.source_url.starts_with("http") {
+                source_entities
+                    .entry(r.source_url.clone())
+                    .or_default()
+                    .push(r.subject_id);
+                source_entities
+                    .entry(r.source_url.clone())
+                    .or_default()
+                    .push(r.object_id);
+            }
+        }
+        // Dedup within each source
+        for ids in source_entities.values_mut() {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+
+        // Build connected entity name-token index: token → Vec<entity_id>
+        let mut token_to_connected: HashMap<String, Vec<i64>> = HashMap::new();
+        let id_to_entity: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+        for e in &entities {
+            if !connected.contains(&e.id) || is_noise_type(&e.entity_type) {
+                continue;
+            }
+            for token in e.name.split_whitespace() {
+                let t = token.to_lowercase();
+                if t.len() >= 4 {
+                    token_to_connected.entry(t).or_default().push(e.id);
+                }
+            }
+        }
+
+        let mut reconnected = 0usize;
+        let mut seen_pairs: HashSet<(i64, i64)> = HashSet::new();
+
+        // Strategy 1: Same-source reconnection for isolated multi-word person/concept entities
+        for e in &entities {
+            if connected.contains(&e.id)
+                || is_noise_type(&e.entity_type)
+                || is_noise_name(&e.name)
+                || e.confidence < 0.7
+                || e.name.split_whitespace().count() < 2
+            {
+                continue;
+            }
+            if reconnected >= 200 {
+                break;
+            }
+
+            // Check if any source mentions a connected entity with a shared surname token
+            let island_tokens: Vec<String> = e
+                .name
+                .split_whitespace()
+                .map(|t| t.to_lowercase())
+                .filter(|t| t.len() >= 4)
+                .collect();
+
+            // Find connected entities sharing a significant token (usually surname)
+            let mut candidates: Vec<(i64, usize)> = Vec::new();
+            for token in &island_tokens {
+                if let Some(cids) = token_to_connected.get(token) {
+                    for &cid in cids {
+                        if cid == e.id || seen_pairs.contains(&(e.id.min(cid), e.id.max(cid))) {
+                            continue;
+                        }
+                        if let Some(ce) = id_to_entity.get(&cid) {
+                            // Must share same entity type or be compatible
+                            if ce.entity_type == e.entity_type
+                                || (e.entity_type == "person" && ce.entity_type == "person")
+                                || (e.entity_type == "concept" && ce.entity_type == "concept")
+                            {
+                                candidates.push((cid, 1));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Pick the best candidate (most shared tokens)
+            if !candidates.is_empty() {
+                // Count shared tokens per candidate
+                let mut token_counts: HashMap<i64, usize> = HashMap::new();
+                for (cid, _) in &candidates {
+                    *token_counts.entry(*cid).or_insert(0) += 1;
+                }
+                // Require at least 2 shared tokens for persons (surname + first name or similar)
+                let min_shared = if e.entity_type == "person" { 2 } else { 1 };
+                if let Some((&best_id, &count)) = token_counts.iter().max_by_key(|(_, &c)| c) {
+                    if count >= min_shared {
+                        // This is likely a duplicate — merge
+                        let pair = (e.id.min(best_id), e.id.max(best_id));
+                        if !seen_pairs.contains(&pair) {
+                            self.brain.merge_entities(e.id, best_id)?;
+                            seen_pairs.insert(pair);
+                            reconnected += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Strategy 2: Connect to contemporary entities from same source URL
+            // Find any source_url that mentions tokens from this entity
+            for (url, src_ids) in &source_entities {
+                let url_lower = url.to_lowercase();
+                let matches_url = island_tokens.iter().any(|t| url_lower.contains(t.as_str()));
+                if !matches_url {
+                    continue;
+                }
+                // Connect to the highest-degree entity from this source
+                let mut best: Option<(i64, usize)> = None;
+                for &sid in src_ids {
+                    if sid == e.id || !connected.contains(&sid) {
+                        continue;
+                    }
+                    if let Some(ce) = id_to_entity.get(&sid) {
+                        if ce.entity_type == e.entity_type
+                            || HIGH_VALUE_TYPES.contains(&ce.entity_type.as_str())
+                        {
+                            let deg = relations
+                                .iter()
+                                .filter(|r| r.subject_id == sid || r.object_id == sid)
+                                .count();
+                            if best.is_none() || deg > best.unwrap().1 {
+                                best = Some((sid, deg));
+                            }
+                        }
+                    }
+                }
+                if let Some((hub_id, _)) = best {
+                    let pair = (e.id.min(hub_id), e.id.max(hub_id));
+                    if !seen_pairs.contains(&pair) {
+                        // Create a relation rather than merge (they're different entities)
+                        let predicate = if e.entity_type == "person" {
+                            "contemporary_of"
+                        } else {
+                            "related_concept"
+                        };
+                        self.brain.upsert_relation(
+                            e.id,
+                            predicate,
+                            hub_id,
+                            &format!("prometheus:source_island_reconnect:{}", url),
+                        )?;
+                        seen_pairs.insert(pair);
+                        reconnected += 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if reconnected > 0 {
+            eprintln!(
+                "  [high-value-island-reconnect] reconnected {} islands via surname/source matching",
+                reconnected
+            );
+        }
+        Ok(reconnected)
+    }
+
     /// Hypothesis quality scoring boost: hypotheses that would increase
     /// predicate diversity for their subject get a confidence boost.
     /// This helps avoid "pioneered-everything" hub formation.
@@ -18844,6 +19026,130 @@ impl<'a> Prometheus<'a> {
             "pytorch",
             "kubernetes",
             "blockchain",
+            "youtube",
+            "spotify",
+            "docker",
+            "linux",
+            "unix",
+            "golang",
+            "rust",
+            "typescript",
+            "react",
+            "angular",
+            "graphql",
+            "redis",
+            "mongodb",
+            "postgresql",
+            "elasticsearch",
+            "kafka",
+            "hadoop",
+            "spark",
+            "terraform",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        // Well-known historical/scientific figures often misclassified as concept
+        let person_keywords: HashSet<&str> = [
+            "charlemagne",
+            "plato",
+            "aristotle",
+            "socrates",
+            "talleyrand",
+            "metternich",
+            "bismarck",
+            "napoleon",
+            "hannibal",
+            "cicero",
+            "seneca",
+            "virgil",
+            "ovid",
+            "horace",
+            "plutarch",
+            "thucydides",
+            "herodotus",
+            "xenophon",
+            "suetonius",
+            "tacitus",
+            "livy",
+            "polybius",
+            "confucius",
+            "avicenna",
+            "averroes",
+            "maimonides",
+            "saladin",
+            "tamerlane",
+            "genghis",
+            "kublai",
+            "chebyshev",
+            "plancherel",
+            "hopcroft",
+            "diophantus",
+            "euclid",
+            "archimedes",
+            "pythagoras",
+            "hippocrates",
+            "galen",
+            "ptolemy",
+            "copernicus",
+            "vesalius",
+            "paracelsus",
+            "linnaeus",
+            "lavoisier",
+            "fourier",
+            "lagrange",
+            "laplace",
+            "cauchy",
+            "galois",
+            "abel",
+            "riemann",
+            "poincaré",
+            "hilbert",
+            "cantor",
+            "dedekind",
+            "weierstrass",
+            "jacobi",
+            "ramanujan",
+            "erdős",
+            "grothendieck",
+            "serre",
+            "weil",
+            "gauss",
+            "fermat",
+            "descartes",
+            "leibniz",
+            "voltaire",
+            "rousseau",
+            "montesquieu",
+            "diderot",
+            "locke",
+            "hobbes",
+            "hume",
+            "kant",
+            "hegel",
+            "nietzsche",
+            "schopenhauer",
+            "kierkegaard",
+            "spinoza",
+            "machiavelli",
+            "erasmus",
+            "aquinas",
+            "augustine",
+            "boethius",
+            "bayezid",
+            "suleiman",
+            "mehmed",
+            "selim",
+            "murad",
+            "whittaker",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let org_keywords: HashSet<&str> = [
+            "unesco", "nato", "opec", "asean", "cern", "nasa", "darpa", "ieee", "acm",
         ]
         .iter()
         .copied()
@@ -18861,6 +19167,10 @@ impl<'a> Prometheus<'a> {
                 Some("place")
             } else if tech_keywords.contains(lower.as_str()) {
                 Some("technology")
+            } else if person_keywords.contains(lower.as_str()) {
+                Some("person")
+            } else if org_keywords.contains(lower.as_str()) {
+                Some("organization")
             } else {
                 None
             };
