@@ -2703,6 +2703,23 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "wertschöpfung",
     "antinomien",
     "mathesi",
+    // Added 2026-02-25 round 3: more noise from DB cleanup
+    "residence",
+    "hyperbolic",
+    "carnage",
+    "weaker",
+    "multicore",
+    "superweapons",
+    "symbolist",
+    "egyptomania",
+    "albanians",
+    "sustainability",
+    "marble",
+    "inspirefest",
+    "confoederatio",
+    "uranoscopia",
+    "mechanik",
+    "netflix",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -4212,6 +4229,14 @@ fn classify_entity_type(name: &str) -> &'static str {
         "chillán",
         "chivirkuy",
         "edgerton",
+        // Added 2026-02-25 round 3
+        "helmstedt",
+        "lexington",
+        "bukhara",
+        "villupuram",
+        "puteoli",
+        "pentagon",
+        "grenoble",
     ];
     if !lower.contains(' ') && KNOWN_PLACES.contains(&lower.as_str()) {
         return "place";
@@ -4310,6 +4335,17 @@ fn classify_entity_type(name: &str) -> &'static str {
         "apastamba",
         "nicolet",
         "haspar",
+        // Added 2026-02-25 round 3
+        "khalatnikov",
+        "eichengreen",
+        "cimabue",
+        "pisistratus",
+        "mirabeau",
+        "poiseuille",
+        "whitehorne",
+        "ariqboke",
+        "miscamble",
+        "kemble",
     ];
     if !lower.contains(' ') && KNOWN_PERSONS.contains(&lower.as_str()) {
         return "person";
