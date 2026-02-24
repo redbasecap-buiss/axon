@@ -4599,14 +4599,26 @@ pub fn graph_quality_score(brain: &Brain) -> Result<(f64, HashMap<String, f64>),
     };
     components.insert("largest_component_ratio".to_string(), lc_ratio);
 
+    // 8. Degree assortativity: knowledge graphs are typically slightly disassortative.
+    //    Score: map [-1,1] → [0,1] with slight preference for mild disassortativity.
+    let assortativity = degree_assortativity(brain).unwrap_or(0.0);
+    let assort_score = if assortativity >= -0.3 && assortativity <= 0.1 {
+        1.0 // mild disassortativity is healthy for knowledge graphs
+    } else {
+        (1.0 - (assortativity - (-0.1)).abs()).max(0.0)
+    };
+    components.insert("assortativity".to_string(), assortativity);
+    components.insert("assortativity_score".to_string(), assort_score);
+
     // Weighted composite (rebalanced to include new metrics)
-    let quality = 0.25 * connectivity
-        + 0.20 * density_score
+    let quality = 0.22 * connectivity
+        + 0.18 * density_score
         + 0.15 * frag_score
         + 0.10 * pred_score
         + 0.10 * pred_balance
         + 0.10 * lc_ratio
-        + 0.10 * type_score;
+        + 0.08 * type_score
+        + 0.07 * assort_score;
 
     components.insert("overall".to_string(), quality);
 
@@ -5141,5 +5153,46 @@ pub fn predicate_gap_entities(
     // Sort by jaccard descending (strongest covariances first)
     results.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(max_results);
+    Ok(results)
+}
+
+/// Local degree anomalies: entities whose degree differs significantly from the
+/// average degree of their neighbors. High anomaly = structural outlier.
+/// Returns (entity_id, name, degree, avg_neighbor_degree, anomaly_score).
+pub fn degree_anomalies(
+    brain: &Brain,
+    min_degree: usize,
+    limit: usize,
+) -> Result<Vec<(i64, String, usize, f64, f64)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+
+    let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+    for r in &relations {
+        adj.entry(r.subject_id).or_default().insert(r.object_id);
+        adj.entry(r.object_id).or_default().insert(r.subject_id);
+    }
+
+    let entities = brain.all_entities()?;
+    let id_to_name: HashMap<i64, String> = entities.into_iter().map(|e| (e.id, e.name)).collect();
+
+    let mut results = Vec::new();
+    for (&eid, neighbors) in &adj {
+        let deg = neighbors.len();
+        if deg < min_degree {
+            continue;
+        }
+        let avg_neigh_deg: f64 = neighbors
+            .iter()
+            .map(|n| adj.get(n).map_or(0, |s| s.len()) as f64)
+            .sum::<f64>()
+            / deg as f64;
+        let denom = (deg as f64).max(avg_neigh_deg).max(1.0);
+        let anomaly = ((deg as f64) - avg_neigh_deg).abs() / denom;
+        let name = id_to_name.get(&eid).cloned().unwrap_or_default();
+        results.push((eid, name, deg, avg_neigh_deg, anomaly));
+    }
+
+    results.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
     Ok(results)
 }

@@ -4420,6 +4420,17 @@ impl<'a> Prometheus<'a> {
         // Promote mature testing hypotheses (>7 days, confidence >= 0.75)
         let promoted = self.promote_mature_hypotheses(7, 0.75).unwrap_or(0);
 
+        // Decay stale hypotheses (>14 days testing, 5% decay per cycle, reject below 0.15)
+        let (h_decayed, h_auto_rej) = self
+            .decay_stale_hypotheses(14, 0.95, 0.15)
+            .unwrap_or((0, 0));
+        if h_decayed > 0 || h_auto_rej > 0 {
+            eprintln!(
+                "[PROMETHEUS] Hypothesis decay: {} decayed, {} auto-rejected",
+                h_decayed, h_auto_rej
+            );
+        }
+
         // Cross-strategy reinforcement: boost hypotheses supported by multiple strategies
         let cross_reinforced = self.cross_strategy_reinforcement().unwrap_or(0);
 
@@ -12538,6 +12549,112 @@ impl<'a> Prometheus<'a> {
             let _ = self.record_outcome(source, true);
         }
         Ok(count)
+    }
+
+    /// Decay confidence of stale testing hypotheses that haven't been confirmed.
+    /// Hypotheses older than `min_days` with confidence below `max_conf` get a
+    /// multiplicative decay applied, eventually auto-rejecting at floor threshold.
+    /// This prevents hypothesis accumulation — the system should not carry thousands
+    /// of low-confidence "testing" hypotheses indefinitely.
+    pub fn decay_stale_hypotheses(
+        &self,
+        min_days: i64,
+        decay_factor: f64,
+        reject_floor: f64,
+    ) -> Result<(usize, usize)> {
+        let cutoff = (Utc::now() - chrono::Duration::days(min_days))
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        // Collect stale testing hypotheses
+        let stale: Vec<(i64, f64, String)> = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, confidence, pattern_source FROM hypotheses \
+                 WHERE status = 'testing' AND discovered_at < ?1",
+            )?;
+            let rows = stmt.query_map(params![cutoff], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>>>()
+        })?;
+
+        let mut decayed = 0usize;
+        let mut rejected = 0usize;
+
+        for (id, conf, source) in &stale {
+            let new_conf = conf * decay_factor;
+            if new_conf < reject_floor {
+                // Auto-reject
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE hypotheses SET status = 'rejected', confidence = ?1 WHERE id = ?2",
+                        params![new_conf, id],
+                    )?;
+                    Ok(())
+                })?;
+                let _ = self.record_outcome(source, false);
+                rejected += 1;
+            } else {
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE hypotheses SET confidence = ?1 WHERE id = ?2",
+                        params![new_conf, id],
+                    )?;
+                    Ok(())
+                })?;
+                decayed += 1;
+            }
+        }
+
+        Ok((decayed, rejected))
+    }
+
+    /// Analyze strategy diversity: returns distribution of hypothesis sources
+    /// and identifies over-represented or under-performing strategies.
+    /// Useful for meta-learning: if one strategy dominates hypothesis generation
+    /// but has low confirmation rate, its weight should drop.
+    pub fn strategy_diversity_report(
+        &self,
+    ) -> Result<Vec<(String, usize, usize, usize, f64, f64)>> {
+        // (strategy, total, confirmed, rejected, confirmation_rate, share_of_total)
+        self.brain.with_conn(|conn| {
+            let total_hyps: i64 =
+                conn.query_row("SELECT COUNT(*) FROM hypotheses", [], |row| row.get(0))?;
+            let total = total_hyps.max(1) as f64;
+
+            let mut stmt = conn.prepare(
+                "SELECT pattern_source, \
+                        COUNT(*) as cnt, \
+                        SUM(CASE WHEN status='confirmed' THEN 1 ELSE 0 END) as conf, \
+                        SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) as rej \
+                 FROM hypotheses \
+                 GROUP BY pattern_source \
+                 ORDER BY cnt DESC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let source: String = row.get(0)?;
+                let cnt: i64 = row.get(1)?;
+                let conf: i64 = row.get(2)?;
+                let rej: i64 = row.get(3)?;
+                let decided = (conf + rej).max(1) as f64;
+                let rate = conf as f64 / decided;
+                let share = cnt as f64 / total;
+                Ok((
+                    source,
+                    cnt as usize,
+                    conf as usize,
+                    rej as usize,
+                    rate,
+                    share,
+                ))
+            })?;
+            rows.collect()
+        })
     }
 
     /// Decompose concatenated entity names: entities like "Caucasus Crimea Balkans"
