@@ -266,6 +266,29 @@ fn is_generic_predicate(p: &str) -> bool {
     GENERIC_PREDICATES.contains(&p)
 }
 
+/// Symmetric predicates: A pred B ⟺ B pred A (no directionality).
+fn is_symmetric_predicate(p: &str) -> bool {
+    const SYMMETRIC: &[&str] = &[
+        "contemporary_of",
+        "collaborated_with",
+        "partner_of",
+        "related_to",
+        "related_concept",
+        "similar_to",
+        "associated_with",
+        "allied_with",
+        "co-authored_with",
+        "co-discovered_with",
+        "rival_of",
+        "neighbor_of",
+        "sibling_of",
+        "colleague_of",
+        "co-founded_with",
+        "located_near",
+    ];
+    SYMMETRIC.contains(&p)
+}
+
 /// Check if two entity types are compatible for hypothesis generation
 /// (e.g., person↔person, concept↔technology, organization↔company).
 fn types_compatible(a: &str, b: &str) -> bool {
@@ -3443,6 +3466,54 @@ impl<'a> Prometheus<'a> {
         Ok(removed)
     }
 
+    /// Remove symmetric duplicate hypotheses: for symmetric predicates like
+    /// contemporary_of, "A pred B" and "B pred A" are equivalent. Keep the
+    /// higher-confidence one and delete the other.
+    pub fn dedup_symmetric_hypotheses(&self) -> Result<usize> {
+        let hyps = self.list_hypotheses(None)?;
+        let mut seen: HashMap<(String, String, String), (i64, f64, String)> = HashMap::new();
+        let mut to_delete: Vec<i64> = Vec::new();
+
+        for h in &hyps {
+            if !is_symmetric_predicate(&h.predicate) || h.object == "?" {
+                continue;
+            }
+            // Normalize: always store (min, max) order
+            let key = if h.subject <= h.object {
+                (h.subject.clone(), h.predicate.clone(), h.object.clone())
+            } else {
+                (h.object.clone(), h.predicate.clone(), h.subject.clone())
+            };
+            if let Some(existing) = seen.get(&key) {
+                // Keep the one with higher confidence, or confirmed status
+                let dominated = if h.status.as_str() == "confirmed" && existing.2 != "confirmed" {
+                    existing.0
+                } else if existing.2 == "confirmed" && h.status.as_str() != "confirmed" {
+                    h.id
+                } else if h.confidence > existing.1 {
+                    existing.0
+                } else {
+                    h.id
+                };
+                to_delete.push(dominated);
+                if dominated == existing.0 {
+                    seen.insert(key, (h.id, h.confidence, h.status.as_str().to_string()));
+                }
+            } else {
+                seen.insert(key, (h.id, h.confidence, h.status.as_str().to_string()));
+            }
+        }
+
+        let removed = to_delete.len();
+        for id in to_delete {
+            self.brain.with_conn(|conn| {
+                conn.execute("DELETE FROM hypotheses WHERE id = ?1", params![id])?;
+                Ok(())
+            })?;
+        }
+        Ok(removed)
+    }
+
     /// Cross-strategy reinforcement: when multiple independent strategies have generated
     /// hypotheses about the same entity pair (subject, object), boost the highest-confidence
     /// one proportionally to the number of independent corroborations.
@@ -4933,6 +5004,15 @@ impl<'a> Prometheus<'a> {
 
         // Hypothesis pair deduplication (prevent bloat from multiple runs)
         let pair_deduped = self.dedup_hypotheses_by_pair().unwrap_or(0);
+
+        // Remove symmetric duplicates (A contemporary_of B == B contemporary_of A)
+        let symmetric_deduped = self.dedup_symmetric_hypotheses().unwrap_or(0);
+        if symmetric_deduped > 0 {
+            eprintln!(
+                "[PROMETHEUS] Removed {} symmetric duplicate hypotheses",
+                symmetric_deduped
+            );
+        }
 
         // Cap total hypothesis count to prevent unbounded DB growth
         let hyp_capped = self.cap_hypothesis_count(2000).unwrap_or(0);
@@ -6880,7 +6960,19 @@ impl<'a> Prometheus<'a> {
                 params![subject, predicate, object],
                 |row| row.get(0),
             )?;
-            Ok(count > 0)
+            if count > 0 {
+                return Ok(true);
+            }
+            // Also check symmetric form for symmetric predicates
+            if is_symmetric_predicate(predicate) && object != "?" {
+                let rev_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM hypotheses WHERE subject = ?1 AND predicate = ?2 AND object = ?3",
+                    params![object, predicate, subject],
+                    |row| row.get(0),
+                )?;
+                return Ok(rev_count > 0);
+            }
+            Ok(false)
         })
     }
 
@@ -21512,6 +21604,38 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
                 "notes",
                 "letters",
                 "papers",
+                "numbers",
+                "equations",
+                "theorem",
+                "theorems",
+                "theory",
+                "principle",
+                "principles",
+                "formula",
+                "method",
+                "methods",
+                "law",
+                "laws",
+                "conjecture",
+                "paradox",
+                "sequence",
+                "series",
+                "constant",
+                "identity",
+                "lemma",
+                "axiom",
+                "calculus",
+                "algebra",
+                "geometry",
+                "mechanics",
+                "dynamics",
+                "phenomenon",
+                "classification",
+                "hypothesis",
+                "cycle",
+                "process",
+                "model",
+                "system",
             ];
             if concept_suffixes.contains(last) {
                 return Some("concept");
@@ -21558,7 +21682,38 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         "distribution",
         "constant",
         "number",
+        "numbers",
         "formula",
+        "equations",
+        "theorems",
+        "principles",
+        "laws",
+        "functions",
+        "constants",
+        "series",
+        "sequence",
+        "sequences",
+        "identities",
+        "identity",
+        "lemma",
+        "axiom",
+        "axioms",
+        "calculus",
+        "algebra",
+        "geometry",
+        "mechanics",
+        "dynamics",
+        "thermodynamics",
+        "relativity",
+        "classification",
+        "method",
+        "methods",
+        "analysis",
+        "model",
+        "system",
+        "process",
+        "cycle",
+        "phenomenon",
     ];
     if current_type == "person"
         && word_count >= 2
