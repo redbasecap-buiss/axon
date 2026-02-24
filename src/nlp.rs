@@ -5742,8 +5742,26 @@ fn extract_capitalized_inner(
                 }
                 if ENTITY_BLACKLIST.contains(&last_lower.as_str())
                     || GENERIC_SINGLE_WORDS.contains(&last_lower.as_str())
+                    || CONCEPT_INDICATORS.contains(&last_clean)
                 {
                     phrase.pop();
+                } else {
+                    break;
+                }
+            }
+            // Strip leading words that are blacklisted navigation/UI terms
+            // (e.g. "Toggle Einstein" → "Einstein") but NOT org/place indicators
+            // since those start valid entities ("University of X", "New York")
+            while phrase.len() > 1 {
+                let first_lower = phrase[0].to_lowercase();
+                // Don't strip if it's an org/place indicator (starts valid multi-word entities)
+                let first_clean = first_lower.trim_matches(|c: char| !c.is_alphanumeric());
+                if ORG_INDICATORS.contains(&first_clean) || PLACE_INDICATORS.contains(&first_clean)
+                {
+                    break;
+                }
+                if ENTITY_BLACKLIST.contains(&first_lower.as_str()) {
+                    phrase.remove(0);
                 } else {
                     break;
                 }

@@ -128,8 +128,8 @@ pub struct CausalLink {
     pub predicate: String,
     pub object_id: i64,
     pub edge_confidence: f64,
-    pub is_causal: bool,       // true if predicate is in CAUSAL_PREDICATES
-    pub is_correlative: bool,  // true if predicate is in CORRELATIVE_PREDICATES
+    pub is_causal: bool,      // true if predicate is in CAUSAL_PREDICATES
+    pub is_correlative: bool, // true if predicate is in CORRELATIVE_PREDICATES
 }
 
 /// An ordered sequence of causal links from source to target.
@@ -139,7 +139,7 @@ pub struct CausalChain {
     pub cumulative_confidence: f64,
     pub source_entity_id: i64,
     pub target_entity_id: i64,
-    pub causal_fraction: f64,  // fraction of links that are truly causal
+    pub causal_fraction: f64, // fraction of links that are truly causal
 }
 
 impl CausalChain {
@@ -342,9 +342,7 @@ fn build_weighted_adjacency(brain: &Brain) -> Result<HashMap<i64, Vec<CausalLink
 
     for r in &relations {
         let pred_lower = r.predicate.to_lowercase();
-        let is_causal = CAUSAL_PREDICATES
-            .iter()
-            .any(|p| pred_lower.contains(p));
+        let is_causal = CAUSAL_PREDICATES.iter().any(|p| pred_lower.contains(p));
         let is_correlative = CORRELATIVE_PREDICATES
             .iter()
             .any(|p| pred_lower.contains(p));
@@ -369,9 +367,7 @@ fn build_reverse_weighted_adjacency(brain: &Brain) -> Result<HashMap<i64, Vec<Ca
 
     for r in &relations {
         let pred_lower = r.predicate.to_lowercase();
-        let is_causal = CAUSAL_PREDICATES
-            .iter()
-            .any(|p| pred_lower.contains(p));
+        let is_causal = CAUSAL_PREDICATES.iter().any(|p| pred_lower.contains(p));
         let is_correlative = CORRELATIVE_PREDICATES
             .iter()
             .any(|p| pred_lower.contains(p));
@@ -465,9 +461,9 @@ impl PredicateSignature {
 pub struct Analogy {
     pub entity_a: i64,
     pub entity_b: i64,
-    pub domain_a: String,     // entity_type of a
-    pub domain_b: String,     // entity_type of b
-    pub mapping: Vec<(String, String)>,  // (predicate_a, predicate_b) correspondences
+    pub domain_a: String,               // entity_type of a
+    pub domain_b: String,               // entity_type of b
+    pub mapping: Vec<(String, String)>, // (predicate_a, predicate_b) correspondences
     pub structural_similarity: f64,
     pub description: String,
 }
@@ -482,8 +478,7 @@ pub fn analogy_score(analogy: &Analogy) -> f64 {
         0.0
     };
 
-    (analogy.structural_similarity * 0.6 + mapping_bonus * 0.3 + cross_domain_bonus * 0.1)
-        .min(1.0)
+    (analogy.structural_similarity * 0.6 + mapping_bonus * 0.3 + cross_domain_bonus * 0.1).min(1.0)
 }
 
 /// Discover analogies across entity-type domains.
@@ -678,7 +673,7 @@ pub struct EmergentConcept {
     pub member_entities: Vec<i64>,
     pub defining_predicates: Vec<String>,
     pub confidence: f64,
-    pub entity_names: Vec<String>,  // human-readable member names
+    pub entity_names: Vec<String>, // human-readable member names
 }
 
 /// Discover emergent concepts by clustering entities that share unusual predicate combinations.
@@ -775,9 +770,7 @@ pub fn discover_emergent_concepts(brain: &Brain) -> Result<Vec<EmergentConcept>>
         let shared_preds = find_shared_predicates(members, &entity_predicates);
         let interesting_shared: Vec<String> = shared_preds
             .into_iter()
-            .filter(|p| {
-                predicate_idf.get(p.as_str()).copied().unwrap_or(1.0) >= 1.3
-            })
+            .filter(|p| predicate_idf.get(p.as_str()).copied().unwrap_or(1.0) >= 1.3)
             .collect();
 
         if interesting_shared.len() < MIN_SHARED_PREDICATES {
@@ -827,7 +820,10 @@ pub fn discover_emergent_concepts(brain: &Brain) -> Result<Vec<EmergentConcept>>
                 .iter()
                 .filter(|m| existing.member_entities.contains(m))
                 .count();
-            let smaller = concept.member_entities.len().min(existing.member_entities.len());
+            let smaller = concept
+                .member_entities
+                .len()
+                .min(existing.member_entities.len());
             smaller > 0 && overlap as f64 / smaller as f64 > 0.8
         });
         if !dominated {
@@ -951,12 +947,22 @@ pub fn materialize_concepts(brain: &Brain, concepts: &[EmergentConcept]) -> Resu
 
         // Link members to the concept
         for &member_id in &concept.member_entities {
-            let _ = brain.upsert_relation(member_id, "member_of", concept_id, "reasoning:emergent_concept");
+            let _ = brain.upsert_relation(
+                member_id,
+                "member_of",
+                concept_id,
+                "reasoning:emergent_concept",
+            );
         }
 
         // Store defining predicates as facts
         for pred in &concept.defining_predicates {
-            let _ = brain.upsert_fact(concept_id, "defining_predicate", pred, "reasoning:emergent_concept");
+            let _ = brain.upsert_fact(
+                concept_id,
+                "defining_predicate",
+                pred,
+                "reasoning:emergent_concept",
+            );
         }
 
         count += 1;
@@ -1110,7 +1116,9 @@ pub fn detect_temporal_contradictions(brain: &Brain) -> Result<Vec<Contradiction
             ))
         })?;
 
-        for (id_a, id_b, entity_id, key_a, key_b, val_a, val_b, conf_a, conf_b, src_a, src_b) in rows.flatten() {
+        for (id_a, id_b, entity_id, key_a, key_b, val_a, val_b, conf_a, conf_b, src_a, src_b) in
+            rows.flatten()
+        {
             // Try to parse years from values
             let year_a = extract_year(&val_a);
             let year_b = extract_year(&val_b);
@@ -1169,7 +1177,8 @@ pub fn detect_temporal_contradictions(brain: &Brain) -> Result<Vec<Contradiction
             ))
         })?;
 
-        for (id_a, id_b, entity_id, pred_a, pred_b, conf_a, conf_b, src_a, src_b) in rows.flatten() {
+        for (id_a, id_b, entity_id, pred_a, pred_b, conf_a, conf_b, src_a, src_b) in rows.flatten()
+        {
             contradictions.push(Contradiction {
                 fact_a_id: id_a,
                 fact_b_id: id_b,
@@ -1341,9 +1350,9 @@ pub enum OntologyChange {
 #[derive(Debug, Clone)]
 pub struct OntologyReport {
     pub proposed_changes: Vec<OntologyChange>,
-    pub synonym_pairs: Vec<(String, String, f64)>,       // (pred_a, pred_b, jaccard)
-    pub overloaded_predicates: Vec<(String, usize)>,      // (predicate, type_count)
-    pub underused_predicates: Vec<(String, usize)>,       // (predicate, usage_count)
+    pub synonym_pairs: Vec<(String, String, f64)>, // (pred_a, pred_b, jaccard)
+    pub overloaded_predicates: Vec<(String, usize)>, // (predicate, type_count)
+    pub underused_predicates: Vec<(String, usize)>, // (predicate, usage_count)
 }
 
 /// Analyze predicate usage patterns and propose ontology restructuring.
@@ -1469,11 +1478,7 @@ pub fn restructure_ontology(brain: &Brain) -> Result<OntologyReport> {
             underused_predicates.push((pred.clone(), pairs.len()));
 
             // Group by prefix for potential super-predicate creation
-            let prefix = pred
-                .split('_')
-                .next()
-                .unwrap_or(pred)
-                .to_string();
+            let prefix = pred.split('_').next().unwrap_or(pred).to_string();
             predicate_families
                 .entry(prefix)
                 .or_default()
@@ -1493,10 +1498,19 @@ pub fn restructure_ontology(brain: &Brain) -> Result<OntologyReport> {
 
     // 4. Detect entity retyping opportunities
     // Find entities typed as "phrase" or generic types but exhibiting patterns of specific types
-    let meaningful_types: HashSet<&str> = ["person", "organization", "place", "concept", "technology", "company", "product", "event"]
-        .iter()
-        .copied()
-        .collect();
+    let meaningful_types: HashSet<&str> = [
+        "person",
+        "organization",
+        "place",
+        "concept",
+        "technology",
+        "company",
+        "product",
+        "event",
+    ]
+    .iter()
+    .copied()
+    .collect();
 
     let mut entity_pred_patterns: HashMap<i64, HashSet<String>> = HashMap::new();
     for r in &relations {
@@ -1546,10 +1560,7 @@ pub fn restructure_ontology(brain: &Brain) -> Result<OntologyReport> {
                         continue;
                     }
 
-                    let overlap: usize = preds
-                        .iter()
-                        .filter_map(|p| profile.get(p))
-                        .sum();
+                    let overlap: usize = preds.iter().filter_map(|p| profile.get(p)).sum();
 
                     let score = overlap as f64 / total as f64;
                     if score > best_score {
@@ -1586,10 +1597,7 @@ pub fn restructure_ontology(brain: &Brain) -> Result<OntologyReport> {
 
     overloaded_predicates.sort_by(|a, b| b.1.cmp(&a.1));
     underused_predicates.sort_by(|a, b| a.1.cmp(&b.1));
-    synonym_pairs.sort_by(|a, b| {
-        b.2.partial_cmp(&a.2)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    synonym_pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
     Ok(OntologyReport {
         proposed_changes,
@@ -1618,10 +1626,7 @@ pub fn apply_ontology_change(brain: &Brain, change: &OntologyChange) -> Result<u
                 conn.execute(
                     "INSERT INTO ontology_history (change_type, details, applied_at)
                      VALUES ('merge_predicate', ?1, ?2)",
-                    params![
-                        format!("{} → {}", source_predicate, target_predicate),
-                        now,
-                    ],
+                    params![format!("{} → {}", source_predicate, target_predicate), now,],
                 )?;
                 Ok(())
             })?;
@@ -1663,10 +1668,7 @@ pub fn apply_ontology_change(brain: &Brain, change: &OntologyChange) -> Result<u
                 conn.execute(
                     "INSERT INTO ontology_history (change_type, details, applied_at)
                      VALUES ('split_predicate', ?1, ?2)",
-                    params![
-                        format!("{} → {:?}", predicate, splits),
-                        now,
-                    ],
+                    params![format!("{} → {:?}", predicate, splits), now,],
                 )?;
                 Ok(())
             })?;
@@ -1704,10 +1706,7 @@ pub fn apply_ontology_change(brain: &Brain, change: &OntologyChange) -> Result<u
                 conn.execute(
                     "INSERT INTO ontology_history (change_type, details, applied_at)
                      VALUES ('create_super_predicate', ?1, ?2)",
-                    params![
-                        format!("{} <- {:?}", new_predicate, children),
-                        now,
-                    ],
+                    params![format!("{} <- {:?}", new_predicate, children), now,],
                 )?;
                 Ok(())
             })?;
@@ -1855,10 +1854,7 @@ pub fn reasoning_cycle(brain: &Brain) -> Result<ReasoningReport> {
     match detect_contradictions(brain) {
         Ok(fact_contradictions) => {
             report.contradictions_detected += fact_contradictions.len();
-            eprintln!(
-                "   Found {} fact contradictions",
-                fact_contradictions.len()
-            );
+            eprintln!("   Found {} fact contradictions", fact_contradictions.len());
             for c in &fact_contradictions {
                 match resolve_contradiction(brain, c) {
                     Ok(_) => report.contradictions_resolved += 1,
@@ -1917,11 +1913,7 @@ pub fn reasoning_cycle(brain: &Brain) -> Result<ReasoningReport> {
             report.analogies_found = analogies.len();
             eprintln!("   Found {} analogies", analogies.len());
             for a in analogies.iter().take(5) {
-                eprintln!(
-                    "   • {} (score: {:.2})",
-                    a.description,
-                    analogy_score(a)
-                );
+                eprintln!("   • {} (score: {:.2})", a.description, analogy_score(a));
             }
         }
         Err(e) => eprintln!("   Warning: analogy discovery failed: {}", e),
@@ -1972,8 +1964,7 @@ fn sample_causal_chains(brain: &Brain) -> Result<usize> {
     // Try pairs among top entities
     for i in 0..candidates.len().min(10) {
         for j in (i + 1)..candidates.len().min(10) {
-            let chains =
-                discover_causal_chains(brain, candidates[i].id, candidates[j].id, 3)?;
+            let chains = discover_causal_chains(brain, candidates[i].id, candidates[j].id, 3)?;
             total_chains += chains.len();
         }
     }
@@ -2031,45 +2022,95 @@ mod tests {
         let germany = brain.upsert_entity("Germany", "place").unwrap();
 
         // Relations: Newton
-        brain.upsert_relation(newton, "pioneered", gravity, "test").unwrap();
-        brain.upsert_relation(newton, "contributed_to", physics, "test").unwrap();
-        brain.upsert_relation(newton, "member_of", royal_society, "test").unwrap();
-        brain.upsert_relation(newton, "studied_at", cambridge, "test").unwrap();
-        brain.upsert_relation(newton, "born_in", england, "test").unwrap();
+        brain
+            .upsert_relation(newton, "pioneered", gravity, "test")
+            .unwrap();
+        brain
+            .upsert_relation(newton, "contributed_to", physics, "test")
+            .unwrap();
+        brain
+            .upsert_relation(newton, "member_of", royal_society, "test")
+            .unwrap();
+        brain
+            .upsert_relation(newton, "studied_at", cambridge, "test")
+            .unwrap();
+        brain
+            .upsert_relation(newton, "born_in", england, "test")
+            .unwrap();
 
         // Relations: Einstein
-        brain.upsert_relation(einstein, "pioneered", relativity, "test").unwrap();
-        brain.upsert_relation(einstein, "contributed_to", physics, "test").unwrap();
-        brain.upsert_relation(einstein, "born_in", germany, "test").unwrap();
-        brain.upsert_relation(einstein, "influenced", gravity, "test").unwrap();
+        brain
+            .upsert_relation(einstein, "pioneered", relativity, "test")
+            .unwrap();
+        brain
+            .upsert_relation(einstein, "contributed_to", physics, "test")
+            .unwrap();
+        brain
+            .upsert_relation(einstein, "born_in", germany, "test")
+            .unwrap();
+        brain
+            .upsert_relation(einstein, "influenced", gravity, "test")
+            .unwrap();
 
         // Relations: Darwin
-        brain.upsert_relation(darwin, "pioneered", evolution, "test").unwrap();
-        brain.upsert_relation(darwin, "contributed_to", biology, "test").unwrap();
-        brain.upsert_relation(darwin, "member_of", royal_society, "test").unwrap();
-        brain.upsert_relation(darwin, "born_in", england, "test").unwrap();
+        brain
+            .upsert_relation(darwin, "pioneered", evolution, "test")
+            .unwrap();
+        brain
+            .upsert_relation(darwin, "contributed_to", biology, "test")
+            .unwrap();
+        brain
+            .upsert_relation(darwin, "member_of", royal_society, "test")
+            .unwrap();
+        brain
+            .upsert_relation(darwin, "born_in", england, "test")
+            .unwrap();
 
         // Relations: Galileo
-        brain.upsert_relation(galileo, "pioneered", heliocentrism, "test").unwrap();
-        brain.upsert_relation(galileo, "contributed_to", physics, "test").unwrap();
+        brain
+            .upsert_relation(galileo, "pioneered", heliocentrism, "test")
+            .unwrap();
+        brain
+            .upsert_relation(galileo, "contributed_to", physics, "test")
+            .unwrap();
 
         // Relations: Tesla
-        brain.upsert_relation(tesla, "pioneered", electricity, "test").unwrap();
-        brain.upsert_relation(tesla, "contributed_to", physics, "test").unwrap();
+        brain
+            .upsert_relation(tesla, "pioneered", electricity, "test")
+            .unwrap();
+        brain
+            .upsert_relation(tesla, "contributed_to", physics, "test")
+            .unwrap();
 
         // Relations: Curie
-        brain.upsert_relation(curie, "pioneered", radioactivity, "test").unwrap();
-        brain.upsert_relation(curie, "contributed_to", physics, "test").unwrap();
+        brain
+            .upsert_relation(curie, "pioneered", radioactivity, "test")
+            .unwrap();
+        brain
+            .upsert_relation(curie, "contributed_to", physics, "test")
+            .unwrap();
 
         // Causal chain: gravity → relativity (Newton's work led to Einstein's)
-        brain.upsert_relation(gravity, "led_to", relativity, "test").unwrap();
-        brain.upsert_relation(newton, "influenced", einstein, "test").unwrap();
+        brain
+            .upsert_relation(gravity, "led_to", relativity, "test")
+            .unwrap();
+        brain
+            .upsert_relation(newton, "influenced", einstein, "test")
+            .unwrap();
 
         // Facts for contradiction testing
-        brain.upsert_fact(newton, "birth_year", "1643", "source_a").unwrap();
-        brain.upsert_fact(newton, "birth_year", "1642", "source_b").unwrap(); // Julian vs Gregorian
-        brain.upsert_fact(newton, "nationality", "English", "test").unwrap();
-        brain.upsert_fact(einstein, "birth_year", "1879", "test").unwrap();
+        brain
+            .upsert_fact(newton, "birth_year", "1643", "source_a")
+            .unwrap();
+        brain
+            .upsert_fact(newton, "birth_year", "1642", "source_b")
+            .unwrap(); // Julian vs Gregorian
+        brain
+            .upsert_fact(newton, "nationality", "English", "test")
+            .unwrap();
+        brain
+            .upsert_fact(einstein, "birth_year", "1879", "test")
+            .unwrap();
 
         brain
     }
@@ -2401,9 +2442,7 @@ mod tests {
         let analogies = discover_analogies(&brain).unwrap();
 
         // Newton and Darwin should be analogous (both pioneered, contributed_to, member_of Royal Society)
-        let has_scientist_analogy = analogies.iter().any(|a| {
-            a.structural_similarity > 0.2
-        });
+        let has_scientist_analogy = analogies.iter().any(|a| a.structural_similarity > 0.2);
         // We should find at least some analogies in this graph
         assert!(analogies.len() >= 0); // non-panic baseline; populated graph should yield some
     }
@@ -2488,19 +2527,13 @@ mod tests {
 
     #[test]
     fn test_generate_concept_name_known_pattern() {
-        let name = generate_concept_name(&[
-            "pioneered".to_string(),
-            "persecuted_for".to_string(),
-        ]);
+        let name = generate_concept_name(&["pioneered".to_string(), "persecuted_for".to_string()]);
         assert_eq!(name, "Vindicated Visionaries");
     }
 
     #[test]
     fn test_generate_concept_name_generic() {
-        let name = generate_concept_name(&[
-            "studied".to_string(),
-            "published".to_string(),
-        ]);
+        let name = generate_concept_name(&["studied".to_string(), "published".to_string()]);
         // Should produce something like "Studied-Published Group"
         assert!(name.contains("Group"));
     }
@@ -2585,7 +2618,9 @@ mod tests {
 
         let contradictions = detect_temporal_contradictions(&brain).unwrap();
         assert!(
-            contradictions.iter().any(|c| c.conflict_type == ConflictType::TemporalContradiction),
+            contradictions
+                .iter()
+                .any(|c| c.conflict_type == ConflictType::TemporalContradiction),
             "Should detect born-after-died temporal contradiction"
         );
     }
@@ -2598,13 +2633,15 @@ mod tests {
         brain.upsert_fact(eid, "answer", "43", "bad_src").unwrap();
 
         // Boost the first fact's confidence
-        brain.with_conn(|conn| {
-            conn.execute(
-                "UPDATE facts SET confidence = 0.9 WHERE value = '42' AND entity_id = ?1",
-                params![eid],
-            )?;
-            Ok(())
-        }).unwrap();
+        brain
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE facts SET confidence = 0.9 WHERE value = '42' AND entity_id = ?1",
+                    params![eid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
 
         let contradictions = detect_contradictions(&brain).unwrap();
         assert!(!contradictions.is_empty());
@@ -2702,9 +2739,7 @@ mod tests {
         let has_synonym = report
             .synonym_pairs
             .iter()
-            .any(|(a, b, _)| {
-                (a == "created" && b == "built") || (a == "built" && b == "created")
-            });
+            .any(|(a, b, _)| (a == "created" && b == "built") || (a == "built" && b == "created"));
         assert!(has_synonym, "Should detect created/built as synonyms");
     }
 
@@ -2735,7 +2770,9 @@ mod tests {
         let brain = test_brain();
         let eid = brain.upsert_entity("John Smith", "phrase").unwrap();
         let concept = brain.upsert_entity("Physics", "concept").unwrap();
-        brain.upsert_relation(eid, "studied", concept, "test").unwrap();
+        brain
+            .upsert_relation(eid, "studied", concept, "test")
+            .unwrap();
 
         let change = OntologyChange::RetypeEntities {
             entity_ids: vec![eid],

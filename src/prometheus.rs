@@ -4120,6 +4120,25 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(oc_hyps);
         }
 
+        // 2x. Inverse relation inference (bidirectional knowledge)
+        let ir_weight = self.get_pattern_weight("inverse_relation")?;
+        if ir_weight >= 0.05 {
+            let ir_hyps = self.generate_hypotheses_from_inverse_relations()?;
+            eprintln!(
+                "[PROMETHEUS] inverse_relation: {} hypotheses",
+                ir_hyps.len()
+            );
+            all_hypotheses.extend(ir_hyps);
+        }
+
+        // 2y. Co-fact hypothesis (entities sharing same fact key-value pairs)
+        let cf_weight = self.get_pattern_weight("co_fact")?;
+        if cf_weight >= 0.05 {
+            let cf_hyps = self.generate_hypotheses_from_co_facts()?;
+            eprintln!("[PROMETHEUS] co_fact: {} hypotheses", cf_hyps.len());
+            all_hypotheses.extend(cf_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -4581,12 +4600,15 @@ impl<'a> Prometheus<'a> {
         let (quality_score, quality_components) =
             crate::graph::graph_quality_score(self.brain).unwrap_or((0.0, HashMap::new()));
 
-        // Track discovery velocity
+        // Track discovery velocity (include auto-resolved counts for accurate metrics)
+        let total_confirmed = confirmed + auto_confirmed as usize + excl_promoted as usize;
+        let total_rejected =
+            rejected + auto_rejected as usize + excl_rejected as usize + bulk_rejected as usize;
         let _ = self.track_discovery_velocity(
             all_patterns.len(),
             all_hypotheses.len(),
-            confirmed,
-            rejected,
+            total_confirmed,
+            total_rejected,
         );
 
         // Discovery health check (trend analysis + hypothesis clustering)
@@ -11745,6 +11767,223 @@ impl<'a> Prometheus<'a> {
             });
         }
         hypotheses.truncate(40);
+        Ok(hypotheses)
+    }
+
+    /// Inverse relation inference: if A→pred→B exists, hypothesize B→inverse(pred)→A.
+    /// Many predicates have natural inverses (e.g., "influenced" ↔ "influenced_by",
+    /// "founded" ↔ "founded_by", "part_of" ↔ "contains").
+    pub fn generate_hypotheses_from_inverse_relations(&self) -> Result<Vec<Hypothesis>> {
+        let inverse_map: HashMap<&str, &str> = [
+            ("influenced", "influenced_by"),
+            ("influenced_by", "influenced"),
+            ("founded", "founded_by"),
+            ("founded_by", "founded"),
+            ("part_of", "contains"),
+            ("contains", "part_of"),
+            ("taught", "studied_under"),
+            ("studied_under", "taught"),
+            ("preceded", "succeeded"),
+            ("succeeded", "preceded"),
+            ("parent_of", "child_of"),
+            ("child_of", "parent_of"),
+            ("employed_by", "employs"),
+            ("employs", "employed_by"),
+            ("mentor_of", "mentored_by"),
+            ("mentored_by", "mentor_of"),
+            ("discovered", "discovered_by"),
+            ("discovered_by", "discovered"),
+            ("invented", "invented_by"),
+            ("invented_by", "invented"),
+            ("collaborated_with", "collaborated_with"),
+            ("defeated", "defeated_by"),
+            ("defeated_by", "defeated"),
+            ("inspired", "inspired_by"),
+            ("inspired_by", "inspired"),
+            ("based_in", "headquarters_of"),
+            ("headquarters_of", "based_in"),
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+
+        // Build existing relation set for dedup
+        let existing: HashSet<(i64, String, i64)> = relations
+            .iter()
+            .map(|r| (r.subject_id, r.predicate.clone(), r.object_id))
+            .collect();
+
+        let mut hypotheses = Vec::new();
+        let mut seen = HashSet::new();
+
+        for r in &relations {
+            if !meaningful.contains(&r.subject_id) || !meaningful.contains(&r.object_id) {
+                continue;
+            }
+            let pred = r.predicate.as_str();
+            if let Some(&inverse) = inverse_map.get(pred) {
+                // Check if inverse relation already exists
+                if existing.contains(&(r.object_id, inverse.to_string(), r.subject_id)) {
+                    continue;
+                }
+                let pair = (
+                    r.object_id.min(r.subject_id),
+                    r.object_id.max(r.subject_id),
+                    inverse,
+                );
+                if !seen.insert(pair) {
+                    continue;
+                }
+
+                let subj_name = id_name.get(&r.object_id).copied().unwrap_or("?");
+                let obj_name = id_name.get(&r.subject_id).copied().unwrap_or("?");
+                if is_noise_name(subj_name) || is_noise_name(obj_name) {
+                    continue;
+                }
+
+                let base_conf = 0.65 + r.confidence * 0.2; // Inverse relations are high-confidence
+                let confidence = self
+                    .calibrated_confidence("inverse_relation", base_conf)
+                    .unwrap_or(base_conf);
+
+                hypotheses.push(Hypothesis {
+                    id: 0,
+                    subject: subj_name.to_string(),
+                    predicate: inverse.to_string(),
+                    object: obj_name.to_string(),
+                    confidence,
+                    evidence_for: vec![format!(
+                        "Inverse of existing relation: {} {} {}",
+                        obj_name, pred, subj_name
+                    )],
+                    evidence_against: vec![],
+                    reasoning_chain: vec![
+                        format!("Known: {} {} {}", obj_name, pred, subj_name),
+                        format!("'{}' implies inverse '{}'", pred, inverse),
+                        "Bidirectional relations strengthen graph connectivity".to_string(),
+                    ],
+                    status: HypothesisStatus::Proposed,
+                    discovered_at: now_str(),
+                    pattern_source: "inverse_relation".to_string(),
+                });
+            }
+        }
+        hypotheses.truncate(60);
+        Ok(hypotheses)
+    }
+
+    /// Co-fact hypothesis: entities sharing the same (key, value) fact pairs are
+    /// likely related. For example, if both "Alan Turing" and "Bletchley Park"
+    /// have fact (location, "England"), they may be connected.
+    pub fn generate_hypotheses_from_co_facts(&self) -> Result<Vec<Hypothesis>> {
+        let entities = self.brain.all_entities()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Build fact-value → entity index
+        let mut fact_groups: HashMap<(String, String), Vec<i64>> = HashMap::new();
+        self.brain.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT entity_id, key, value FROM facts WHERE confidence >= 0.5")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (eid, key, value) = row?;
+                if meaningful.contains(&eid)
+                    && !key.is_empty()
+                    && !value.is_empty()
+                    && value.len() > 2
+                {
+                    // Skip overly generic fact keys
+                    let generic_keys = ["type", "description", "name", "source", "url"];
+                    if !generic_keys.contains(&key.as_str()) {
+                        fact_groups.entry((key, value)).or_default().push(eid);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+        // Build existing relation set
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<(i64, i64)> = relations
+            .iter()
+            .flat_map(|r| [(r.subject_id, r.object_id), (r.object_id, r.subject_id)])
+            .collect();
+
+        let mut hypotheses = Vec::new();
+        let mut seen = HashSet::new();
+
+        for ((key, value), eids) in &fact_groups {
+            if eids.len() < 2 || eids.len() > 20 {
+                continue; // Skip too-small or too-common groups
+            }
+            for i in 0..eids.len().min(10) {
+                for j in (i + 1)..eids.len().min(10) {
+                    let a = eids[i];
+                    let b = eids[j];
+                    if connected.contains(&(a, b)) {
+                        continue;
+                    }
+                    let pair = (a.min(b), a.max(b));
+                    if !seen.insert(pair) {
+                        continue;
+                    }
+                    let a_name = id_name.get(&a).copied().unwrap_or("?");
+                    let b_name = id_name.get(&b).copied().unwrap_or("?");
+                    if is_noise_name(a_name) || is_noise_name(b_name) {
+                        continue;
+                    }
+                    let a_type = id_type.get(&a).copied().unwrap_or("?");
+                    let b_type = id_type.get(&b).copied().unwrap_or("?");
+                    let predicate = infer_predicate(a_type, b_type, None);
+
+                    let base_conf = 0.40 + (1.0 / eids.len() as f64) * 0.2; // Rarer shared facts = higher conf
+                    let confidence = self
+                        .calibrated_confidence("co_fact", base_conf)
+                        .unwrap_or(base_conf);
+
+                    hypotheses.push(Hypothesis {
+                        id: 0,
+                        subject: a_name.to_string(),
+                        predicate: predicate.to_string(),
+                        object: b_name.to_string(),
+                        confidence,
+                        evidence_for: vec![format!(
+                            "Shared fact: {}={} (group size {})",
+                            key,
+                            value,
+                            eids.len()
+                        )],
+                        evidence_against: vec![],
+                        reasoning_chain: vec![
+                            format!("{} and {} both have fact {}={}", a_name, b_name, key, value),
+                            "Shared factual attributes suggest a real-world connection".to_string(),
+                        ],
+                        status: HypothesisStatus::Proposed,
+                        discovered_at: now_str(),
+                        pattern_source: "co_fact".to_string(),
+                    });
+                }
+            }
+        }
+        hypotheses.truncate(50);
         Ok(hypotheses)
     }
 
