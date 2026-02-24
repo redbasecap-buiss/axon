@@ -4612,3 +4612,121 @@ pub fn graph_quality_score(brain: &Brain) -> Result<(f64, HashMap<String, f64>),
 
     Ok((quality, components))
 }
+
+/// Compute predicate co-occurrence: which predicates tend to appear together
+/// on the same entity. Returns pairs of (pred_a, pred_b, jaccard_similarity)
+/// sorted by similarity descending. Useful for predicate transfer validation.
+pub fn predicate_covariance(
+    brain: &Brain,
+    min_jaccard: f64,
+) -> Result<Vec<(String, String, f64)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+
+    // Build entity → set of predicates
+    let mut entity_preds: HashMap<i64, HashSet<String>> = HashMap::new();
+    for r in &relations {
+        entity_preds
+            .entry(r.subject_id)
+            .or_default()
+            .insert(r.predicate.clone());
+    }
+
+    // Count how many entities have each predicate
+    let mut pred_entities: HashMap<String, HashSet<i64>> = HashMap::new();
+    for (eid, preds) in &entity_preds {
+        for p in preds {
+            pred_entities.entry(p.clone()).or_default().insert(*eid);
+        }
+    }
+
+    // Only consider predicates with ≥5 entities
+    let preds: Vec<String> = pred_entities
+        .iter()
+        .filter(|(_, ents)| ents.len() >= 5)
+        .map(|(p, _)| p.clone())
+        .collect();
+
+    let mut results = Vec::new();
+    for i in 0..preds.len() {
+        for j in (i + 1)..preds.len() {
+            let a_set = &pred_entities[&preds[i]];
+            let b_set = &pred_entities[&preds[j]];
+            let intersection = a_set.intersection(b_set).count();
+            let union = a_set.union(b_set).count();
+            if union == 0 {
+                continue;
+            }
+            let jaccard = intersection as f64 / union as f64;
+            if jaccard >= min_jaccard {
+                results.push((preds[i].clone(), preds[j].clone(), jaccard));
+            }
+        }
+    }
+    results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(results)
+}
+
+/// Find entities that serve as "bridges" between otherwise disconnected
+/// predicate domains. These entities use predicates from multiple
+/// distinct clusters, making them cross-domain connectors.
+pub fn cross_domain_bridges(
+    brain: &Brain,
+    min_domains: usize,
+) -> Result<Vec<(i64, String, Vec<String>)>, rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let relations = brain.all_relations()?;
+
+    // Build entity → set of predicates (both directions)
+    let mut entity_preds: HashMap<i64, HashSet<String>> = HashMap::new();
+    for r in &relations {
+        entity_preds
+            .entry(r.subject_id)
+            .or_default()
+            .insert(r.predicate.clone());
+        entity_preds
+            .entry(r.object_id)
+            .or_default()
+            .insert(r.predicate.clone());
+    }
+
+    let id_name: HashMap<i64, &str> = entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+
+    // Define predicate domain clusters
+    let domain_map: HashMap<&str, &str> = [
+        ("pioneered", "innovation"),
+        ("contributed_to", "innovation"),
+        ("works_on", "innovation"),
+        ("active_in", "geography"),
+        ("located_near", "geography"),
+        ("based_in", "geography"),
+        ("contemporary_of", "social"),
+        ("partner_of", "social"),
+        ("affiliated_with", "social"),
+        ("related_concept", "knowledge"),
+        ("references", "knowledge"),
+        ("subclass_of", "knowledge"),
+    ]
+    .into_iter()
+    .collect();
+
+    let mut bridges = Vec::new();
+    for (eid, preds) in &entity_preds {
+        let domains: HashSet<&str> = preds
+            .iter()
+            .filter_map(|p| domain_map.get(p.as_str()).copied())
+            .collect();
+        if domains.len() >= min_domains {
+            let name = id_name.get(eid).copied().unwrap_or("?");
+            bridges.push((
+                *eid,
+                name.to_string(),
+                domains
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+    }
+    bridges.sort_by(|a, b| b.2.len().cmp(&a.2.len()));
+    Ok(bridges)
+}

@@ -10563,10 +10563,27 @@ impl<'a> Prometheus<'a> {
                 .push(e.id);
         }
 
+        // Build predicate prevalence per type group: only transfer predicates
+        // that are common across the group (≥25% of entities have it).
+        // Rare predicates are likely entity-specific, not transferable.
+        let mut type_pred_prevalence: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        for (etype, ids) in &type_groups {
+            let counts = type_pred_prevalence.entry(etype.to_string()).or_default();
+            for &eid in ids {
+                if let Some(preds) = out_preds.get(&eid) {
+                    for p in preds {
+                        *counts.entry(p.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
         let mut hypotheses = Vec::new();
         let mut seen: HashSet<(i64, String)> = HashSet::new();
 
-        for group in type_groups.values() {
+        for (etype, group) in &type_groups {
+            let prevalence = type_pred_prevalence.get(*etype);
+            let group_size = group.len();
             // Shuffle for diversity when group is large, then sample
             let group: Vec<i64> = if group.len() > 300 {
                 // Deterministic but varied sampling: pick every Nth entity
@@ -10609,8 +10626,15 @@ impl<'a> Prometheus<'a> {
                         continue;
                     }
 
-                    // Find predicates in A but not B
+                    // Find predicates in A but not B — only transfer prevalent predicates
                     for missing_pred in a_preds.difference(b_preds) {
+                        // Skip predicates that aren't common in this type group (< 25% prevalence)
+                        if let Some(prev) = prevalence {
+                            let pred_count = prev.get(missing_pred.as_str()).copied().unwrap_or(0);
+                            if group_size >= 10 && (pred_count as f64 / group_size as f64) < 0.25 {
+                                continue;
+                            }
+                        }
                         let key = (b, missing_pred.clone());
                         if seen.contains(&key) {
                             continue;
@@ -10657,8 +10681,14 @@ impl<'a> Prometheus<'a> {
                             break;
                         }
                     }
-                    // Also check B → A direction
+                    // Also check B → A direction — only transfer prevalent predicates
                     for missing_pred in b_preds.difference(a_preds) {
+                        if let Some(prev) = prevalence {
+                            let pred_count = prev.get(missing_pred.as_str()).copied().unwrap_or(0);
+                            if group_size >= 10 && (pred_count as f64 / group_size as f64) < 0.25 {
+                                continue;
+                            }
+                        }
                         let key = (a, missing_pred.clone());
                         if seen.contains(&key) {
                             continue;
