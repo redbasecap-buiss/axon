@@ -4394,6 +4394,7 @@ impl<'a> Prometheus<'a> {
         for h in all_hypotheses.iter_mut().take(200) {
             self.score_hypothesis(h)?;
             self.validate_hypothesis(h)?;
+            let _ = self.apply_type_pair_affinity(h);
         }
         // Batch-boost using graph structure (communities + k-cores) — computed once
         let boost_slice = if all_hypotheses.len() > 200 {
@@ -4724,6 +4725,9 @@ impl<'a> Prometheus<'a> {
         // Reconnect high-value isolated entities via surname/source matching
         let hv_island_reconnected = self.reconnect_high_value_islands_by_surname().unwrap_or(0);
 
+        // Surname-only island reconnection (broader reach than high-value reconnect)
+        let surname_reconnected = self.reconnect_islands_by_surname_match().unwrap_or(0);
+
         // Boost confidence of well-known entities
         let known_boosted = self.boost_known_entity_confidence().unwrap_or(0);
 
@@ -4840,7 +4844,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -4929,6 +4933,7 @@ impl<'a> Prometheus<'a> {
             token_type_reclassified,
             foreign_purged,
             hv_island_reconnected,
+            surname_reconnected,
             known_boosted,
             predicates_refined,
             contextual_refined,
@@ -18718,6 +18723,221 @@ impl<'a> Prometheus<'a> {
             );
         }
         Ok(reconnected)
+    }
+
+    /// Reconnect isolated person entities to connected persons sharing the same
+    /// surname (last name token). Uses a relaxed confidence threshold (≥ 0.5)
+    /// and requires only a matching last name plus compatible type. Creates
+    /// `contemporary_of` relations rather than merging, since these are distinct
+    /// individuals who may be related (same family, same field).
+    pub fn reconnect_islands_by_surname_match(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        // Build surname → connected person ids index
+        let mut surname_to_connected: HashMap<String, Vec<(i64, usize)>> = HashMap::new();
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+        for e in &entities {
+            if !connected.contains(&e.id) || e.entity_type != "person" {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 {
+                continue;
+            }
+            let surname = words.last().unwrap().to_lowercase();
+            // Skip very short or common surnames that produce false positives
+            if surname.len() < 4 {
+                continue;
+            }
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            surname_to_connected
+                .entry(surname)
+                .or_default()
+                .push((e.id, deg));
+        }
+
+        // Common surnames to skip (too many false positives)
+        let skip_surnames: HashSet<&str> = [
+            "smith",
+            "johnson",
+            "williams",
+            "brown",
+            "jones",
+            "miller",
+            "davis",
+            "wilson",
+            "moore",
+            "taylor",
+            "anderson",
+            "thomas",
+            "jackson",
+            "white",
+            "harris",
+            "martin",
+            "thompson",
+            "garcia",
+            "martinez",
+            "robinson",
+            "clark",
+            "rodriguez",
+            "lewis",
+            "lee",
+            "walker",
+            "hall",
+            "allen",
+            "young",
+            "king",
+            "wright",
+            "scott",
+            "green",
+            "baker",
+            "adams",
+            "nelson",
+            "hill",
+            "campbell",
+            "mitchell",
+            "roberts",
+            "carter",
+            "phillips",
+            "evans",
+            "turner",
+            "torres",
+            "parker",
+            "collins",
+            "edwards",
+            "stewart",
+            "morris",
+            "murphy",
+            "cook",
+            "rogers",
+            "morgan",
+            "bell",
+            "cooper",
+            "bailey",
+            "reed",
+            "ward",
+            "cox",
+            "howard",
+            "ross",
+            "wood",
+            "james",
+            "west",
+            "long",
+            "ford",
+        ]
+        .into_iter()
+        .collect();
+
+        let mut reconnected = 0usize;
+        let mut seen: HashSet<(i64, i64)> = HashSet::new();
+
+        for e in &entities {
+            if connected.contains(&e.id)
+                || e.entity_type != "person"
+                || e.confidence < 0.5
+                || is_noise_name(&e.name)
+            {
+                continue;
+            }
+            if reconnected >= 300 {
+                break;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 {
+                continue;
+            }
+            let surname = words.last().unwrap().to_lowercase();
+            if surname.len() < 4 || skip_surnames.contains(surname.as_str()) {
+                continue;
+            }
+
+            if let Some(candidates) = surname_to_connected.get(&surname) {
+                // Pick the highest-degree connected person with this surname
+                if let Some(&(best_id, _deg)) = candidates.iter().max_by_key(|(_, d)| *d) {
+                    let pair = (e.id.min(best_id), e.id.max(best_id));
+                    if !seen.contains(&pair) {
+                        self.brain.upsert_relation(
+                            e.id,
+                            "contemporary_of",
+                            best_id,
+                            "prometheus:surname_island_reconnect",
+                        )?;
+                        seen.insert(pair);
+                        reconnected += 1;
+                    }
+                }
+            }
+        }
+
+        if reconnected > 0 {
+            eprintln!(
+                "  [surname-island-reconnect] reconnected {} person islands via surname matching",
+                reconnected
+            );
+        }
+        Ok(reconnected)
+    }
+
+    /// Type-pair predicate affinity scoring: adjusts hypothesis confidence based
+    /// on empirical success rates for (subject_type, object_type, predicate)
+    /// combinations. E.g., person→person with `contemporary_of` has high
+    /// confirmation rates, while concept→place with `related_to` is weaker.
+    pub fn apply_type_pair_affinity(&self, h: &mut Hypothesis) -> Result<()> {
+        if h.object == "?" {
+            return Ok(());
+        }
+        let s_ent = self.brain.get_entity_by_name(&h.subject)?;
+        let o_ent = self.brain.get_entity_by_name(&h.object)?;
+        if let (Some(se), Some(oe)) = (s_ent, o_ent) {
+            // High-affinity pairings (boost)
+            let high_affinity = matches!(
+                (
+                    se.entity_type.as_str(),
+                    oe.entity_type.as_str(),
+                    h.predicate.as_str()
+                ),
+                ("person", "person", "contemporary_of")
+                    | ("person", "concept", "pioneered")
+                    | ("person", "technology", "pioneered")
+                    | ("person", "organization", "affiliated_with")
+                    | ("person", "place", "active_in")
+                    | ("organization", "place", "based_in")
+                    | ("organization", "person", "affiliated_with")
+            );
+            // Low-affinity pairings (penalize)
+            let low_affinity = matches!(
+                (
+                    se.entity_type.as_str(),
+                    oe.entity_type.as_str(),
+                    h.predicate.as_str()
+                ),
+                ("concept", "place", "related_to")
+                    | ("place", "concept", "related_to")
+                    | ("concept", "concept", "related_concept")
+                    | ("place", "place", "contemporary_of")
+                    | ("concept", "concept", "contemporary_of")
+            );
+
+            if high_affinity {
+                h.confidence = (h.confidence * 1.08).min(1.0);
+                h.evidence_for
+                    .push("High-affinity type-predicate combination".to_string());
+            } else if low_affinity {
+                h.confidence *= 0.90;
+                h.evidence_against
+                    .push("Low-affinity type-predicate combination".to_string());
+            }
+        }
+        Ok(())
     }
 
     /// Hypothesis quality scoring boost: hypotheses that would increase

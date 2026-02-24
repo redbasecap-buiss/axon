@@ -942,6 +942,26 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "steward",
     "subsistence",
     "translation",
+    // Added 2026-02-24 (brain cleaner round 10): generic words still in DB
+    "mythology",
+    "comedy",
+    "heuristic",
+    "breach",
+    "suppose",
+    "foreigners",
+    "initially",
+    "operations",
+    "dissolution",
+    "cognition",
+    "compression",
+    "evaporation",
+    "perception",
+    "precipitation",
+    "scheduling",
+    "unemployment",
+    "fragment",
+    "implosion",
+    "longitude",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -3622,6 +3642,16 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         if suffixes.iter().any(|s| lower.ends_with(s)) && trimmed.len() > 6 {
             return false;
         }
+    }
+
+    // Reject single-word entities that are US dollar amounts (e.g. "US$16,098,404")
+    if lower.starts_with("us$") && etype != "currency" {
+        return false;
+    }
+
+    // Reject military standard codes (e.g. "MIL-STD-1815")
+    if lower.starts_with("mil-std-") || lower.starts_with("mil-spec-") {
+        return false;
     }
 
     // Reject single-word person titles used alone (President, Queen, etc.)
