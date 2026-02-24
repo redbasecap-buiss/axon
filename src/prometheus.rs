@@ -4880,6 +4880,15 @@ impl<'a> Prometheus<'a> {
         // Purge isolated person entities with all-common-English-word names
         let common_english_purged = self.purge_common_english_person_islands().unwrap_or(0);
 
+        // Reclassify person islands matching geographic/event/concept patterns
+        let geo_reclassified = self.reclassify_geographic_person_islands().unwrap_or(0);
+
+        // Reclassify two-word compound concept persons (e.g., "Aneutronic Fusion")
+        let compound_reclassified = self.reclassify_compound_concept_persons().unwrap_or(0);
+
+        // Purge ancient low-confidence islands (>30 days old, conf ≤0.5, no facts/relations)
+        let ancient_purged = self.purge_ancient_low_confidence_islands(30).unwrap_or(0);
+
         // Purge NLP concatenation noise ("Examples Yang", "Neumann John Examples")
         let concat_noise_purged = self.purge_concatenation_noise().unwrap_or(0);
 
@@ -5076,7 +5085,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} geo-person-reclassified, {} compound-concept-reclassified, {} ancient-islands-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -5157,6 +5166,9 @@ impl<'a> Prometheus<'a> {
             concepts_reclassified,
             surname_concepts_reclassified,
             common_english_purged,
+            geo_reclassified,
+            compound_reclassified,
+            ancient_purged,
             abbreviation_merged,
             concat_noise_purged,
             token_reconnected,
@@ -20600,6 +20612,284 @@ impl<'a> Prometheus<'a> {
             );
         }
         Ok(purged)
+    }
+
+    /// Reclassify person islands that match geographic/event/concept patterns.
+    ///
+    /// Catches Latin prefixes (Pax, Via, Porta, Terra, etc.), geographic suffixes
+    /// (Corridor, Basin, Pass, etc.), and historical event suffixes (Accord, Pact,
+    /// Treaty, Schism, etc.) that NLP misclassifies as person entities.
+    pub fn reclassify_geographic_person_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        // Latin/geographic prefixes that indicate places, not persons
+        let place_prefixes: &[&str] = &[
+            "pax ", "via ", "porta ", "pont ", "mons ", "mont ", "cabo ", "isla ", "sierra ",
+            "terra ", "lago ", "rio ", "val ", "col ", "fort ", "camp ", "klein ", "gross ",
+            "groß ",
+        ];
+
+        // Suffixes indicating geographic features or events
+        let place_suffixes: &[&str] = &[
+            " corridor",
+            " basin",
+            " pass",
+            " gorge",
+            " canyon",
+            " reef",
+            " glacier",
+            " plateau",
+            " delta",
+            " strait",
+            " gulf",
+            " cape",
+            " peninsula",
+            " archipelago",
+            " lagoon",
+            " fjord",
+            " atoll",
+            " oasis",
+            " steppe",
+            " tundra",
+            " savanna",
+            " savannah",
+            " noir",
+            " noire",
+            " blanche",
+            " haute",
+            " basse",
+        ];
+
+        let concept_suffixes: &[&str] = &[
+            " accord",
+            " pact",
+            " treaty",
+            " schism",
+            " cordiale",
+            " knot",
+            " manifesto",
+            " doctrine",
+            " heresy",
+            " crusade",
+            " armistice",
+            " convention",
+            " protocol",
+            " charter",
+            " concordat",
+            " edict",
+            " decree",
+            " fusion",
+            " fission",
+            " sanitaire",
+            " entente",
+        ];
+
+        let mut reclassified = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            if e.entity_type != "person" || e.confidence > 0.7 {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+
+            let lower = e.name.to_lowercase();
+
+            let is_place = place_prefixes.iter().any(|p| lower.starts_with(p))
+                || place_suffixes.iter().any(|s| lower.ends_with(s));
+            let is_concept = concept_suffixes.iter().any(|s| lower.ends_with(s));
+
+            if is_place {
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE entities SET entity_type = 'place' WHERE id = ?1",
+                        params![e.id],
+                    )?;
+                    Ok(())
+                })?;
+                reclassified += 1;
+            } else if is_concept {
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE entities SET entity_type = 'concept' WHERE id = ?1",
+                        params![e.id],
+                    )?;
+                    Ok(())
+                })?;
+                reclassified += 1;
+            }
+        }
+        if reclassified > 0 {
+            eprintln!(
+                "  [geo-person-reclassify] reclassified {} isolated person entities to place/concept",
+                reclassified
+            );
+        }
+        Ok(reclassified)
+    }
+
+    /// Purge ancient low-confidence islands: entities that were first seen >30 days ago,
+    /// have confidence ≤0.5, no relations, and no facts. These have had plenty of time
+    /// to be connected and haven't been — they're extraction noise.
+    pub fn purge_ancient_low_confidence_islands(&self, max_age_days: i64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::days(max_age_days))
+            .format("%Y-%m-%d")
+            .to_string();
+
+        let count: usize = self.brain.with_conn(|conn| {
+            let removed = conn.execute(
+                "DELETE FROM entities WHERE id IN (
+                    SELECT e.id FROM entities e
+                    WHERE e.confidence <= 0.5
+                    AND e.first_seen < ?1
+                    AND e.id NOT IN (SELECT subject_id FROM relations)
+                    AND e.id NOT IN (SELECT object_id FROM relations)
+                    AND e.id NOT IN (SELECT entity_id FROM facts)
+                    AND e.access_count <= 1
+                )",
+                params![cutoff],
+            )?;
+            Ok(removed)
+        })?;
+
+        if count > 0 {
+            eprintln!(
+                "  [ancient-island-purge] removed {} low-confidence islands older than {} days",
+                count, max_age_days
+            );
+        }
+        Ok(count)
+    }
+
+    /// Detect and reclassify person entities whose names are actually well-known
+    /// two-word compound concepts (e.g., "Aneutronic Fusion", "Diamond Necklace").
+    /// Uses a heuristic: if the second word is a common noun (not a name) and the
+    /// first word is an adjective/material/descriptor, it's likely a concept.
+    pub fn reclassify_compound_concept_persons(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        // Common noun second words that indicate concepts, not persons
+        let concept_nouns: HashSet<&str> = [
+            "fusion",
+            "fission",
+            "necklace",
+            "paradox",
+            "theorem",
+            "effect",
+            "principle",
+            "constant",
+            "formula",
+            "conjecture",
+            "inequality",
+            "hypothesis",
+            "spectrum",
+            "cycle",
+            "process",
+            "mechanism",
+            "reaction",
+            "equation",
+            "transform",
+            "function",
+            "series",
+            "distribution",
+            "integral",
+            "matrix",
+            "tensor",
+            "field",
+            "algebra",
+            "geometry",
+            "topology",
+            "manifold",
+            "lattice",
+            "protocol",
+            "algorithm",
+            "cipher",
+            "code",
+            "machine",
+            "engine",
+            "turbine",
+            "reactor",
+            "accelerator",
+            "collider",
+            "telescope",
+            "microscope",
+            "radiation",
+            "emission",
+            "absorption",
+            "diffraction",
+            "interference",
+            "resonance",
+            "oscillation",
+            "entropy",
+            "enthalpy",
+            "catalysis",
+            "synthesis",
+            "analysis",
+            "plague",
+            "epidemic",
+            "pandemic",
+            "famine",
+            "drought",
+            "insurgency",
+            "rebellion",
+            "mutiny",
+            "blockade",
+            "embargo",
+            "boycott",
+            "lockout",
+            "putsch",
+            "coup",
+            "restoration",
+        ]
+        .into_iter()
+        .collect();
+
+        let mut reclassified = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) || e.entity_type != "person" || e.confidence > 0.6 {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() != 2 {
+                continue;
+            }
+            let second_lower = words[1].to_lowercase();
+            if concept_nouns.contains(second_lower.as_str()) {
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE entities SET entity_type = 'concept' WHERE id = ?1",
+                        params![e.id],
+                    )?;
+                    Ok(())
+                })?;
+                reclassified += 1;
+            }
+        }
+        if reclassified > 0 {
+            eprintln!(
+                "  [compound-concept-reclassify] reclassified {} two-word compound concept persons",
+                reclassified
+            );
+        }
+        Ok(reclassified)
     }
 }
 
