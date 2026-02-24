@@ -5281,11 +5281,81 @@ impl<'a> Prometheus<'a> {
                         }
 
                         // Signal 3: Same entity type + high degree (well-established entities)
+                        let s_rels = self.brain.get_relations_for(s_ent.id)?;
+                        let o_rels = self.brain.get_relations_for(o_ent.id)?;
                         if s_ent.entity_type == o_ent.entity_type {
-                            let s_rels = self.brain.get_relations_for(s_ent.id)?;
-                            let o_rels = self.brain.get_relations_for(o_ent.id)?;
                             if s_rels.len() >= 3 && o_rels.len() >= 3 {
                                 evidence_score += 0.05;
+                            }
+                        }
+
+                        // Signal 4: Mutual neighbors (shared connections)
+                        let s_neighbors: HashSet<i64> = s_rels
+                            .iter()
+                            .flat_map(|r| {
+                                let s_id = self
+                                    .brain
+                                    .get_entity_by_name(&r.0)
+                                    .ok()
+                                    .flatten()
+                                    .map(|e| e.id)
+                                    .unwrap_or(-1);
+                                let o_id = self
+                                    .brain
+                                    .get_entity_by_name(&r.2)
+                                    .ok()
+                                    .flatten()
+                                    .map(|e| e.id)
+                                    .unwrap_or(-1);
+                                vec![s_id, o_id]
+                            })
+                            .filter(|&id| id != s_ent.id && id >= 0)
+                            .collect();
+                        let o_neighbors: HashSet<i64> = o_rels
+                            .iter()
+                            .flat_map(|r| {
+                                let s_id = self
+                                    .brain
+                                    .get_entity_by_name(&r.0)
+                                    .ok()
+                                    .flatten()
+                                    .map(|e| e.id)
+                                    .unwrap_or(-1);
+                                let o_id = self
+                                    .brain
+                                    .get_entity_by_name(&r.2)
+                                    .ok()
+                                    .flatten()
+                                    .map(|e| e.id)
+                                    .unwrap_or(-1);
+                                vec![s_id, o_id]
+                            })
+                            .filter(|&id| id != o_ent.id && id >= 0)
+                            .collect();
+                        let mutual_neighbors = s_neighbors.intersection(&o_neighbors).count();
+                        if mutual_neighbors >= 2 {
+                            evidence_score += 0.05 * (mutual_neighbors as f64).min(4.0);
+                        }
+
+                        // Signal 5: Temporal co-discovery special case — if both
+                        // entities are still isolated (degree 0-1), resolve based on
+                        // shared sources or age.  These hypotheses can't get path
+                        // confirmation because both endpoints lack connections.
+                        if h.pattern_source == "temporal_co_discovery"
+                            || h.pattern_source == "source_co_occurrence"
+                        {
+                            if shared_sources >= 1 {
+                                // Co-crawled entities sharing a source — strong signal
+                                evidence_score += 0.15;
+                            } else if s_rels.is_empty() && o_rels.is_empty() {
+                                // Both still isolated with no shared source after being
+                                // hypothesis'd — weak signal, but not contradicted.
+                                // Confirm at reduced threshold if entity types are compatible.
+                                if types_compatible(&s_ent.entity_type, &o_ent.entity_type)
+                                    && h.confidence >= 0.4
+                                {
+                                    evidence_score += 0.10;
+                                }
                             }
                         }
 
@@ -5324,9 +5394,12 @@ impl<'a> Prometheus<'a> {
                     Some(s_ent) => {
                         let rels = self.brain.get_relations_for(s_ent.id)?;
                         // Tuple: (subject_name, predicate, object_name, confidence)
-                        let has_predicate =
-                            rels.iter().any(|r| r.0 == h.subject && r.1 == h.predicate);
-                        if has_predicate {
+                        let has_exact = rels.iter().any(|r| r.0 == h.subject && r.1 == h.predicate);
+                        // Also check for similar predicates (fuzzy match)
+                        let has_similar = rels
+                            .iter()
+                            .any(|r| r.0 == h.subject && predicates_similar(&r.1, &h.predicate));
+                        if has_exact {
                             // Entity acquired the predicted predicate — confirmed!
                             self.update_hypothesis_status(h.id, HypothesisStatus::Confirmed)?;
                             self.record_outcome(&h.pattern_source, true)?;
@@ -5336,9 +5409,37 @@ impl<'a> Prometheus<'a> {
                             ];
                             let _ = self.save_discovery(h.id, &evidence);
                             confirmed += 1;
+                        } else if has_similar && h.confidence >= 0.5 {
+                            // Entity has a semantically similar predicate — close enough
+                            self.update_hypothesis_status(h.id, HypothesisStatus::Confirmed)?;
+                            self.record_outcome(&h.pattern_source, true)?;
+                            let matching_pred = rels
+                                .iter()
+                                .find(|r| {
+                                    r.0 == h.subject && predicates_similar(&r.1, &h.predicate)
+                                })
+                                .map(|r| r.1.clone())
+                                .unwrap_or_default();
+                            let evidence = vec![
+                                format!(
+                                    "{} has similar predicate '{}' (predicted '{}')",
+                                    h.subject, matching_pred, h.predicate
+                                ),
+                                format!("Pattern source: {}", h.pattern_source),
+                            ];
+                            let _ = self.save_discovery(h.id, &evidence);
+                            confirmed += 1;
                         } else if rels.is_empty() {
                             // Entity is completely isolated — reject low-confidence ones
                             if h.confidence < 0.5 {
+                                self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                                self.record_outcome(&h.pattern_source, false)?;
+                                rejected += 1;
+                            }
+                        } else if rels.len() >= 3 && !has_similar {
+                            // Entity is well-connected but hasn't acquired
+                            // any similar predicate — reject if confidence is marginal
+                            if h.confidence < 0.6 {
                                 self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
                                 self.record_outcome(&h.pattern_source, false)?;
                                 rejected += 1;
