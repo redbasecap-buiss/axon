@@ -2618,6 +2618,30 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return true;
     }
 
+    // Reject entities containing math/code symbols (likely formula fragments)
+    if trimmed
+        .chars()
+        .any(|c| "Σ→←≈≤≥∈∀∃∫∂∇∆∞±÷×∝∑∏√∩∪⊂⊃⊆⊇∧∨¬⟨⟩{}[]|\\".contains(c))
+    {
+        return false;
+    }
+
+    // Reject citation-like patterns (e.g. "I:361 Robert Millikan", "Tacitus Annales IV.5")
+    if trimmed.contains(':') && trimmed.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    // Reject Cyrillic-only entries (Wikipedia cross-language artifacts)
+    if trimmed
+        .chars()
+        .all(|c| !c.is_ascii_alphabetic() || c.is_whitespace())
+        && trimmed
+            .chars()
+            .any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
+    {
+        return false;
+    }
+
     // Blacklist check (case-insensitive)
     let lower = trimmed.to_lowercase();
     if ENTITY_BLACKLIST.contains(&lower.as_str()) {
@@ -4155,7 +4179,13 @@ fn classify_entity_type(name: &str) -> &'static str {
                     || NOT_PERSON_WORDS.contains(&clean)
             });
             if !has_noun_suffix && !has_indicator && !has_common_word {
-                return "person";
+                // Reject if any word contains digits (e.g. "XE6", "S15", "Pile-1")
+                let has_code = name
+                    .split_whitespace()
+                    .any(|w| w.chars().any(|c| c.is_ascii_digit()));
+                if !has_code {
+                    return "person";
+                }
             }
         }
     }

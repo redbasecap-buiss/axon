@@ -2423,7 +2423,11 @@ impl<'a> Prometheus<'a> {
                 self.brain.get_entity_by_name(&h.object)?,
             ) {
                 let incompatible = matches!(
-                    (s_ent.entity_type.as_str(), o_ent.entity_type.as_str(), h.predicate.as_str()),
+                    (
+                        s_ent.entity_type.as_str(),
+                        o_ent.entity_type.as_str(),
+                        h.predicate.as_str()
+                    ),
                     ("person", "place", "contemporary_of")
                         | ("place", "person", "contemporary_of")
                         | ("concept", "person", "located_near")
