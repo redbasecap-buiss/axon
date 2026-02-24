@@ -2616,6 +2616,14 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "afterword",
     "afficionado",
     "additionally",
+    "invented",
+    "condensate",
+    "waterfall",
+    "diciembre",
+    "marseillois",
+    "bonapartist",
+    "bektashi",
+    "tecnología",
     "rainbow",
     "insight",
     "profile",
@@ -3142,10 +3150,22 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
                 "connected",
                 "coupled",
                 "resolved",
+                "born",
+                "made",
+                "led",
+                "dominated",
+                "speaking",
+                "style",
+                "type",
+                "case",
             ];
             if adjective_suffixes.iter().any(|s| last == s) {
                 return false;
             }
+        }
+        // Reject X-to-Y patterns (e.g. "Source-to-source", "Sun-to-Earth")
+        if parts.len() == 3 && parts[1] == "to" {
+            return false;
         }
         // Also reject "Nationality-Nationality" patterns (e.g. "Chinese-Soviet", "Sino-American")
         if let Some(first) = parts.first() {
