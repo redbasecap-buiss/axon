@@ -506,6 +506,20 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "independently",
     "occasionally",
     "ultimately",
+    // Added 2026-02-25: generic words and concatenation patterns from DB cleanup
+    "difficulties",
+    "eleventh",
+    "end-user",
+    "forgotten",
+    "fresh-water",
+    "respect",
+    "society",
+    "year time",
+    "sea-bottom",
+    "nachbarn",
+    "raumentwicklung",
+    "memoria",
+    "further",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -2839,6 +2853,23 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     // Reject citation-like patterns (e.g. "I:361 Robert Millikan", "Tacitus Annales IV.5")
     if trimmed.contains(':') && trimmed.chars().any(|c| c.is_ascii_digit()) {
         return false;
+    }
+
+    // Reject slash-separated compound entities (e.g. "Karatsuba/Voronin", "Ocean/sea")
+    // but allow known patterns like "AdS/CFT", "TCP/IP"
+    if trimmed.contains('/') {
+        let parts: Vec<&str> = trimmed.split('/').collect();
+        if parts.len() == 2 && parts.iter().all(|p| p.len() > 3) {
+            return false;
+        }
+    }
+
+    // Reject entities with 6+ words — almost always concatenation artifacts
+    {
+        let word_count = trimmed.split_whitespace().count();
+        if word_count >= 6 {
+            return false;
+        }
     }
 
     // Reject Cyrillic-only entries (Wikipedia cross-language artifacts)

@@ -338,6 +338,57 @@ fn bfs_path(
     Ok(None)
 }
 
+/// Bounded BFS: find shortest path up to `max_hops`. Returns None if no path
+/// exists within the hop limit. Much faster than full BFS for validation checks.
+pub fn shortest_path_bounded(
+    brain: &Brain,
+    from: &str,
+    to: &str,
+    max_hops: usize,
+) -> Result<Option<Vec<i64>>, rusqlite::Error> {
+    let from_entity = brain.get_entity_by_name(from)?;
+    let to_entity = brain.get_entity_by_name(to)?;
+    let (from_id, to_id) = match (from_entity, to_entity) {
+        (Some(f), Some(t)) => (f.id, t.id),
+        _ => return Ok(None),
+    };
+    if from_id == to_id {
+        return Ok(Some(vec![from_id]));
+    }
+    let adj = build_adjacency(brain)?;
+    // BFS with depth tracking
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    let mut parent: HashMap<i64, i64> = HashMap::new();
+    visited.insert(from_id);
+    queue.push_back((from_id, 0usize));
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= max_hops {
+            continue;
+        }
+        if let Some(neighbors) = adj.get(&current) {
+            for &next in neighbors {
+                if !visited.contains(&next) {
+                    visited.insert(next);
+                    parent.insert(next, current);
+                    if next == to_id {
+                        let mut path = vec![to_id];
+                        let mut cur = to_id;
+                        while let Some(&p) = parent.get(&cur) {
+                            path.push(p);
+                            cur = p;
+                        }
+                        path.reverse();
+                        return Ok(Some(path));
+                    }
+                    queue.push_back((next, depth + 1));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Betweenness centrality — approximate via sampled BFS from up to `sample` nodes.
 pub fn betweenness_centrality(
     brain: &Brain,

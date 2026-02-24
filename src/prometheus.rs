@@ -266,6 +266,27 @@ fn is_generic_predicate(p: &str) -> bool {
     GENERIC_PREDICATES.contains(&p)
 }
 
+/// Check if two entity types are compatible for hypothesis generation
+/// (e.g., person↔person, concept↔technology, organization↔company).
+fn types_compatible(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let compatible_pairs: &[(&str, &str)] = &[
+        ("concept", "technology"),
+        ("organization", "company"),
+        ("person", "organization"),
+        ("person", "company"),
+        ("place", "organization"),
+        ("concept", "event"),
+        ("technology", "product"),
+        ("organization", "product"),
+    ];
+    compatible_pairs
+        .iter()
+        .any(|(x, y)| (a == *x && b == *y) || (a == *y && b == *x))
+}
+
 /// Infer a more specific predicate for a hypothesized relation based on entity types
 /// and optional shared-neighbor context. Returns a predicate string.
 /// `shared_neighbor_types` is a map from entity_type → count of shared neighbors of that type.
@@ -913,7 +934,330 @@ fn is_noise_name(name: &str) -> bool {
     if word_count == 1 && title_only.contains(&lower_trimmed) {
         return true;
     }
+    // Concatenated entity detection: names that look like 2+ entities mashed together.
+    // Pattern: "Einstein Boris Podolsky", "Bohr Bush", "Baltimore Maryland Archimedes"
+    // Heuristic: 3+ words where a middle word is a common first name suggests concatenation.
+    if word_count >= 3 {
+        let words: Vec<&str> = lower_trimmed.split_whitespace().collect();
+        // Check if any non-first, non-last word is a common first name (suggests entity boundary)
+        let first_names = [
+            "albert",
+            "isaac",
+            "niels",
+            "werner",
+            "max",
+            "erwin",
+            "paul",
+            "carl",
+            "karl",
+            "ernst",
+            "ludwig",
+            "fritz",
+            "otto",
+            "hans",
+            "kurt",
+            "richard",
+            "robert",
+            "james",
+            "john",
+            "william",
+            "charles",
+            "george",
+            "edward",
+            "henry",
+            "thomas",
+            "david",
+            "michael",
+            "joseph",
+            "alexander",
+            "leonhard",
+            "bernhard",
+            "hermann",
+            "heinrich",
+            "johann",
+            "gottfried",
+            "wilhelm",
+            "friedrich",
+            "georg",
+            "peter",
+            "martin",
+            "franz",
+            "boris",
+            "nikolai",
+            "sergei",
+            "andrei",
+            "vladimir",
+            "ivan",
+            "dmitri",
+            "alan",
+            "arthur",
+            "francis",
+            "stephen",
+            "felix",
+            "emmy",
+            "marie",
+            "ada",
+            "sophia",
+            "anna",
+            "margaret",
+            "mary",
+            "elizabeth",
+            "benjamin",
+            "daniel",
+            "donald",
+            "jacques",
+            "pierre",
+            "jean",
+            "louis",
+            "antoine",
+            "nicolas",
+            "henri",
+            "rené",
+            "giuseppe",
+            "giovanni",
+            "antonio",
+            "marco",
+            "andreas",
+            "rafael",
+            "enrico",
+            "lise",
+            "emile",
+            "auguste",
+        ];
+        let boundary_hits = words[1..words.len() - 1]
+            .iter()
+            .filter(|w| first_names.contains(w))
+            .count();
+        if boundary_hits >= 1 {
+            return true;
+        }
+    }
+    // Two-word names where both words are known famous surnames (concatenation like "Bohr Bush", "Newton Gauss")
+    if word_count == 2 {
+        let words: Vec<&str> = lower_trimmed.split_whitespace().collect();
+        let famous_surnames = [
+            "einstein",
+            "newton",
+            "bohr",
+            "heisenberg",
+            "euler",
+            "gauss",
+            "hilbert",
+            "riemann",
+            "lagrange",
+            "laplace",
+            "fermat",
+            "pascal",
+            "leibniz",
+            "kepler",
+            "copernicus",
+            "galileo",
+            "darwin",
+            "maxwell",
+            "faraday",
+            "planck",
+            "dirac",
+            "schrödinger",
+            "pauli",
+            "feynman",
+            "hawking",
+            "curie",
+            "lovelace",
+            "turing",
+            "archimedes",
+            "euclid",
+            "ptolemy",
+            "pythagoras",
+            "bush",
+            "poldolsky",
+            "podolsky",
+            "rosen",
+            "bell",
+            "born",
+            "fermi",
+            "oppenheimer",
+            "rutherford",
+            "tesla",
+            "edison",
+            "marconi",
+            "hertz",
+            "boltzmann",
+            "carnot",
+            "kelvin",
+            "joule",
+            "ampere",
+            "volta",
+            "ohm",
+            "coulomb",
+            "fresnel",
+            "huygens",
+            "hooke",
+            "watt",
+            "bernoulli",
+            "fourier",
+            "cauchy",
+            "abel",
+            "galois",
+            "cantor",
+            "dedekind",
+            "weierstrass",
+            "poincare",
+            "noether",
+            "ramanujan",
+            "hardy",
+            "littlewood",
+            "gödel",
+            "church",
+            "von neumann",
+        ];
+        if famous_surnames.contains(&words[0]) && famous_surnames.contains(&words[1]) {
+            return true;
+        }
+    }
+    // Concatenated place+person or person+place: 4+ words where multiple known places appear
+    // alongside other entity types (e.g. "Dhar Nema Mauritania", "Pacific Ocean Commerce")
+    if word_count >= 4 {
+        let words: Vec<&str> = lower_trimmed.split_whitespace().collect();
+        let known_places = [
+            "maryland",
+            "baltimore",
+            "california",
+            "virginia",
+            "carolina",
+            "massachusetts",
+            "pennsylvania",
+            "connecticut",
+            "washington",
+            "florida",
+            "georgia",
+            "oregon",
+            "mauritania",
+            "patagonia",
+            "rawson",
+            "gulf",
+            "ocean",
+            "pacific",
+            "atlantic",
+            "commerce",
+            "tutorials",
+            "monastery",
+        ];
+        let place_hits = words.iter().filter(|w| known_places.contains(w)).count();
+        let non_place = word_count - place_hits;
+        // If we have places mixed with other words in a 4+ word name, it's concatenation
+        if place_hits >= 1 && non_place >= 2 && !lower_trimmed.contains("university") {
+            // But allow genuine multi-word place names — only flag if there's a person-like word too
+            let has_person_word = words.iter().any(|w| first_names_extended().contains(w));
+            if has_person_word {
+                return true;
+            }
+        }
+    }
     false
+}
+
+/// Extended first names list for concatenation detection (called rarely, not perf-critical).
+fn first_names_extended() -> HashSet<&'static str> {
+    [
+        "albert",
+        "isaac",
+        "niels",
+        "werner",
+        "max",
+        "erwin",
+        "paul",
+        "carl",
+        "karl",
+        "ernst",
+        "ludwig",
+        "fritz",
+        "otto",
+        "hans",
+        "kurt",
+        "richard",
+        "robert",
+        "james",
+        "john",
+        "william",
+        "charles",
+        "george",
+        "edward",
+        "henry",
+        "thomas",
+        "david",
+        "michael",
+        "joseph",
+        "alexander",
+        "leonhard",
+        "bernhard",
+        "hermann",
+        "heinrich",
+        "johann",
+        "gottfried",
+        "wilhelm",
+        "friedrich",
+        "georg",
+        "peter",
+        "martin",
+        "franz",
+        "boris",
+        "nikolai",
+        "sergei",
+        "andrei",
+        "vladimir",
+        "ivan",
+        "dmitri",
+        "alan",
+        "arthur",
+        "francis",
+        "stephen",
+        "felix",
+        "emmy",
+        "marie",
+        "ada",
+        "sophia",
+        "anna",
+        "margaret",
+        "mary",
+        "elizabeth",
+        "benjamin",
+        "daniel",
+        "donald",
+        "jacques",
+        "pierre",
+        "jean",
+        "louis",
+        "antoine",
+        "nicolas",
+        "henri",
+        "rené",
+        "giuseppe",
+        "giovanni",
+        "antonio",
+        "marco",
+        "andreas",
+        "rafael",
+        "enrico",
+        "lise",
+        "emile",
+        "auguste",
+        "diodorus",
+        "archimedes",
+        "euclid",
+        "ptolemy",
+        "heisenberg",
+        "einstein",
+        "bohr",
+        "newton",
+        "euler",
+        "gauss",
+        "hilbert",
+        "riemann",
+        "lagrange",
+        "laplace",
+    ]
+    .into_iter()
+    .collect()
 }
 
 /// Filter entity IDs to only meaningful ones (non-noise type, reasonable name, quality).
@@ -2576,6 +2920,27 @@ impl<'a> Prometheus<'a> {
             h.confidence = (h.confidence - 0.3).max(0.0);
         }
 
+        // Path-distance evidence: if a short path (2-3 hops) exists between
+        // subject and object, that's independent structural evidence of relatedness.
+        // Uses bounded BFS (max 3 hops) for efficiency — avoids full graph traversal.
+        if h.object != "?" && !direct_evidence {
+            if let Ok(Some(path)) =
+                crate::graph::shortest_path_bounded(self.brain, &h.subject, &h.object, 3)
+            {
+                let hops = path.len().saturating_sub(1);
+                if hops == 2 {
+                    h.evidence_for
+                        .push("Connected via 2-hop path through graph".to_string());
+                    h.confidence = (h.confidence + 0.10).min(1.0);
+                } else if hops == 3 {
+                    h.evidence_for
+                        .push("Connected via 3-hop path through graph".to_string());
+                    h.confidence = (h.confidence + 0.05).min(1.0);
+                }
+                // 1-hop means already directly connected — handled by direct evidence above
+            }
+        }
+
         // Type compatibility check: penalize hypotheses linking incompatible entity types
         if h.object != "?" {
             if let (Some(s_ent), Some(o_ent)) = (
@@ -3395,6 +3760,18 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(katz_hyps);
         }
 
+        // 2s. Temporal co-discovery: isolated entities first-seen in the same
+        //     time window likely originate from the same topic/article
+        let tcd_weight = self.get_pattern_weight("temporal_co_discovery")?;
+        if tcd_weight >= 0.05 {
+            let tcd_hyps = self.generate_hypotheses_from_temporal_co_discovery()?;
+            eprintln!(
+                "[PROMETHEUS] temporal_co_discovery: {} hypotheses",
+                tcd_hyps.len()
+            );
+            all_hypotheses.extend(tcd_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -3606,6 +3983,15 @@ impl<'a> Prometheus<'a> {
 
         // Clean up fragment hypotheses (single-word subject+object = NLP noise, not discoveries)
         let fragment_cleaned = self.cleanup_fragment_hypotheses().unwrap_or(0);
+
+        // Reject hypotheses involving concatenated entity names
+        let concat_hyp_rejected = self.cleanup_concatenated_hypotheses().unwrap_or(0);
+        if concat_hyp_rejected > 0 {
+            eprintln!(
+                "[PROMETHEUS] Rejected {} hypotheses with concatenated entity names",
+                concat_hyp_rejected
+            );
+        }
 
         // Fuzzy duplicate detection + auto-merge high-confidence dupes
         let fuzzy_dupes = self.find_fuzzy_duplicates().unwrap_or_default();
@@ -3829,7 +4215,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
              {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} contemporary_of refined, {} hypotheses promoted, \
-             {} fragment hypotheses cleaned, \
+             {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
              motifs: {}△ {}ff {}ch {}↔{}",
             all_patterns.len(),
@@ -3908,6 +4294,7 @@ impl<'a> Prometheus<'a> {
             contemporary_refined,
             promoted,
             fragment_cleaned,
+            concat_hyp_rejected,
             pair_deduped,
             hyp_capped,
             max_k,
@@ -5583,6 +5970,12 @@ impl<'a> Prometheus<'a> {
             // For entities matching noise name patterns, purge up to degree 3
             // (many noise entities accumulate relations through automated discovery)
             let noise_threshold = if is_noise_name(&e.name) { 3 } else { 1 };
+            if e.name.contains("Podolsky") || e.name.contains("Bohr Bush") {
+                eprintln!(
+                    "[PURGE-DEBUG] '{}': deg={}, is_noise={}, is_noise_name={}, noise_threshold={}, is_low_value={}, is_citation={}",
+                    e.name, deg, is_noise, is_noise_name(&e.name), noise_threshold, is_low_value, is_citation_fragment
+                );
+            }
             if (deg <= noise_threshold && is_noise) || is_low_value || is_citation_fragment {
                 self.brain.with_conn(|conn| {
                     conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
@@ -7714,6 +8107,21 @@ impl<'a> Prometheus<'a> {
         Ok(count)
     }
 
+    /// Reject hypotheses where subject or object is a concatenated entity name (NLP noise).
+    /// Returns count of hypotheses rejected.
+    pub fn cleanup_concatenated_hypotheses(&self) -> Result<usize> {
+        let hyps = self.list_hypotheses(Some(HypothesisStatus::Testing))?;
+        let confirmed = self.list_hypotheses(Some(HypothesisStatus::Confirmed))?;
+        let mut rejected = 0usize;
+        for h in hyps.iter().chain(confirmed.iter()) {
+            if is_noise_name(&h.subject) || (h.object != "?" && is_noise_name(&h.object)) {
+                self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                rejected += 1;
+            }
+        }
+        Ok(rejected)
+    }
+
     pub fn bulk_reject_stale_testing(&self, max_days: i64, max_confidence: f64) -> Result<usize> {
         let cutoff = (Utc::now() - chrono::Duration::days(max_days))
             .naive_utc()
@@ -9759,6 +10167,124 @@ impl<'a> Prometheus<'a> {
             }
         }
         hypotheses.truncate(30);
+        Ok(hypotheses)
+    }
+
+    /// Generate hypotheses from temporal co-discovery: isolated entities that
+    /// were first_seen in the same narrow time window (≤2 hours) likely came
+    /// from the same article/topic and should be connected.
+    pub fn generate_hypotheses_from_temporal_co_discovery(&self) -> Result<Vec<Hypothesis>> {
+        let entities = self.brain.all_entities()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let relations = self.brain.all_relations()?;
+
+        // Build connected set
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Collect high-value isolated entities with timestamps
+        let mut isolated: Vec<&crate::db::Entity> = entities
+            .iter()
+            .filter(|e| {
+                !connected.contains(&e.id)
+                    && meaningful.contains(&e.id)
+                    && !is_noise_name(&e.name)
+                    && !is_noise_type(&e.entity_type)
+                    && HIGH_VALUE_TYPES.contains(&e.entity_type.as_str())
+            })
+            .collect();
+
+        if isolated.len() < 2 {
+            return Ok(vec![]);
+        }
+
+        // Sort by first_seen for efficient window scanning
+        isolated.sort_by_key(|e| e.first_seen);
+
+        let mut hypotheses = Vec::new();
+        let mut seen: HashSet<(i64, i64)> = HashSet::new();
+        let window = chrono::Duration::hours(2);
+
+        // Sliding window: O(n) scan for entities within 2h of each other
+        let mut start = 0;
+        for end in 0..isolated.len() {
+            // Advance start past the window
+            while start < end && (isolated[end].first_seen - isolated[start].first_seen) > window {
+                start += 1;
+            }
+            // Pair isolated[end] with all in [start..end)
+            for j in start..end {
+                if hypotheses.len() >= 40 {
+                    break;
+                }
+                let a = isolated[j];
+                let b = isolated[end];
+                let pair = if a.id < b.id {
+                    (a.id, b.id)
+                } else {
+                    (b.id, a.id)
+                };
+                if !seen.insert(pair) {
+                    continue;
+                }
+                // Same-name skip
+                if a.name.to_lowercase() == b.name.to_lowercase() {
+                    continue;
+                }
+                // Must be same or compatible types
+                if a.entity_type != b.entity_type
+                    && !types_compatible(&a.entity_type, &b.entity_type)
+                {
+                    continue;
+                }
+                let delta_min = (b.first_seen - a.first_seen).num_minutes().unsigned_abs();
+                let predicate = infer_predicate(&a.entity_type, &b.entity_type, None);
+                let base_conf = if delta_min <= 10 {
+                    0.55
+                } else if delta_min <= 60 {
+                    0.45
+                } else {
+                    0.35
+                };
+                let confidence = self
+                    .calibrated_confidence("temporal_co_discovery", base_conf)
+                    .unwrap_or(base_conf);
+
+                hypotheses.push(Hypothesis {
+                    id: 0,
+                    subject: a.name.clone(),
+                    predicate: predicate.to_string(),
+                    object: b.name.clone(),
+                    confidence,
+                    evidence_for: vec![format!(
+                        "Both isolated, discovered within {} minutes of each other",
+                        delta_min
+                    )],
+                    evidence_against: vec![],
+                    reasoning_chain: vec![
+                        format!(
+                            "{} ({}) and {} ({}) are both isolated entities",
+                            a.name, a.entity_type, b.name, b.entity_type
+                        ),
+                        format!(
+                            "First seen {} min apart — likely from same crawl topic",
+                            delta_min
+                        ),
+                    ],
+                    status: HypothesisStatus::Proposed,
+                    discovered_at: now_str(),
+                    pattern_source: "temporal_co_discovery".to_string(),
+                });
+            }
+            if hypotheses.len() >= 40 {
+                break;
+            }
+        }
+
+        hypotheses.truncate(40);
         Ok(hypotheses)
     }
 
