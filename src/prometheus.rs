@@ -3928,6 +3928,17 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(katz_hyps);
         }
 
+        // 2s2. Concept enrichment (sparse concepts → related entities)
+        let ce_weight = self.get_pattern_weight("concept_enrichment")?;
+        if ce_weight >= 0.05 {
+            let ce_hyps = self.generate_hypotheses_from_concept_enrichment()?;
+            eprintln!(
+                "[PROMETHEUS] concept_enrichment: {} hypotheses",
+                ce_hyps.len()
+            );
+            all_hypotheses.extend(ce_hyps);
+        }
+
         // 2s. Temporal co-discovery: isolated entities first-seen in the same
         //     time window likely originate from the same topic/article
         let tcd_weight = self.get_pattern_weight("temporal_co_discovery")?;
@@ -10856,6 +10867,163 @@ impl<'a> Prometheus<'a> {
             }
         }
         hypotheses.truncate(30);
+        Ok(hypotheses)
+    }
+
+    /// Generate hypotheses to enrich sparse concept entities.
+    /// Concepts average <0.5 relations — find the most likely connections
+    /// by matching concept names against entity names and fact values.
+    /// Strategy: for each sparse concept (≤1 relation), find entities whose
+    /// name contains the concept name or who share a source URL.
+    pub fn generate_hypotheses_from_concept_enrichment(&self) -> Result<Vec<Hypothesis>> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        // Count relations per entity
+        let mut rel_count: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *rel_count.entry(r.subject_id).or_insert(0) += 1;
+            *rel_count.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Find sparse concepts
+        let sparse_concepts: Vec<&crate::db::Entity> = entities
+            .iter()
+            .filter(|e| {
+                e.entity_type == "concept"
+                    && meaningful.contains(&e.id)
+                    && !is_noise_name(&e.name)
+                    && e.name.len() >= 4
+                    && rel_count.get(&e.id).copied().unwrap_or(0) <= 1
+            })
+            .take(300)
+            .collect();
+
+        if sparse_concepts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build source_url → entity_id index from facts
+        let mut source_index: HashMap<String, Vec<i64>> = HashMap::new();
+        for r in &relations {
+            if !r.source_url.is_empty() {
+                source_index
+                    .entry(r.source_url.clone())
+                    .or_default()
+                    .push(r.subject_id);
+                source_index
+                    .entry(r.source_url.clone())
+                    .or_default()
+                    .push(r.object_id);
+            }
+        }
+
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+
+        // Non-concept entities with ≥2 relations (good connection targets)
+        let connected_entities: Vec<&crate::db::Entity> = entities
+            .iter()
+            .filter(|e| {
+                e.entity_type != "concept"
+                    && meaningful.contains(&e.id)
+                    && rel_count.get(&e.id).copied().unwrap_or(0) >= 2
+                    && !is_noise_name(&e.name)
+            })
+            .collect();
+
+        let mut hypotheses = Vec::new();
+        let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+
+        for concept in &sparse_concepts {
+            if hypotheses.len() >= 50 {
+                break;
+            }
+            let concept_lower = concept.name.to_lowercase();
+            let concept_words: Vec<&str> = concept_lower.split_whitespace().collect();
+
+            // Strategy 1: Find non-concept entities whose name contains this concept
+            for target in &connected_entities {
+                if hypotheses.len() >= 50 {
+                    break;
+                }
+                let target_lower = target.name.to_lowercase();
+                // Concept must be a meaningful substring (not just "a" in "Argentina")
+                if concept_words.len() >= 2 && target_lower.contains(&concept_lower) {
+                    let pair = (concept.name.clone(), target.name.clone());
+                    if seen_pairs.insert(pair) {
+                        hypotheses.push(Hypothesis {
+                            id: 0,
+                            subject: concept.name.clone(),
+                            predicate: "related_concept".into(),
+                            object: target.name.clone(),
+                            confidence: 0.55,
+                            evidence_for: vec![format!(
+                                "concept '{}' appears in entity name '{}'",
+                                concept.name, target.name
+                            )],
+                            evidence_against: vec![],
+                            reasoning_chain: vec![format!(
+                                "Name containment: '{}' is a concept that appears within '{}'",
+                                concept.name, target.name
+                            )],
+                            status: HypothesisStatus::Testing,
+                            discovered_at: now_str(),
+                            pattern_source: "concept_enrichment".into(),
+                        });
+                    }
+                }
+            }
+
+            // Strategy 2: Concept shares a source URL with connected entities
+            let concept_rels: Vec<_> = relations
+                .iter()
+                .filter(|r| r.subject_id == concept.id || r.object_id == concept.id)
+                .collect();
+            for cr in &concept_rels {
+                if !cr.source_url.is_empty() {
+                    if let Some(co_entities) = source_index.get(&cr.source_url) {
+                        for &eid in co_entities {
+                            if eid == concept.id || hypotheses.len() >= 50 {
+                                continue;
+                            }
+                            if rel_count.get(&eid).copied().unwrap_or(0) < 2 {
+                                continue;
+                            }
+                            if let Some(&name) = id_name.get(&eid) {
+                                if is_noise_name(name) {
+                                    continue;
+                                }
+                                let pair = (concept.name.clone(), name.to_string());
+                                if seen_pairs.insert(pair) {
+                                    hypotheses.push(Hypothesis {
+                                        id: 0,
+                                        subject: concept.name.clone(),
+                                        predicate: "related_concept".into(),
+                                        object: name.to_string(),
+                                        confidence: 0.50,
+                                        evidence_for: vec![format!(
+                                            "co-occurs in source: {}",
+                                            cr.source_url
+                                        )],
+                                        evidence_against: vec![],
+                                        reasoning_chain: vec![format!(
+                                            "Source co-occurrence: '{}' and '{}' share source URL",
+                                            concept.name, name
+                                        )],
+                                        status: HypothesisStatus::Testing,
+                                        discovered_at: now_str(),
+                                        pattern_source: "concept_enrichment".into(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(hypotheses)
     }
 

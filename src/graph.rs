@@ -1073,6 +1073,118 @@ pub fn connectivity_resilience(brain: &Brain, remove_top_k: usize) -> Result<f64
     Ok(max_component as f64 / original_largest as f64)
 }
 
+/// Harmonic centrality: works for disconnected graphs (unlike closeness centrality).
+/// HC(v) = (1/(n-1)) * sum_{u≠v} 1/d(v,u), where d(v,u)=∞ gives 0 contribution.
+/// Better than closeness for graphs with high fragmentation (like ours at 89%).
+/// Returns map of entity_id → harmonic centrality score in [0,1].
+pub fn harmonic_centrality(brain: &Brain) -> Result<HashMap<i64, f64>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let n = adj.len();
+    if n <= 1 {
+        return Ok(HashMap::new());
+    }
+    let ids: Vec<i64> = adj.keys().copied().collect();
+    let norm = 1.0 / (n as f64 - 1.0);
+    let mut result = HashMap::with_capacity(n);
+
+    for &source in &ids {
+        // BFS from source
+        let mut dist: HashMap<i64, usize> = HashMap::new();
+        dist.insert(source, 0);
+        let mut queue = VecDeque::new();
+        queue.push_back(source);
+        while let Some(v) = queue.pop_front() {
+            let d = dist[&v];
+            if let Some(neighbors) = adj.get(&v) {
+                for &w in neighbors {
+                    if !dist.contains_key(&w) {
+                        dist.insert(w, d + 1);
+                        queue.push_back(w);
+                    }
+                }
+            }
+        }
+        let hc: f64 = ids
+            .iter()
+            .filter(|&&u| u != source)
+            .map(|u| dist.get(u).map(|&d| 1.0 / d as f64).unwrap_or(0.0))
+            .sum::<f64>()
+            * norm;
+        result.insert(source, hc);
+    }
+    Ok(result)
+}
+
+/// Top-k entities by harmonic centrality (sampled BFS for large graphs).
+/// For graphs with >5000 nodes, samples 500 random source nodes for speed.
+pub fn harmonic_centrality_top_k(
+    brain: &Brain,
+    k: usize,
+) -> Result<Vec<(i64, f64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let n = adj.len();
+    if n <= 1 {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<i64> = adj.keys().copied().collect();
+    let norm = 1.0 / (n as f64 - 1.0);
+
+    // For large graphs, approximate by sampling BFS sources
+    let sample_sources: Vec<i64> = if n > 5000 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut sampled: Vec<i64> = ids.clone();
+        // Deterministic shuffle using hash
+        sampled.sort_by(|a, b| {
+            let mut ha = DefaultHasher::new();
+            a.hash(&mut ha);
+            let mut hb = DefaultHasher::new();
+            b.hash(&mut hb);
+            ha.finish().cmp(&hb.finish())
+        });
+        sampled.truncate(500);
+        sampled
+    } else {
+        ids.clone()
+    };
+
+    // For each target node, accumulate inverse-distance from sampled sources
+    let mut scores: HashMap<i64, f64> = HashMap::with_capacity(n);
+
+    for &source in &sample_sources {
+        let mut dist: HashMap<i64, usize> = HashMap::new();
+        dist.insert(source, 0);
+        let mut queue = VecDeque::new();
+        queue.push_back(source);
+        while let Some(v) = queue.pop_front() {
+            let d = dist[&v];
+            if let Some(neighbors) = adj.get(&v) {
+                for &w in neighbors {
+                    if !dist.contains_key(&w) {
+                        dist.insert(w, d + 1);
+                        queue.push_back(w);
+                    }
+                }
+            }
+        }
+        for (&target, &d) in &dist {
+            if target != source && d > 0 {
+                *scores.entry(target).or_insert(0.0) += 1.0 / d as f64;
+            }
+        }
+    }
+
+    // Normalize
+    let source_norm = norm * (n as f64 / sample_sources.len() as f64);
+    let mut ranked: Vec<(i64, f64)> = scores
+        .into_iter()
+        .map(|(id, s)| (id, s * source_norm))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(k);
+    Ok(ranked)
+}
+
 /// Edge reciprocity: fraction of directed edges that have a reverse edge.
 /// High reciprocity suggests symmetric relationships (knows, related_to).
 /// Low reciprocity suggests hierarchical relationships (part_of, located_in).
