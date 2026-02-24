@@ -3068,6 +3068,38 @@ impl<'a> Prometheus<'a> {
             }
         }
 
+        // Fragmentation-reduction bonus: hypotheses that would connect isolated
+        // entities to the main graph get a confidence boost, incentivizing the
+        // discovery engine to reduce the 89%+ fragmentation rate.
+        if h.object != "?" {
+            if let (Some(s_ent), Some(o_ent)) = (
+                self.brain.get_entity_by_name(&h.subject)?,
+                self.brain.get_entity_by_name(&h.object)?,
+            ) {
+                let s_rels = self.brain.get_relations_for(s_ent.id)?;
+                let o_rels = self.brain.get_relations_for(o_ent.id)?;
+                let s_isolated = s_rels.is_empty();
+                let o_isolated = o_rels.is_empty();
+                if s_isolated && o_isolated {
+                    // Both isolated: connecting them creates a new component but
+                    // reduces island count by 2 — moderate boost
+                    h.evidence_for.push(
+                        "Both entities are isolated — connection reduces fragmentation".to_string(),
+                    );
+                    apply_boost(&mut total_boost, 0.06);
+                    h.confidence = (base_confidence + total_boost).min(1.0);
+                } else if s_isolated || o_isolated {
+                    // One isolated: connecting to a non-isolated entity integrates
+                    // it into the graph — stronger boost (reduces islands by 1)
+                    h.evidence_for.push(
+                        "Connects isolated entity to graph — reduces fragmentation".to_string(),
+                    );
+                    apply_boost(&mut total_boost, 0.10);
+                    h.confidence = (base_confidence + total_boost).min(1.0);
+                }
+            }
+        }
+
         // Update status based on confidence (use defined thresholds)
         let was_confirmed = h.status == HypothesisStatus::Confirmed;
         if h.confidence >= CONFIRMATION_THRESHOLD {
@@ -3432,9 +3464,16 @@ impl<'a> Prometheus<'a> {
     /// (more selective), high-ROI strategies get lower thresholds (more exploratory).
     pub fn adaptive_thresholds(&self) -> Result<HashMap<String, f64>> {
         let roi = self.strategy_roi()?;
+        let confirmation_rates = self.strategy_confirmation_rates(30).unwrap_or_default();
         let mut thresholds = HashMap::new();
         for (strategy, total, _confirmed, _rejected, roi_val, _) in &roi {
-            let threshold = if *total < 10 {
+            // Use confirmation rate to further penalize unreliable strategies
+            let conf_rate = confirmation_rates
+                .get(strategy)
+                .map(|(_, _, r)| *r)
+                .unwrap_or(0.5);
+
+            let base_threshold = if *total < 10 {
                 0.3 // Default: moderate threshold for new strategies
             } else if *roi_val >= 0.3 {
                 0.2 // Low threshold: explore more for high-ROI strategies
@@ -3445,7 +3484,20 @@ impl<'a> Prometheus<'a> {
             } else {
                 0.65 // Very selective: only keep high-confidence hypotheses
             };
-            thresholds.insert(strategy.clone(), threshold);
+
+            // Confirmation-rate adjustment: strategies with <30% confirmation
+            // get an additional threshold increase (requiring higher confidence
+            // to pass). This is a softer alternative to full suspension.
+            let conf_penalty = if conf_rate < 0.15 {
+                0.20 // Very unreliable: strong penalty
+            } else if conf_rate < 0.30 {
+                0.10 // Unreliable: moderate penalty
+            } else {
+                0.0
+            };
+
+            let combined: f64 = base_threshold + conf_penalty;
+            thresholds.insert(strategy.clone(), combined.min(0.85));
         }
         Ok(thresholds)
     }
@@ -3567,6 +3619,60 @@ impl<'a> Prometheus<'a> {
         };
 
         Ok((entropy, dominant, dominant_frac, rec))
+    }
+
+    /// Compute per-strategy confirmation rates from the hypotheses table.
+    /// Returns strategy → (total, confirmed, confirmation_rate).
+    /// Strategies with >= min_samples and confirmation_rate < suspend_threshold
+    /// should be auto-suspended to avoid wasting cycles on low-quality hypotheses.
+    pub fn strategy_confirmation_rates(
+        &self,
+        min_samples: i64,
+    ) -> Result<HashMap<String, (i64, i64, f64)>> {
+        self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT pattern_source, COUNT(*) as total,
+                        SUM(CASE WHEN status='confirmed' THEN 1 ELSE 0 END) as confirmed
+                 FROM hypotheses
+                 GROUP BY pattern_source
+                 HAVING total >= ?1",
+            )?;
+            let rows = stmt.query_map(params![min_samples], |row| {
+                let source: String = row.get(0)?;
+                let total: i64 = row.get(1)?;
+                let confirmed: i64 = row.get(2)?;
+                Ok((source, total, confirmed))
+            })?;
+            let mut map = HashMap::new();
+            for row in rows {
+                let (source, total, confirmed) = row?;
+                let rate = if total > 0 {
+                    confirmed as f64 / total as f64
+                } else {
+                    0.0
+                };
+                map.insert(source, (total, confirmed, rate));
+            }
+            Ok(map)
+        })
+    }
+
+    /// Returns set of strategy names that should be suspended (confirmation rate
+    /// below threshold with sufficient samples). These strategies waste compute.
+    pub fn suspended_strategies(&self) -> Result<HashSet<String>> {
+        let rates = self.strategy_confirmation_rates(50)?;
+        let mut suspended = HashSet::new();
+        for (strategy, (_total, _confirmed, rate)) in &rates {
+            if *rate < 0.20 {
+                suspended.insert(strategy.clone());
+                eprintln!(
+                    "[PROMETHEUS] Auto-suspending strategy '{}' (confirmation rate {:.1}% < 20%)",
+                    strategy,
+                    rate * 100.0
+                );
+            }
+        }
+        Ok(suspended)
     }
 
     /// Get total discovery count (confirmed hypotheses that were recorded).
@@ -3701,6 +3807,15 @@ impl<'a> Prometheus<'a> {
         }
 
         // 2. Gap detection & hypothesis generation (adaptive: skip low-weight strategies)
+        // Auto-suspend strategies with < 20% confirmation rate over 50+ samples
+        let suspended = self.suspended_strategies().unwrap_or_default();
+        if !suspended.is_empty() {
+            eprintln!(
+                "[PROMETHEUS] Suspended {} low-ROI strategies: {:?}",
+                suspended.len(),
+                suspended
+            );
+        }
         eprintln!("[PROMETHEUS] Starting hypothesis generation...");
         let t1 = std::time::Instant::now();
         let hole_weight = self.get_pattern_weight("structural_hole")?;
@@ -3894,8 +4009,9 @@ impl<'a> Prometheus<'a> {
         }
 
         // 2o. Predicate pattern transfer (entities with similar predicate profiles missing a predicate)
+        // Auto-suspended if confirmation rate < 20% over 50+ samples
         let ppt_weight = self.get_pattern_weight("predicate_transfer")?;
-        if ppt_weight >= 0.05 {
+        if ppt_weight >= 0.05 && !suspended.contains("predicate_transfer") {
             let ppt_hyps = self.generate_hypotheses_from_predicate_transfer()?;
             eprintln!(
                 "[PROMETHEUS] predicate_transfer: {} hypotheses",
@@ -3951,7 +4067,7 @@ impl<'a> Prometheus<'a> {
         // 2s. Temporal co-discovery: isolated entities first-seen in the same
         //     time window likely originate from the same topic/article
         let tcd_weight = self.get_pattern_weight("temporal_co_discovery")?;
-        if tcd_weight >= 0.05 {
+        if tcd_weight >= 0.05 && !suspended.contains("temporal_co_discovery") {
             let tcd_hyps = self.generate_hypotheses_from_temporal_co_discovery()?;
             eprintln!(
                 "[PROMETHEUS] temporal_co_discovery: {} hypotheses",
