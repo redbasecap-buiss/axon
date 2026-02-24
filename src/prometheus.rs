@@ -6319,7 +6319,19 @@ impl<'a> Prometheus<'a> {
             .map(|w| (w.pattern_type.clone(), w.weight))
             .collect();
 
+        // Pre-compute suspended strategies (hypothesis-level confirmation rate < 20%)
+        let suspended = self.suspended_strategies().unwrap_or_default();
+
         for h in hyps.iter_mut() {
+            // Batch-reject all testing hypotheses from suspended strategies
+            // (confirmation rate < 20% with 50+ samples — these are proven losers)
+            if suspended.contains(&h.pattern_source) && h.confidence < 0.75 {
+                self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                self.record_outcome(&h.pattern_source, false)?;
+                rejected += 1;
+                continue;
+            }
+
             // Strategy-aware rejection: auto-reject hypotheses from strategies with
             // historically very low confirmation rates (weight < 0.10)
             let source_weight = weight_map.get(&h.pattern_source).copied().unwrap_or(1.0);
@@ -6328,6 +6340,39 @@ impl<'a> Prometheus<'a> {
                 self.record_outcome(&h.pattern_source, false)?;
                 rejected += 1;
                 continue;
+            }
+
+            // Fast-track resolution for katz_similarity: these hypotheses are
+            // path-based and can be validated immediately — if no path ≤3 hops
+            // exists between subject and object, reject early.
+            if h.pattern_source == "katz_similarity" && h.object != "?" {
+                let path = crate::graph::shortest_path(self.brain, &h.subject, &h.object)?;
+                match path {
+                    Some(p) if p.len() <= 3 => {
+                        // Direct or 2-hop path — confirm if confidence is decent
+                        if h.confidence >= 0.55 {
+                            self.update_hypothesis_status(h.id, HypothesisStatus::Confirmed)?;
+                            self.record_outcome(&h.pattern_source, true)?;
+                            confirmed += 1;
+                            continue;
+                        }
+                    }
+                    _ => {
+                        // No short path — reject if stale (>12h)
+                        if let Ok(discovered) = chrono::NaiveDateTime::parse_from_str(
+                            &h.discovered_at,
+                            "%Y-%m-%d %H:%M:%S",
+                        ) {
+                            let now = chrono::Utc::now().naive_utc();
+                            if (now - discovered).num_hours() >= 12 {
+                                self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                                self.record_outcome(&h.pattern_source, false)?;
+                                rejected += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
 
             // Aggressive open-ended rejection: hypotheses with object="?" from
@@ -13447,10 +13492,15 @@ impl<'a> Prometheus<'a> {
                 seen.insert(key);
 
                 let predicate = infer_predicate(etype, other_type, None);
-                let base_conf = 0.40 + 0.10 * (shared_count as f64).min(3.0);
+                let base_conf = 0.45 + 0.10 * (shared_count as f64).min(3.0);
                 let confidence = self
                     .calibrated_confidence("fact_gap", base_conf)
                     .unwrap_or(base_conf);
+                // Skip low-confidence fact_gap hypotheses — historically ~59% confirmation
+                // rate means we should only emit higher-quality candidates
+                if confidence < 0.45 {
+                    continue;
+                }
 
                 hypotheses.push(Hypothesis {
                     id: 0,
