@@ -962,6 +962,24 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "fragment",
     "implosion",
     "longitude",
+    // Added 2026-02-25 (brain cleaner): generic/academic/foreign noise
+    "congressional",
+    "privatdocent",
+    "jahrhunderts",
+    "lebensraum",
+    "decemvirate",
+    "geographica",
+    "negafibonacci",
+    "hackweek",
+    "forbindelserne",
+    "postboten",
+    "resultat",
+    "eliminationstheorie",
+    "unsolvability",
+    "pitchblende",
+    "shadowgraph",
+    "polynomideale",
+    "grenzmauer",
 ];
 
 /// Common person name prefixes/titles for entity classification.

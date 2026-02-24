@@ -3241,6 +3241,35 @@ impl<'a> Prometheus<'a> {
             }
         }
 
+        // Predicate frequency signal: predicates that appear many times in the graph
+        // are well-established patterns — boost hypotheses using them.
+        // Rare predicates (< 3 occurrences) may be extraction noise — penalize slightly.
+        {
+            let pred_count: i64 = self
+                .brain
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM relations WHERE predicate = ?1",
+                        params![h.predicate],
+                        |row| row.get(0),
+                    )
+                })
+                .unwrap_or(0);
+            if pred_count >= 50 {
+                apply_boost(&mut total_boost, 0.05);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            } else if pred_count >= 10 {
+                apply_boost(&mut total_boost, 0.02);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            } else if pred_count < 3 {
+                h.evidence_against.push(format!(
+                    "Rare predicate '{}' (only {} occurrences in graph)",
+                    h.predicate, pred_count
+                ));
+                h.confidence = (h.confidence - 0.04).max(0.0);
+            }
+        }
+
         // Update status based on confidence (use defined thresholds)
         let was_confirmed = h.status == HypothesisStatus::Confirmed;
         if h.confidence >= CONFIRMATION_THRESHOLD {
@@ -4343,6 +4372,16 @@ impl<'a> Prometheus<'a> {
             }
             // Skip hypotheses with very long entity names (likely sentence fragments)
             if h.subject.len() > 60 || h.object.len() > 60 {
+                return false;
+            }
+            // Skip entities that are mostly digits (coordinates, IDs, dates)
+            let digit_ratio = |s: &str| -> f64 {
+                if s.is_empty() {
+                    return 0.0;
+                }
+                s.chars().filter(|c| c.is_ascii_digit()).count() as f64 / s.len() as f64
+            };
+            if digit_ratio(&h.subject) > 0.5 || (h.object != "?" && digit_ratio(&h.object) > 0.5) {
                 return false;
             }
             // Skip substring hypotheses — one name contains the other (merge candidates, not discoveries)
@@ -11303,14 +11342,18 @@ impl<'a> Prometheus<'a> {
                 .map(|v| v.iter().copied().collect())
                 .unwrap_or_default();
             let shared_neighbors = a_nbrs.intersection(&b_nbrs).count();
-            if shared_neighbors == 0 {
+            if shared_neighbors < 2 {
                 continue;
             }
             let a_type = id_type.get(a).copied().unwrap_or("unknown");
             let b_type = id_type.get(b).copied().unwrap_or("unknown");
+            // Skip type-incompatible pairs (e.g., person↔concept via generic predicate)
+            if !types_compatible(a_type, b_type) {
+                continue;
+            }
             let predicate = infer_predicate(a_type, b_type, None);
 
-            // Boost confidence by shared neighbor count
+            // Boost confidence by shared neighbor count (starts at 2 now)
             let neighbor_boost = (shared_neighbors as f64 * 0.03).min(0.15);
             let base_conf = (0.35 + (sim.ln().max(-5.0) + 5.0) * 0.08 + neighbor_boost).min(0.75);
             let confidence = self
