@@ -4937,6 +4937,9 @@ impl<'a> Prometheus<'a> {
         // Surname-only island reconnection (broader reach than high-value reconnect)
         let surname_reconnected = self.reconnect_islands_by_surname_match().unwrap_or(0);
 
+        // Source-URL name matching (connect islands whose names appear in relation source URLs)
+        let source_url_reconnected = self.reconnect_islands_by_source_url_match().unwrap_or(0);
+
         // Purge single-word participle/adjective concepts (NLP noise like "Entangled", "Interacting")
         // Runs AFTER reconnection strategies to catch noise that was re-connected
         let participle_purged = self.purge_participle_concept_entities().unwrap_or(0);
@@ -5088,7 +5091,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} geo-person-reclassified, {} place-region-reclassified, {} compound-concept-reclassified, {} ancient-islands-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} geo-person-reclassified, {} place-region-reclassified, {} compound-concept-reclassified, {} ancient-islands-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} source-url-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -5188,6 +5191,7 @@ impl<'a> Prometheus<'a> {
             foreign_purged,
             hv_island_reconnected,
             surname_reconnected,
+            source_url_reconnected,
             known_boosted,
             predicates_refined,
             contextual_refined,
@@ -19809,6 +19813,104 @@ impl<'a> Prometheus<'a> {
         if reconnected > 0 {
             eprintln!(
                 "  [surname-island-reconnect] reconnected {} person islands via surname matching",
+                reconnected
+            );
+        }
+        Ok(reconnected)
+    }
+
+    /// Reconnect isolated entities by matching their names against source URLs
+    /// in existing relations. If "Stephen Hawking" is isolated and a relation has
+    /// source_url containing "Stephen_Hawking" or "stephen-hawking", connect them.
+    pub fn reconnect_islands_by_source_url_match(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        // Build source_url → set of connected entity IDs
+        let mut url_entities: HashMap<String, HashSet<i64>> = HashMap::new();
+        for r in &relations {
+            if !r.source_url.is_empty() {
+                let entry = url_entities.entry(r.source_url.clone()).or_default();
+                entry.insert(r.subject_id);
+                entry.insert(r.object_id);
+            }
+        }
+
+        let id_to_entity: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+
+        let mut reconnected = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) || is_noise_type(&e.entity_type) || is_noise_name(&e.name)
+            {
+                continue;
+            }
+            if e.name.len() < 5 || !e.name.contains(' ') {
+                continue; // Skip single-word entities (too many false matches)
+            }
+
+            // Generate URL-friendly variants of the entity name
+            let underscore = e.name.replace(' ', "_");
+            let hyphen = e.name.to_lowercase().replace(' ', "-");
+            let lower_underscore = e.name.to_lowercase().replace(' ', "_");
+
+            // Search for matching source URLs
+            let mut best_hub: Option<(i64, usize)> = None; // (entity_id, degree)
+            for (url, eids) in &url_entities {
+                if url.contains(&underscore)
+                    || url.contains(&hyphen)
+                    || url.contains(&lower_underscore)
+                {
+                    // Find highest-degree connected entity from this URL
+                    for &eid in eids {
+                        if eid == e.id {
+                            continue;
+                        }
+                        let deg = relations
+                            .iter()
+                            .filter(|r| r.subject_id == eid || r.object_id == eid)
+                            .count();
+                        if best_hub.map_or(true, |(_, d)| deg > d) {
+                            best_hub = Some((eid, deg));
+                        }
+                    }
+                }
+            }
+
+            if let Some((hub_id, _)) = best_hub {
+                let hub = match id_to_entity.get(&hub_id) {
+                    Some(h) => h,
+                    None => continue,
+                };
+                let pred = match (e.entity_type.as_str(), hub.entity_type.as_str()) {
+                    ("person", "person") => "contemporary_of",
+                    ("person", "place") | ("place", "person") => "active_in",
+                    ("person", "organization") | ("organization", "person") => "affiliated_with",
+                    ("person", "concept") | ("concept", "person") => "related_to",
+                    ("place", "place") => "located_near",
+                    _ => "related_to",
+                };
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO relations (subject_id, predicate, object_id, confidence, source_url, learned_at)
+                         VALUES (?1, ?2, ?3, 0.55, 'source_url_match', ?4)",
+                        params![e.id, pred, hub_id, Utc::now().to_rfc3339()],
+                    )?;
+                    Ok(())
+                })?;
+                reconnected += 1;
+                if reconnected >= 300 {
+                    break;
+                }
+            }
+        }
+        if reconnected > 0 {
+            eprintln!(
+                "  [source-url-match] reconnected {} islands via source URL name matching",
                 reconnected
             );
         }

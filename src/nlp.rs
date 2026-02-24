@@ -6892,6 +6892,56 @@ pub fn extract_relations(sentences: &[String]) -> Vec<(String, String, String)> 
         "generates",
         "provides",
         "offers",
+        // Academic / biographical verbs
+        "studied",
+        "taught",
+        "influenced",
+        "inspired",
+        "mentored",
+        "supervised",
+        "collaborated",
+        "proposed",
+        "published",
+        "proved",
+        "theorized",
+        "formulated",
+        "pioneered",
+        "established",
+        "introduced",
+        "designed",
+        "patented",
+        "led",
+        "directed",
+        "governed",
+        "ruled",
+        "conquered",
+        "defeated",
+        "succeeded",
+        "preceded",
+        "married",
+        "befriended",
+        "employed",
+        "hired",
+        "appointed",
+        "commissioned",
+        "funded",
+        "sponsored",
+        "criticized",
+        "opposed",
+        "challenged",
+        "debated",
+        "visited",
+        "explored",
+        "colonized",
+        "annexed",
+        "unified",
+        "divided",
+        "reformed",
+        "transformed",
+        "revolutionized",
+        "improved",
+        "expanded",
+        "extended",
     ]
     .iter()
     .copied()
@@ -7019,6 +7069,172 @@ pub fn extract_relations(sentences: &[String]) -> Vec<(String, String, String)> 
                     let object = obj.join(" ");
                     if subject != object {
                         relations.push((subject, verb.clone(), object));
+                    }
+                }
+            }
+        }
+
+        // Prepositional patterns: "born/based/located/lived in X", "X of Y"
+        for i in 0..words.len().saturating_sub(2) {
+            let w = words[i]
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
+            let prep = words.get(i + 1).map(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase()
+            });
+            let prep_str = prep.as_deref().unwrap_or("");
+
+            // "born/based/lived/died/worked/studied/taught in <Place>"
+            if matches!(
+                w.as_str(),
+                "born" | "based" | "lived" | "died" | "worked" | "studied" | "taught" | "located"
+            ) && prep_str == "in"
+            {
+                // Collect subject before the verb (look backwards for capitalized words)
+                let mut subj = Vec::new();
+                if i >= 1 {
+                    // Skip "was" before the verb
+                    let start = if i >= 2 {
+                        let prev = words[i - 1]
+                            .trim_matches(|c: char| !c.is_alphanumeric())
+                            .to_lowercase();
+                        if matches!(prev.as_str(), "was" | "were" | "is" | "are") {
+                            i as isize - 2
+                        } else {
+                            i as isize - 1
+                        }
+                    } else {
+                        i as isize - 1
+                    };
+                    let mut j = start;
+                    while j >= 0 {
+                        let ww = words[j as usize].trim_matches(|c: char| !c.is_alphanumeric());
+                        if !ww.is_empty() && ww.chars().next().is_some_and(|c| c.is_uppercase()) {
+                            subj.push(ww);
+                            j -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    subj.reverse();
+                }
+                // Collect object after "in"
+                let mut obj = Vec::new();
+                let mut k = i + 2;
+                while k < words.len() {
+                    let ww = words[k].trim_matches(|c: char| !c.is_alphanumeric());
+                    if !ww.is_empty() && ww.chars().next().is_some_and(|c| c.is_uppercase()) {
+                        obj.push(ww);
+                        k += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if !subj.is_empty() && !obj.is_empty() {
+                    let subject = subj.join(" ");
+                    let object = obj.join(" ");
+                    if subject != object {
+                        let pred = format!("{}_in", w);
+                        relations.push((subject, pred, object));
+                    }
+                }
+            }
+
+            // "X at Y" (worked at, studied at, professor at)
+            if matches!(
+                w.as_str(),
+                "worked" | "studied" | "taught" | "professor" | "researcher" | "employed"
+            ) && prep_str == "at"
+            {
+                let mut subj = Vec::new();
+                let start = if i >= 2 {
+                    let prev = words[i - 1]
+                        .trim_matches(|c: char| !c.is_alphanumeric())
+                        .to_lowercase();
+                    if matches!(prev.as_str(), "was" | "were" | "is" | "are" | "a" | "an") {
+                        i as isize - 2
+                    } else {
+                        i as isize - 1
+                    }
+                } else if i >= 1 {
+                    i as isize - 1
+                } else {
+                    -1
+                };
+                let mut j = start;
+                while j >= 0 {
+                    let ww = words[j as usize].trim_matches(|c: char| !c.is_alphanumeric());
+                    if !ww.is_empty() && ww.chars().next().is_some_and(|c| c.is_uppercase()) {
+                        subj.push(ww);
+                        j -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                subj.reverse();
+                let mut obj = Vec::new();
+                let mut k = i + 2;
+                while k < words.len() {
+                    let ww = words[k].trim_matches(|c: char| !c.is_alphanumeric());
+                    if !ww.is_empty() && ww.chars().next().is_some_and(|c| c.is_uppercase()) {
+                        obj.push(ww);
+                        k += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if !subj.is_empty() && !obj.is_empty() {
+                    let subject = subj.join(" ");
+                    let object = obj.join(" ");
+                    if subject != object {
+                        relations.push((subject, "affiliated_with".to_string(), object));
+                    }
+                }
+            }
+        }
+
+        // Possessive: "X's Y" pattern → (X, associated_with, Y)
+        for i in 0..words.len().saturating_sub(1) {
+            if words[i].ends_with("'s") || words[i].ends_with("\u{2019}s") {
+                let owner = words[i]
+                    .trim_end_matches("'s")
+                    .trim_end_matches("\u{2019}s")
+                    .trim_matches(|c: char| !c.is_alphanumeric());
+                if !owner.is_empty() && owner.chars().next().is_some_and(|c| c.is_uppercase()) {
+                    // Look ahead for capitalized object
+                    let mut obj = Vec::new();
+                    let mut k = i + 1;
+                    while k < words.len() {
+                        let ww = words[k].trim_matches(|c: char| !c.is_alphanumeric());
+                        if !ww.is_empty() && ww.chars().next().is_some_and(|c| c.is_uppercase()) {
+                            obj.push(ww);
+                            k += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if !obj.is_empty() {
+                        // Also collect multi-word owner
+                        let mut full_owner = Vec::new();
+                        let mut j = i as isize - 1;
+                        while j >= 0 {
+                            let ww = words[j as usize].trim_matches(|c: char| !c.is_alphanumeric());
+                            if !ww.is_empty() && ww.chars().next().is_some_and(|c| c.is_uppercase())
+                            {
+                                full_owner.push(ww);
+                                j -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        full_owner.reverse();
+                        full_owner.push(owner);
+                        let subject = full_owner.join(" ");
+                        let object = obj.join(" ");
+                        if subject != object {
+                            relations.push((subject, "associated_with".to_string(), object));
+                        }
                     }
                 }
             }
