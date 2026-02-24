@@ -4841,3 +4841,92 @@ pub fn clustering_anomalies(
     });
     Ok(anomalies)
 }
+
+/// Overlap coefficient link prediction: `|N(a) ∩ N(b)| / min(|N(a)|, |N(b)|)`.
+/// Unlike Jaccard, this captures asymmetric containment — a small entity fully
+/// embedded in a larger entity's neighborhood scores 1.0.
+/// Returns top-k predicted links with scores.
+pub fn overlap_coefficient_predict(
+    brain: &Brain,
+    limit: usize,
+) -> Result<Vec<(i64, i64, f64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let entities = brain.all_entities()?;
+
+    // Filter to meaningful entities with enough connections
+    let meaningful: HashSet<i64> = entities
+        .iter()
+        .filter(|e| {
+            !crate::prometheus::is_noise_type(&e.entity_type)
+                && !crate::prometheus::is_noise_name(&e.name)
+                && adj.get(&e.id).is_some_and(|n| n.len() >= 2)
+        })
+        .map(|e| e.id)
+        .collect();
+
+    // Build neighbor sets
+    let neighbor_sets: HashMap<i64, HashSet<i64>> = meaningful
+        .iter()
+        .map(|&id| {
+            let neighbors: HashSet<i64> = adj
+                .get(&id)
+                .map(|n| n.iter().copied().collect())
+                .unwrap_or_default();
+            (id, neighbors)
+        })
+        .collect();
+
+    // Existing edges for filtering
+    let mut existing_edges: HashSet<(i64, i64)> = HashSet::new();
+    for (&node, neighbors) in &neighbor_sets {
+        for &n in neighbors {
+            existing_edges.insert((node.min(n), node.max(n)));
+        }
+    }
+
+    let mut predictions: Vec<(i64, i64, f64)> = Vec::new();
+    let ids: Vec<i64> = meaningful.iter().copied().collect();
+
+    for i in 0..ids.len().min(500) {
+        let a = ids[i];
+        let na = &neighbor_sets[&a];
+        if na.is_empty() {
+            continue;
+        }
+        for &b in na {
+            if !meaningful.contains(&b) {
+                continue;
+            }
+            let nb = &neighbor_sets[&b];
+            if nb.is_empty() {
+                continue;
+            }
+            // Check 2-hop neighbors of a through b
+            for &c in nb {
+                if c <= a || !meaningful.contains(&c) {
+                    continue;
+                }
+                if existing_edges.contains(&(a.min(c), a.max(c))) {
+                    continue;
+                }
+                let nc = &neighbor_sets[&c];
+                let intersection = na.intersection(nc).count();
+                if intersection == 0 {
+                    continue;
+                }
+                let min_degree = na.len().min(nc.len());
+                let score = intersection as f64 / min_degree as f64;
+                if score >= 0.3 {
+                    predictions.push((a, c, score));
+                }
+            }
+        }
+        if predictions.len() >= limit * 10 {
+            break;
+        }
+    }
+
+    predictions.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    predictions.truncate(limit);
+    Ok(predictions)
+}

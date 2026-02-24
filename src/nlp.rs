@@ -595,6 +595,16 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "marquis",
     "grant",
     "levantine",
+    // Added 2026-02-24 (cron round 3): demonyms and generics
+    "italian",
+    "bengali",
+    "israeli",
+    "kyrgyz",
+    "persian",
+    "tajik",
+    "territorial",
+    "piracy",
+    "peacock",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -3868,6 +3878,33 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         ];
         if german_generic_suffixes.iter().any(|s| lower.ends_with(s)) {
             return false;
+        }
+    }
+
+    // Reject 3+-word "person" entities where ALL words are capitalized and NONE are linking words
+    // These are typically lists of names/places mashed together (e.g. "Bulgaria Serbia Montenegro")
+    if etype == "person" && lower.contains(' ') {
+        let w: Vec<&str> = trimmed.split_whitespace().collect();
+        if w.len() >= 3 {
+            let linking = [
+                "of", "the", "de", "del", "di", "du", "von", "van", "la", "le", "el", "al", "das",
+                "des", "der", "den", "und", "and", "bin", "ibn", "ben", "y", "e",
+            ];
+            let all_cap = w
+                .iter()
+                .all(|word| word.chars().next().is_some_and(|c| c.is_uppercase()));
+            let has_link = w
+                .iter()
+                .any(|word| linking.contains(&word.to_lowercase().as_str()));
+            // If all words are capitalized with no linking words, and the last word looks like
+            // a standalone noun (not a typical surname suffix), it's probably a list/fragment
+            if all_cap && !has_link {
+                // Allow if it matches common name patterns (First Middle Last)
+                // But reject if it has 4+ words with no linking — almost certainly noise
+                if w.len() >= 4 {
+                    return false;
+                }
+            }
         }
     }
 

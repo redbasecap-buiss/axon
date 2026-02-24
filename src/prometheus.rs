@@ -258,7 +258,7 @@ const NOISE_NAMES: &[&str] = &[
     "shy",
 ];
 
-fn is_noise_type(t: &str) -> bool {
+pub fn is_noise_type(t: &str) -> bool {
     NOISE_TYPES.contains(&t)
 }
 
@@ -348,7 +348,7 @@ const FRAGMENT_VERBS: &[&str] = &[
 ];
 
 /// Check if an entity name looks like noise (stopword, too short, numeric, etc.)
-fn is_noise_name(name: &str) -> bool {
+pub fn is_noise_name(name: &str) -> bool {
     let lower = name.to_lowercase();
     if NOISE_NAMES.contains(&lower.as_str()) {
         return true;
@@ -2424,28 +2424,14 @@ impl<'a> Prometheus<'a> {
             }
             let obj_name = self.entity_name(*obj_id)?;
 
-            // Derive a meaningful predicate from the shared relationship
-            let inferred_pred = peer_predicates
-                .get(pred.as_str())
-                .copied()
-                .unwrap_or_else(|| {
-                    // For non-mapped predicates, use the original predicate context
-                    // but only if it's specific enough
-                    if pred.contains('_') && pred.len() > 5 {
-                        "shares_context_with"
-                    } else {
-                        return "related_to"; // too vague, will get lower confidence
-                    }
-                });
-
-            // Confidence depends on predicate specificity
-            let base_conf = if peer_predicates.contains_key(pred.as_str()) {
-                0.60 // known peer relationship
-            } else if inferred_pred == "shares_context_with" {
-                0.50 // reasonable inference
-            } else {
-                0.35 // generic, likely noise
+            // Only use explicitly mapped peer predicates — unmapped ones had
+            // a 3% confirmation rate and generate too much noise.
+            let inferred_pred = match peer_predicates.get(pred.as_str()) {
+                Some(&p) => p,
+                None => continue, // skip unmapped predicates entirely
             };
+
+            let base_conf = 0.60; // known peer relationship
 
             // For each pair of subjects, propose a relationship
             for i in 0..subjects.len().min(4) {
@@ -10680,21 +10666,37 @@ impl<'a> Prometheus<'a> {
                                 (0.3 + jaccard * 0.3).min(0.75),
                             )
                             .unwrap_or(0.45);
+                        // Analogical object inference: if A→pred→obj, try to predict
+                        // that B→pred→obj (same object) or B→pred→type-compatible object.
+                        // This dramatically improves validation vs object="?".
+                        let all_objects = pred_objects
+                            .get(&(a, missing_pred.clone()))
+                            .cloned()
+                            .unwrap_or_default();
+                        // Pick the most specific object (longest name, not "?")
+                        let best_object = all_objects
+                            .iter()
+                            .filter(|o| *o != "?")
+                            .max_by_key(|o| o.len())
+                            .cloned()
+                            .unwrap_or_else(|| "?".to_string());
+
                         hypotheses.push(Hypothesis {
                             id: 0,
                             subject: b_name.to_string(),
                             predicate: missing_pred.clone(),
-                            object: "?".to_string(),
+                            object: best_object.clone(),
                             confidence,
                             evidence_for: vec![format!(
-                                "Predicate profile overlap {:.0}% with {} ({} shared predicates); {} has '{}' → {}",
-                                jaccard * 100.0, a_name, shared, a_name, missing_pred, example_obj
+                                "Predicate profile overlap {:.0}% with {} ({} shared predicates); {} has '{}' → {}; analogical prediction: {} → {} → {}",
+                                jaccard * 100.0, a_name, shared, a_name, missing_pred, example_obj,
+                                b_name, missing_pred, best_object
                             )],
                             evidence_against: vec![],
                             reasoning_chain: vec![
                                 format!("{} and {} share {} of {} predicates (Jaccard {:.2})", b_name, a_name, shared, total, jaccard),
-                                format!("{} has predicate '{}' but {} does not", a_name, missing_pred, b_name),
-                                "Similar predicate profiles suggest missing predicates should transfer".to_string(),
+                                format!("{} has '{}' → '{}'; {} lacks this predicate", a_name, missing_pred, best_object, b_name),
+                                format!("Analogical inference: similar entities often share the same predicate targets"),
                             ],
                             status: HypothesisStatus::Proposed,
                             discovered_at: now_str(),
@@ -10733,21 +10735,34 @@ impl<'a> Prometheus<'a> {
                                 (0.3 + jaccard * 0.3).min(0.75),
                             )
                             .unwrap_or(0.45);
+                        // Analogical object inference for B→A direction
+                        let all_objects_b = pred_objects
+                            .get(&(b, missing_pred.clone()))
+                            .cloned()
+                            .unwrap_or_default();
+                        let best_object_b = all_objects_b
+                            .iter()
+                            .filter(|o| *o != "?")
+                            .max_by_key(|o| o.len())
+                            .cloned()
+                            .unwrap_or_else(|| "?".to_string());
+
                         hypotheses.push(Hypothesis {
                             id: 0,
                             subject: a_name.to_string(),
                             predicate: missing_pred.clone(),
-                            object: "?".to_string(),
+                            object: best_object_b.clone(),
                             confidence,
                             evidence_for: vec![format!(
-                                "Predicate profile overlap {:.0}% with {} ({} shared predicates); {} has '{}' → {}",
-                                jaccard * 100.0, b_name, shared, b_name, missing_pred, example_obj
+                                "Predicate profile overlap {:.0}% with {} ({} shared predicates); {} has '{}' → {}; analogical prediction: {} → {} → {}",
+                                jaccard * 100.0, b_name, shared, b_name, missing_pred, example_obj,
+                                a_name, missing_pred, best_object_b
                             )],
                             evidence_against: vec![],
                             reasoning_chain: vec![
                                 format!("{} and {} share {} of {} predicates (Jaccard {:.2})", a_name, b_name, shared, total, jaccard),
-                                format!("{} has predicate '{}' but {} does not", b_name, missing_pred, a_name),
-                                "Similar predicate profiles suggest missing predicates should transfer".to_string(),
+                                format!("{} has '{}' → '{}'; {} lacks this predicate", b_name, missing_pred, best_object_b, a_name),
+                                format!("Analogical inference: similar entities often share the same predicate targets"),
                             ],
                             status: HypothesisStatus::Proposed,
                             discovered_at: now_str(),
