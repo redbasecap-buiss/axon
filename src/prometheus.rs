@@ -3960,6 +3960,17 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(tcd_hyps);
         }
 
+        // 2u. Predicate-profile similarity (structurally analogous entities)
+        let pp_weight = self.get_pattern_weight("predicate_profile")?;
+        if pp_weight >= 0.05 {
+            let pp_hyps = self.generate_hypotheses_from_predicate_profile()?;
+            eprintln!(
+                "[PROMETHEUS] predicate_profile: {} hypotheses",
+                pp_hyps.len()
+            );
+            all_hypotheses.extend(pp_hyps);
+        }
+
         // 2t. Shared predicate-object inverse inference
         let spo_weight = self.get_pattern_weight("shared_predicate_object")?;
         if spo_weight >= 0.05 {
@@ -11090,6 +11101,201 @@ impl<'a> Prometheus<'a> {
                     }
                 }
             }
+        }
+
+        Ok(hypotheses)
+    }
+
+    /// Generate hypotheses from predicate-profile similarity: entities that
+    /// participate in similar distributions of predicate types (e.g., both have
+    /// `pioneered`, `active_in`, `affiliated_with`) are structurally analogous
+    /// and likely related, even without direct connections.
+    pub fn generate_hypotheses_from_predicate_profile(&self) -> Result<Vec<Hypothesis>> {
+        let entities = self.brain.all_entities()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let relations = self.brain.all_relations()?;
+
+        // Build predicate profile per entity: {entity_id → {predicate → count}}
+        let mut profiles: HashMap<i64, HashMap<String, usize>> = HashMap::new();
+        let mut existing_edges: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            *profiles
+                .entry(r.subject_id)
+                .or_default()
+                .entry(r.predicate.clone())
+                .or_insert(0) += 1;
+            *profiles
+                .entry(r.object_id)
+                .or_default()
+                .entry(r.predicate.clone())
+                .or_insert(0) += 1;
+            existing_edges.insert((r.subject_id, r.object_id));
+            existing_edges.insert((r.object_id, r.subject_id));
+        }
+
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Collect all predicate labels for vector indexing
+        let all_predicates: Vec<String> = {
+            let mut preds: HashSet<String> = HashSet::new();
+            for prof in profiles.values() {
+                for k in prof.keys() {
+                    preds.insert(k.clone());
+                }
+            }
+            let mut v: Vec<String> = preds.into_iter().collect();
+            v.sort();
+            v
+        };
+        let pred_idx: HashMap<&str, usize> = all_predicates
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.as_str(), i))
+            .collect();
+        let dim = all_predicates.len();
+        if dim < 3 {
+            return Ok(vec![]);
+        }
+
+        // Only consider entities with ≥3 distinct predicates (rich profiles)
+        let candidates: Vec<i64> = profiles
+            .iter()
+            .filter(|(id, prof)| {
+                prof.len() >= 3
+                    && meaningful.contains(id)
+                    && id_name.get(id).map(|n| !is_noise_name(n)).unwrap_or(false)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        if candidates.len() < 2 || candidates.len() > 5000 {
+            // Too few or too many — skip
+            return Ok(vec![]);
+        }
+
+        // Build normalized vectors
+        let vectors: HashMap<i64, Vec<f64>> = candidates
+            .iter()
+            .filter_map(|&id| {
+                let prof = profiles.get(&id)?;
+                let mut vec = vec![0.0_f64; dim];
+                for (pred, &count) in prof {
+                    if let Some(&idx) = pred_idx.get(pred.as_str()) {
+                        vec[idx] = count as f64;
+                    }
+                }
+                let norm: f64 = vec.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if norm > 0.0 {
+                    for x in vec.iter_mut() {
+                        *x /= norm;
+                    }
+                    Some((id, vec))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sample pairs (full O(n²) too expensive for large n)
+        let sample_ids: Vec<i64> = {
+            let mut ids: Vec<i64> = vectors.keys().copied().collect();
+            ids.sort(); // deterministic
+            ids.truncate(500);
+            ids
+        };
+
+        let mut scored: Vec<(i64, i64, f64)> = Vec::new();
+        for i in 0..sample_ids.len() {
+            let a = sample_ids[i];
+            let va = match vectors.get(&a) {
+                Some(v) => v,
+                None => continue,
+            };
+            for j in (i + 1)..sample_ids.len() {
+                let b = sample_ids[j];
+                if existing_edges.contains(&(a, b)) {
+                    continue;
+                }
+                // Must be same type for meaningful profile comparison
+                let at = id_type.get(&a).copied().unwrap_or("");
+                let bt = id_type.get(&b).copied().unwrap_or("");
+                if at != bt {
+                    continue;
+                }
+                let vb = match vectors.get(&b) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                // Cosine similarity (vectors already normalized)
+                let cosine: f64 = va.iter().zip(vb.iter()).map(|(x, y)| x * y).sum();
+                if cosine >= 0.85 {
+                    scored.push((a, b, cosine));
+                }
+            }
+        }
+
+        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(30);
+
+        let mut hypotheses = Vec::new();
+        for (a, b, cosine) in &scored {
+            let a_name = match id_name.get(a) {
+                Some(n) => *n,
+                None => continue,
+            };
+            let b_name = match id_name.get(b) {
+                Some(n) => *n,
+                None => continue,
+            };
+            if is_noise_name(a_name) || is_noise_name(b_name) {
+                continue;
+            }
+            let a_type = id_type.get(a).copied().unwrap_or("unknown");
+            let predicate = infer_predicate(a_type, a_type, None);
+            let base_conf = 0.35 + (cosine - 0.85) * 2.0; // 0.85→0.35, 1.0→0.65
+            let confidence = self
+                .calibrated_confidence("predicate_profile", base_conf)
+                .unwrap_or(base_conf);
+
+            // Describe which predicates they share
+            let a_prof = profiles.get(a).cloned().unwrap_or_default();
+            let b_prof = profiles.get(b).cloned().unwrap_or_default();
+            let shared_preds: Vec<String> = a_prof
+                .keys()
+                .filter(|k| b_prof.contains_key(*k))
+                .take(5)
+                .cloned()
+                .collect();
+
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.to_string(),
+                predicate: predicate.to_string(),
+                object: b_name.to_string(),
+                confidence,
+                evidence_for: vec![
+                    format!("Predicate-profile cosine similarity: {:.3}", cosine),
+                    format!("Shared predicate types: {}", shared_preds.join(", ")),
+                ],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!(
+                        "{} and {} have highly similar relation profiles ({} shared predicates)",
+                        a_name,
+                        b_name,
+                        shared_preds.len()
+                    ),
+                    "Entities with analogous structural roles are likely to be related".to_string(),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "predicate_profile".to_string(),
+            });
         }
 
         Ok(hypotheses)

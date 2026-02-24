@@ -2934,6 +2934,32 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "structure",
     "portrait",
     "frequency",
+    // Added 2026-02-24: generic English words found as false concept entities
+    "photographs",
+    "fundamentals",
+    "succession",
+    "instruments",
+    "formulae",
+    "engines",
+    "practitioners",
+    "spectroscopy",
+    "discoveries",
+    "astronomers",
+    "approaches",
+    "artifacts",
+    "selenium",
+    "aristocrats",
+    "bodyguard",
+    "interferometer",
+    "conjectures",
+    "curriculum",
+    "variational",
+    "biggest",
+    "breakthroughs",
+    "omega",
+    "autumn",
+    "yeast",
+    "attempt",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -4547,6 +4573,8 @@ fn classify_entity_type(name: &str) -> &'static str {
         "fayum",
         "zeitun",
         "magog",
+        // Added 2026-02-24 (brain cleaner): reclassified from concept
+        "bologna",
     ];
     if !lower.contains(' ') && KNOWN_PLACES.contains(&lower.as_str()) {
         return "place";
@@ -4743,6 +4771,21 @@ fn classify_entity_type(name: &str) -> &'static str {
         "loczy",
         "stoney",
         "bivar",
+        // Added 2026-02-24 (brain cleaner): reclassified from concept
+        "voltaire",
+        "leibniz",
+        "montesquieu",
+        "descartes",
+        "attucks",
+        "balfour",
+        "churchill",
+        "wordsworth",
+        "minkowski",
+        "alzheimer",
+        "aristotle",
+        "avogadro",
+        "barnett",
+        "ashton",
     ];
     if !lower.contains(' ') && KNOWN_PERSONS.contains(&lower.as_str()) {
         return "person";

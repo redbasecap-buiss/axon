@@ -4930,3 +4930,85 @@ pub fn overlap_coefficient_predict(
     predictions.truncate(limit);
     Ok(predictions)
 }
+
+/// Compute the spectral gap approximation using power iteration on the
+/// normalized Laplacian.  The spectral gap (λ₂) indicates algebraic
+/// connectivity — higher values mean the graph is better connected.
+/// Returns (lambda2_estimate, iterations_used).
+pub fn spectral_gap_estimate(
+    brain: &Brain,
+    max_iter: usize,
+) -> Result<(f64, usize), rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let n = adj.len();
+    if n < 3 {
+        return Ok((0.0, 0));
+    }
+
+    let ids: Vec<i64> = adj.keys().copied().collect();
+    let id_to_idx: HashMap<i64, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+
+    let degrees: Vec<f64> = ids
+        .iter()
+        .map(|id| adj.get(id).map(|v| v.len()).unwrap_or(0) as f64)
+        .collect();
+
+    let mut v: Vec<f64> = (0..n).map(|i| (i as f64) - (n as f64 / 2.0)).collect();
+
+    let sum: f64 = v.iter().sum();
+    let mean = sum / n as f64;
+    for x in v.iter_mut() {
+        *x -= mean;
+    }
+    let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm < 1e-12 {
+        return Ok((0.0, 0));
+    }
+    for x in v.iter_mut() {
+        *x /= norm;
+    }
+
+    let mut lambda = 0.0_f64;
+    let mut iter_used = 0;
+
+    for it in 0..max_iter {
+        let mut lv = vec![0.0_f64; n];
+        for (i, &id) in ids.iter().enumerate() {
+            if degrees[i] < 1.0 {
+                lv[i] = v[i];
+                continue;
+            }
+            let mut av_i = 0.0_f64;
+            if let Some(neighbors) = adj.get(&id) {
+                for &nbr in neighbors {
+                    if let Some(&j) = id_to_idx.get(&nbr) {
+                        av_i += v[j];
+                    }
+                }
+            }
+            lv[i] = v[i] - av_i / degrees[i];
+        }
+
+        let vtlv: f64 = v.iter().zip(lv.iter()).map(|(a, b)| a * b).sum();
+        let vtv: f64 = v.iter().map(|x| x * x).sum();
+        lambda = if vtv > 1e-12 { vtlv / vtv } else { 0.0 };
+
+        v = lv;
+
+        let sum: f64 = v.iter().sum();
+        let mean = sum / n as f64;
+        for x in v.iter_mut() {
+            *x -= mean;
+        }
+        let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm < 1e-12 {
+            break;
+        }
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+        iter_used = it + 1;
+    }
+
+    Ok((lambda, iter_used))
+}
