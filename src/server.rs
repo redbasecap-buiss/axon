@@ -11,6 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
+use crate::contradiction;
 use crate::crawler;
 use crate::db::Brain;
 use crate::nlp;
@@ -204,6 +205,112 @@ q.addEventListener('input', () => {{
     Ok(Html(html))
 }
 
+#[derive(Deserialize)]
+pub struct FuzzyParams {
+    q: Option<String>,
+    distance: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct FuzzyResult {
+    name: String,
+    entity_type: String,
+    confidence: f64,
+    edit_distance: usize,
+    similarity: f64,
+}
+
+#[derive(Serialize)]
+pub struct FuzzyResponse {
+    query: String,
+    results: Vec<FuzzyResult>,
+}
+
+async fn handle_fuzzy(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<FuzzyParams>,
+) -> Result<Json<FuzzyResponse>, StatusCode> {
+    let q = params.q.unwrap_or_default();
+    let brain = state.brain()?;
+    let matches = brain
+        .fuzzy_search_entities(&q, params.distance)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let results = matches
+        .into_iter()
+        .map(|(e, dist, sim)| FuzzyResult {
+            name: e.name,
+            entity_type: e.entity_type,
+            confidence: e.confidence,
+            edit_distance: dist,
+            similarity: sim,
+        })
+        .collect();
+    Ok(Json(FuzzyResponse { query: q, results }))
+}
+
+#[derive(Serialize)]
+pub struct ContradictionEntry {
+    entity: String,
+    key: String,
+    value_a: String,
+    value_b: String,
+    confidence_a: f64,
+    confidence_b: f64,
+    severity: String,
+}
+
+#[derive(Serialize)]
+pub struct ContradictionsResponse {
+    count: usize,
+    contradictions: Vec<ContradictionEntry>,
+}
+
+async fn handle_contradictions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ContradictionsResponse>, StatusCode> {
+    let brain = state.brain()?;
+    let results = contradiction::detect_contradictions(&brain)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let count = results.len();
+    let contradictions = results
+        .into_iter()
+        .map(|c| ContradictionEntry {
+            entity: c.entity_name,
+            key: c.key,
+            value_a: c.value_a,
+            value_b: c.value_b,
+            confidence_a: c.confidence_a,
+            confidence_b: c.confidence_b,
+            severity: c.severity.as_str().to_string(),
+        })
+        .collect();
+    Ok(Json(ContradictionsResponse {
+        count,
+        contradictions,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct AboutParams {
+    name: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct AboutResponse {
+    entity: String,
+    info: Vec<String>,
+}
+
+async fn handle_about(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AboutParams>,
+) -> Result<Json<AboutResponse>, StatusCode> {
+    let name = params.name.unwrap_or_default();
+    let brain = state.brain()?;
+    let info = query::about(&brain, &name).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(AboutResponse { entity: name, info }))
+}
+
 // ---------- router ----------
 
 pub fn build_router(db_path: &Path) -> Router {
@@ -217,6 +324,9 @@ pub fn build_router(db_path: &Path) -> Router {
         .route("/api/stats", get(handle_stats))
         .route("/api/feed", post(handle_feed))
         .route("/api/topics", get(handle_topics))
+        .route("/api/fuzzy", get(handle_fuzzy))
+        .route("/api/contradictions", get(handle_contradictions))
+        .route("/api/about", get(handle_about))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

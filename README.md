@@ -46,6 +46,20 @@ axon crawl --max-pages 20
 # Forget old, low-confidence facts
 axon forget --threshold 0.1 --min-age-days 30
 
+# Fuzzy search (typo-tolerant)
+axon fuzzy "Einstien"            # finds "Einstein"
+axon fuzzy "Motzart" --distance 2
+
+# Ingest local markdown files
+axon ingest notes.md
+axon ingest ./docs/ --recursive
+
+# Import URLs from sitemaps
+axon sitemap https://example.com --max 200
+
+# Detect contradictions in the knowledge graph
+axon contradictions
+
 # Run as daemon (continuously learn)
 axon daemon --interval 30m
 ```
@@ -92,6 +106,23 @@ axon daemon --interval 30m
 - Rate limiting with politeness delays
 - Crawl frontier with priority queue
 - Content hash-based change detection
+- **Sitemap parsing** — auto-discover URLs from sitemap.xml and sitemap indexes
+- **Markdown ingestion** — feed local .md files and directories
+
+### Fuzzy Search
+
+- Levenshtein distance with Damerau transposition
+- Auto-calibrated edit distance based on query length
+- Substring and word-level matching
+- Bigram similarity for phrase matching
+- Typo-tolerant entity lookup across CLI, API, and queries
+
+### Contradiction Detection
+
+- Detects conflicting facts for the same entity/key
+- Severity levels: HARD (equal confidence), SOFT (one dominant), MINOR (numeric rounding)
+- Boolean contradiction detection (true/false, alive/dead, etc.)
+- Numeric closeness analysis (within 5% = minor)
 
 ## Configuration
 
@@ -117,6 +148,23 @@ Pure Rust, minimal footprint:
 - `chrono` — Time handling
 - `tokio` — Async runtime
 - `texting_robots` — robots.txt parsing
+
+## 🌐 REST API
+
+```bash
+axon serve --port 8080
+```
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/` | GET | Dashboard UI |
+| `/api/ask?q=...` | GET | Query the knowledge graph |
+| `/api/stats` | GET | Brain statistics |
+| `/api/topics` | GET | Top entities |
+| `/api/feed` | POST | Feed a URL `{"url": "..."}` |
+| `/api/fuzzy?q=...&distance=2` | GET | Fuzzy entity search |
+| `/api/contradictions` | GET | Detect contradictions |
+| `/api/about?name=...` | GET | Everything known about an entity |
 
 ## 🔬 PROMETHEUS — Automated Scientific Discovery
 

@@ -1,18 +1,22 @@
 mod chat;
 mod config;
+pub mod contradiction;
 mod crawler;
 pub mod criticality;
 mod db;
 #[allow(dead_code)]
 mod embeddings;
 mod export;
+pub mod fuzzy;
 mod graph;
+mod markdown;
 mod nlp;
 pub mod plugin;
 pub mod prometheus;
 mod query;
 pub mod reasoning;
 mod server;
+mod sitemap;
 mod tui;
 
 use clap::{Parser, Subcommand};
@@ -128,6 +132,31 @@ enum Commands {
     },
     /// Predict which entities are most likely to gain new connections
     Predict,
+    /// Fuzzy search for entities (typo-tolerant)
+    Fuzzy {
+        query: String,
+        /// Max edit distance (auto if not set)
+        #[arg(long)]
+        distance: Option<usize>,
+    },
+    /// Ingest a local markdown file or directory
+    Ingest {
+        /// Path to .md file or directory
+        path: PathBuf,
+        /// Recurse into subdirectories
+        #[arg(long)]
+        recursive: bool,
+    },
+    /// Discover URLs from a site's sitemap.xml
+    Sitemap {
+        /// Base URL of the site
+        url: String,
+        /// Maximum entries to import
+        #[arg(long, default_value = "100")]
+        max: usize,
+    },
+    /// Detect contradictions in the knowledge graph
+    Contradictions,
     /// Generate default config at ~/.axon/config.toml
     Init,
     /// Launch HTTP API server
@@ -598,6 +627,59 @@ async fn main() -> anyhow::Result<()> {
                     println!("     {}", p.reason);
                 }
             }
+        }
+        Commands::Fuzzy { query, distance } => {
+            let results = brain.fuzzy_search_entities(&query, distance)?;
+            if results.is_empty() {
+                println!("🤷 No matches found for \"{query}\" (even with fuzzy search).");
+            } else {
+                println!("🔍 Fuzzy matches for \"{query}\":\n");
+                for (entity, dist, sim) in &results {
+                    let marker = if *dist == 0 { "exact" } else { "fuzzy" };
+                    println!(
+                        "  [{marker}] {} ({}) — {:.0}% match, confidence: {:.0}%",
+                        entity.name,
+                        entity.entity_type,
+                        sim * 100.0,
+                        entity.confidence * 100.0
+                    );
+                }
+            }
+        }
+        Commands::Ingest { path, recursive } => {
+            if path.is_file() {
+                println!("📄 Ingesting: {}", path.display());
+                let (e, r, f) = markdown::ingest_file(&brain, &path)?;
+                println!("   Learned {e} entities, {r} relations, {f} facts");
+            } else if path.is_dir() {
+                println!(
+                    "📁 Ingesting directory: {} (recursive: {recursive})",
+                    path.display()
+                );
+                let (files, e, r, f) = markdown::ingest_directory(&brain, &path, recursive)?;
+                println!("   Processed {files} files: {e} entities, {r} relations, {f} facts");
+            } else {
+                eprintln!("❌ Path not found: {}", path.display());
+                std::process::exit(1);
+            }
+        }
+        Commands::Sitemap { url, max } => {
+            println!("🗺️  Discovering sitemaps for: {url}");
+            let sitemap_urls = sitemap::discover_sitemaps(&url).await?;
+            println!("   Found {} sitemap(s)", sitemap_urls.len());
+            let entries = sitemap::fetch_all_entries(&sitemap_urls, max).await?;
+            println!("   Discovered {} URL(s)", entries.len());
+            let mut added = 0;
+            for entry in &entries {
+                let priority = entry.priority.map(|p| (p * 10.0) as i32).unwrap_or(5);
+                brain.add_to_frontier(&entry.url, priority)?;
+                added += 1;
+            }
+            println!("   Added {added} URLs to crawl frontier");
+        }
+        Commands::Contradictions => {
+            let results = contradiction::detect_contradictions(&brain)?;
+            print!("{}", contradiction::format_contradictions(&results));
         }
         Commands::Init => unreachable!(),
         Commands::Serve { port } => {

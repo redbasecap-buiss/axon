@@ -277,6 +277,43 @@ impl Brain {
         rows.collect()
     }
 
+    /// Fuzzy search entities using Levenshtein distance.
+    /// Falls back to fuzzy matching when exact LIKE search returns no results.
+    pub fn fuzzy_search_entities(
+        &self,
+        query: &str,
+        max_distance: Option<usize>,
+    ) -> Result<Vec<(Entity, usize, f64)>> {
+        // First try exact search
+        let exact = self.search_entities(query)?;
+        if !exact.is_empty() {
+            return Ok(exact.into_iter().map(|e| (e, 0, 1.0)).collect());
+        }
+
+        // Fall back to fuzzy search over all entity names
+        let all = self.all_entities()?;
+        let names: Vec<String> = all.iter().map(|e| e.name.clone()).collect();
+        let matches = crate::fuzzy::fuzzy_search(query, &names, max_distance);
+
+        let mut results = Vec::new();
+        for (matched_name, dist, sim) in matches.into_iter().take(20) {
+            if let Some(entity) = all.iter().find(|e| e.name == matched_name) {
+                results.push((entity.clone(), dist, sim));
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Get all entity names (for fuzzy search candidate list).
+    pub fn all_entity_names(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM entities ORDER BY access_count DESC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
     pub fn get_entity_by_name(&self, name: &str) -> Result<Option<Entity>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, entity_type, confidence, first_seen, last_seen, access_count
