@@ -5383,3 +5383,62 @@ pub fn graph_evolution_rate(brain: &Brain) -> Result<(f64, f64, f64), rusqlite::
 
     Ok((ent_rate, rel_rate, density_trend))
 }
+
+/// Compute predicate concentration per entity — identifies entities where
+/// a single predicate dominates their relations (Herfindahl index).
+/// Returns entities with HHI > threshold, sorted by concentration descending.
+/// Useful for finding entities that need predicate diversification.
+pub fn predicate_concentration(
+    brain: &Brain,
+    min_degree: usize,
+    hhi_threshold: f64,
+) -> Result<Vec<(i64, String, usize, f64, String)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let entities = brain.all_entities()?;
+    let id_to_name: std::collections::HashMap<i64, &str> =
+        entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+
+    // Build per-entity predicate frequency map
+    let mut pred_freq: std::collections::HashMap<i64, std::collections::HashMap<&str, usize>> =
+        std::collections::HashMap::new();
+    for r in &relations {
+        *pred_freq
+            .entry(r.subject_id)
+            .or_default()
+            .entry(&r.predicate)
+            .or_insert(0) += 1;
+        *pred_freq
+            .entry(r.object_id)
+            .or_default()
+            .entry(&r.predicate)
+            .or_insert(0) += 1;
+    }
+
+    let mut results = Vec::new();
+    for (eid, freqs) in &pred_freq {
+        let total: usize = freqs.values().sum();
+        if total < min_degree {
+            continue;
+        }
+        // Herfindahl-Hirschman Index: sum of squared shares
+        let hhi: f64 = freqs
+            .values()
+            .map(|&c| {
+                let share = c as f64 / total as f64;
+                share * share
+            })
+            .sum();
+        if hhi >= hhi_threshold {
+            let dominant_pred = freqs
+                .iter()
+                .max_by_key(|(_, &v)| v)
+                .map(|(k, _)| k.to_string())
+                .unwrap_or_default();
+            let name = id_to_name.get(eid).unwrap_or(&"?").to_string();
+            results.push((*eid, name, total, hhi, dominant_pred));
+        }
+    }
+
+    results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(results)
+}

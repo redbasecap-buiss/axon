@@ -876,6 +876,18 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "fastnacht",
     "epigenome",
     "risorgimento",
+    // Added 2026-02-24 (brain cleaner round 7)
+    "guardian",
+    "colloquium",
+    "supercontinent",
+    "palazzo",
+    "jamaican",
+    "royale",
+    "rulers",
+    "forum",
+    "briefwechsel",
+    "euthanasie",
+    "über",
 ];
 
 /// Common person name prefixes/titles for entity classification.

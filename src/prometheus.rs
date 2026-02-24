@@ -4705,6 +4705,9 @@ impl<'a> Prometheus<'a> {
         // Refine contemporary_of using shared-neighbor evidence
         let contemporary_refined = self.refine_contemporary_of().unwrap_or(0);
 
+        // Refine overused "pioneered" into type-specific predicates
+        let pioneered_refined = self.refine_pioneered().unwrap_or(0);
+
         // Promote mature testing hypotheses (>7 days, confidence >= 0.75)
         let promoted = self.promote_mature_hypotheses(7, 0.75).unwrap_or(0);
 
@@ -4787,7 +4790,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -4881,6 +4884,7 @@ impl<'a> Prometheus<'a> {
             contributed_refined,
             related_to_refined,
             contemporary_refined,
+            pioneered_refined,
             promoted,
             fragment_cleaned,
             concat_hyp_rejected,
@@ -13888,6 +13892,144 @@ impl<'a> Prometheus<'a> {
                 "co_practitioners"
             } else {
                 continue;
+            };
+
+            let ok = self.brain.with_conn(|conn| {
+                let res = conn.execute(
+                    "UPDATE relations SET predicate = ?1 WHERE id = ?2",
+                    params![new_pred, r.id],
+                );
+                match res {
+                    Ok(_) => Ok(true),
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                }
+            })?;
+            if ok {
+                updated += 1;
+            }
+        }
+
+        Ok(updated)
+    }
+
+    /// Refine overused `pioneered` predicates into more specific relationships
+    /// based on entity type pairs. "pioneered" is semantically correct only for
+    /// person→concept; all other type pairs get domain-specific predicates.
+    /// Also refines person→concept "pioneered" when neighborhood evidence suggests
+    /// a more specific predicate (e.g., "founded" for organizations, "invented" for tech).
+    pub fn refine_pioneered(&self) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let id_to_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+        let id_to_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+
+        let mut updated = 0usize;
+
+        // Phase 1: Fix type-mismatched "pioneered" relations
+        for r in &relations {
+            if r.predicate != "pioneered" {
+                continue;
+            }
+            let s_type = id_to_type.get(&r.subject_id).copied().unwrap_or("unknown");
+            let o_type = id_to_type.get(&r.object_id).copied().unwrap_or("unknown");
+
+            // person→concept is the only valid "pioneered" — skip it for phase 1
+            if s_type == "person" && o_type == "concept" {
+                continue;
+            }
+
+            let new_pred = match (s_type, o_type) {
+                ("person", "person") => "contemporary_of",
+                ("person", "place") => "active_in",
+                ("person", "organization") => "affiliated_with",
+                ("person", "event") => "participated_in",
+                ("person", "technology") => "invented",
+                ("concept", "concept") => "related_concept",
+                ("concept", "person") => "pioneered_by",
+                ("concept", "place") | ("place", "concept") => "relevant_to",
+                ("place", "place") => "located_near",
+                ("place", "person") => "birthplace_of",
+                ("organization", "concept") => "works_on",
+                ("organization", "person") => "employed",
+                ("organization", "place") => "based_in",
+                ("organization", "organization") => "partner_of",
+                _ => "associated_with",
+            };
+
+            let ok = self.brain.with_conn(|conn| {
+                let res = conn.execute(
+                    "UPDATE relations SET predicate = ?1 WHERE id = ?2",
+                    params![new_pred, r.id],
+                );
+                match res {
+                    Ok(_) => Ok(true),
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                }
+            })?;
+            if ok {
+                updated += 1;
+            }
+        }
+
+        // Phase 2: Specialize person→concept "pioneered" using object name heuristics
+        // Concepts containing certain keywords suggest more precise predicates
+        let remaining: Vec<_> = self
+            .brain
+            .all_relations()?
+            .into_iter()
+            .filter(|r| r.predicate == "pioneered")
+            .collect();
+
+        for r in &remaining {
+            let o_name = match id_to_name.get(&r.object_id) {
+                Some(n) => n.to_lowercase(),
+                None => continue,
+            };
+
+            // Keyword-based specialization
+            let new_pred = if o_name.contains("theorem")
+                || o_name.contains("conjecture")
+                || o_name.contains("equation")
+                || o_name.contains("formula")
+                || o_name.contains("law of")
+                || o_name.contains("principle of")
+            {
+                "formulated"
+            } else if o_name.contains("algorithm")
+                || o_name.contains("method")
+                || o_name.contains("technique")
+                || o_name.contains("protocol")
+            {
+                "developed"
+            } else if o_name.contains("theory")
+                || o_name.contains("hypothesis")
+                || o_name.contains("model of")
+            {
+                "theorized"
+            } else if o_name.contains("machine")
+                || o_name.contains("engine")
+                || o_name.contains("device")
+                || o_name.contains("instrument")
+            {
+                "invented"
+            } else {
+                continue; // Keep as "pioneered" — it's the right generic
             };
 
             let ok = self.brain.with_conn(|conn| {
