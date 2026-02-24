@@ -320,6 +320,16 @@ impl Brain {
         rows.collect()
     }
 
+    pub fn get_source_urls_for(&self, entity_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT source_url FROM relations
+             WHERE (subject_id = ?1 OR object_id = ?1)
+             AND source_url IS NOT NULL AND source_url != ''",
+        )?;
+        let rows = stmt.query_map(params![entity_id], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
     pub fn get_facts_for(&self, entity_id: i64) -> Result<Vec<Fact>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, entity_id, key, value, confidence, source_url

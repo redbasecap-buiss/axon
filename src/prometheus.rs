@@ -2421,14 +2421,18 @@ impl<'a> Prometheus<'a> {
                 }
 
                 // Source co-occurrence: both entities appear in the same source URL
-                let s_sources: HashSet<String> = self
-                    .brain
-                    .get_relations_for(s_ent.id)?
-                    .iter()
-                    .filter_map(|(_, _, _, _)| None::<String>) // source_url not in tuple
-                    .collect();
-                // (source URL not easily accessible from relation tuple, skip for now)
-                let _ = s_sources;
+                let s_sources: HashSet<String> = self.brain.get_source_urls_for(s_ent.id)?
+                    .into_iter().collect();
+                let o_sources: HashSet<String> = self.brain.get_source_urls_for(o_ent.id)?
+                    .into_iter().collect();
+                let shared_sources = s_sources.intersection(&o_sources).count();
+                if shared_sources >= 1 {
+                    h.evidence_for.push(format!(
+                        "Co-occur in {} source URL(s)",
+                        shared_sources
+                    ));
+                    h.confidence = (h.confidence + 0.03 * shared_sources as f64).min(1.0);
+                }
             }
         }
 
@@ -13891,6 +13895,13 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
             "port",
             "inlet",
             "fjord",
+            "ocean",
+            "oceans",
+            "sea",
+            "seas",
+            "seamount",
+            "oceania",
+            "atoll",
         ];
         if let Some(last) = words.last() {
             if geo_suffixes.contains(last) {
@@ -14134,23 +14145,34 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         return Some("place");
     }
 
-    // Multi-word place names misclassified as concept or person (e.g. "Spanish Netherlands", "Ottoman Empire")
+    // Multi-word place names misclassified as concept or person
+    // Generic suffix-based detection for empires, kingdoms, republics, etc.
     if (current_type == "concept" || current_type == "person") && word_count >= 2 {
+        let geopolitical_suffixes: &[&str] = &[
+            "empire",
+            "kingdom",
+            "republic",
+            "dynasty",
+            "caliphate",
+            "khanate",
+            "sultanate",
+            "principality",
+            "confederation",
+            "netherlands",
+            "union",
+        ];
+        if let Some(last) = words.last() {
+            if geopolitical_suffixes.contains(last) {
+                // Exception: "Soviet Union" is place, "Trade Union" is organization
+                let org_prefixes = ["trade", "labor", "labour", "workers", "european"];
+                if *last == "union" && org_prefixes.iter().any(|p| lower.starts_with(p)) {
+                    return Some("organization");
+                }
+                return Some("place");
+            }
+        }
         let place_compounds: &[&str] = &[
-            "spanish netherlands",
-            "austrian netherlands",
-            "southern netherlands",
-            "ottoman empire",
-            "roman empire",
-            "byzantine empire",
-            "british empire",
-            "russian empire",
-            "persian empire",
-            "mughal empire",
-            "holy roman empire",
             "soviet union",
-            "austro-hungarian empire",
-            "habsburg empire",
             "west germany",
             "east germany",
             "west berlin",
