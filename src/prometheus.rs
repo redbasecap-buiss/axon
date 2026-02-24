@@ -3993,6 +3993,17 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(spo_hyps);
         }
 
+        // 2w. Overlap coefficient link prediction (asymmetric similarity)
+        let oc_weight = self.get_pattern_weight("overlap_coefficient")?;
+        if oc_weight >= 0.05 {
+            let oc_hyps = self.generate_hypotheses_from_overlap_coefficient()?;
+            eprintln!(
+                "[PROMETHEUS] overlap_coefficient: {} hypotheses",
+                oc_hyps.len()
+            );
+            all_hypotheses.extend(oc_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -9871,9 +9882,9 @@ impl<'a> Prometheus<'a> {
     /// Entities sharing the same (predicate, object) patterns are likely related
     /// even if not directly connected.
     pub fn generate_hypotheses_from_semantic_similarity(&self) -> Result<Vec<Hypothesis>> {
-        // Two passes: strict (min_shared=2, top 40) and relaxed for high-value types (min_shared=1, top 20)
-        let mut similar = crate::graph::semantic_fingerprint_similarity(self.brain, 2, 40)?;
-        let relaxed = crate::graph::semantic_fingerprint_similarity(self.brain, 1, 20)?;
+        // Two passes: strict (min_shared=2, top 80) and relaxed for high-value types (min_shared=1, top 40)
+        let mut similar = crate::graph::semantic_fingerprint_similarity(self.brain, 2, 80)?;
+        let relaxed = crate::graph::semantic_fingerprint_similarity(self.brain, 1, 40)?;
         // Merge relaxed results that aren't already present
         let existing: HashSet<(i64, i64)> = similar.iter().map(|(a, b, _, _)| (*a, *b)).collect();
         for item in relaxed {
@@ -11557,6 +11568,66 @@ impl<'a> Prometheus<'a> {
             }
         }
 
+        hypotheses.truncate(40);
+        Ok(hypotheses)
+    }
+
+    /// Overlap coefficient link prediction: identifies entity pairs where the
+    /// smaller entity's neighborhood is largely contained in the larger's.
+    /// This asymmetric measure catches "subset" relationships missed by Jaccard.
+    pub fn generate_hypotheses_from_overlap_coefficient(&self) -> Result<Vec<Hypothesis>> {
+        let predictions = crate::graph::overlap_coefficient_predict(self.brain, 60)?;
+        let entities = self.brain.all_entities()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        let mut hypotheses = Vec::new();
+        for (a, b, score) in &predictions {
+            if !meaningful.contains(a) || !meaningful.contains(b) {
+                continue;
+            }
+            let a_name = id_name.get(a).copied().unwrap_or("?");
+            let b_name = id_name.get(b).copied().unwrap_or("?");
+            if is_noise_name(a_name) || is_noise_name(b_name) {
+                continue;
+            }
+            let a_type = id_type.get(a).copied().unwrap_or("?");
+            let b_type = id_type.get(b).copied().unwrap_or("?");
+            let predicate = infer_predicate(a_type, b_type, None);
+            let base_conf = 0.35 + (score - 0.3) * 0.5; // 0.3→0.35, 1.0→0.70
+            let confidence = self
+                .calibrated_confidence("overlap_coefficient", base_conf)
+                .unwrap_or(base_conf);
+
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.to_string(),
+                predicate: predicate.to_string(),
+                object: b_name.to_string(),
+                confidence,
+                evidence_for: vec![format!(
+                    "Overlap coefficient {:.3}: smaller neighborhood largely contained in larger",
+                    score
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!(
+                        "{} and {} share significant neighbor overlap",
+                        a_name, b_name
+                    ),
+                    format!("Overlap coefficient: {:.3} (asymmetric containment)", score),
+                    "High overlap suggests hierarchical or associative relationship".to_string(),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "overlap_coefficient".to_string(),
+            });
+        }
         hypotheses.truncate(40);
         Ok(hypotheses)
     }
