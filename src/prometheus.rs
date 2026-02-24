@@ -2433,11 +2433,39 @@ impl<'a> Prometheus<'a> {
 
             let base_conf = 0.60; // known peer relationship
 
+            // Pre-fetch entity types for type compatibility filtering
+            let subj_types: Vec<(i64, String)> = subjects
+                .iter()
+                .filter_map(|&sid| {
+                    self.brain
+                        .get_entity_by_id(sid)
+                        .ok()
+                        .flatten()
+                        .map(|e| (sid, e.entity_type))
+                })
+                .collect();
+
             // For each pair of subjects, propose a relationship
-            for i in 0..subjects.len().min(4) {
-                for j in (i + 1)..subjects.len().min(4) {
-                    let a = self.entity_name(subjects[i])?;
-                    let b = self.entity_name(subjects[j])?;
+            for i in 0..subj_types.len().min(4) {
+                for j in (i + 1)..subj_types.len().min(4) {
+                    let (sid_a, ref type_a) = subj_types[i];
+                    let (sid_b, ref type_b) = subj_types[j];
+
+                    // Type compatibility: both subjects should be the same type
+                    // or a compatible pair (person-person, org-org, place-place)
+                    // Mixed type pairs (e.g. person + concept) rarely confirm
+                    if type_a != type_b {
+                        let compatible_pairs: HashSet<(&str, &str)> =
+                            [("person", "organization"), ("organization", "person")]
+                                .into_iter()
+                                .collect();
+                        if !compatible_pairs.contains(&(type_a.as_str(), type_b.as_str())) {
+                            continue;
+                        }
+                    }
+
+                    let a = self.entity_name(sid_a)?;
+                    let b = self.entity_name(sid_b)?;
 
                     // Skip if inferred predicate is too vague and confidence too low
                     if inferred_pred == "related_to" {
@@ -3172,6 +3200,43 @@ impl<'a> Prometheus<'a> {
                 h.evidence_for
                     .push("Cross-pattern corroboration: 1 independent source agrees".to_string());
                 apply_boost(&mut total_boost, 0.06);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            }
+        }
+
+        // Predicate specificity: specific predicates (born_in, invented, founded)
+        // are more reliable signals than vague ones (related_to, associated_with).
+        // Penalize vague predicates to reduce false confirmations.
+        {
+            const VAGUE_PREDICATES: &[&str] = &[
+                "related_to",
+                "associated_with",
+                "connected_to",
+                "linked_to",
+                "relevant_to",
+                "contemporary_of",
+            ];
+            const SPECIFIC_PREDICATES: &[&str] = &[
+                "born_in",
+                "founded",
+                "invented",
+                "discovered",
+                "created",
+                "published",
+                "located_in",
+                "member_of",
+                "headquartered_in",
+                "studied_at",
+                "works_at",
+                "developed",
+                "pioneered",
+                "capital_of",
+                "part_of",
+            ];
+            if VAGUE_PREDICATES.contains(&h.predicate.as_str()) {
+                h.confidence = (h.confidence - 0.05).max(0.0);
+            } else if SPECIFIC_PREDICATES.contains(&h.predicate.as_str()) {
+                apply_boost(&mut total_boost, 0.04);
                 h.confidence = (base_confidence + total_boost).min(1.0);
             }
         }
@@ -8082,8 +8147,8 @@ impl<'a> Prometheus<'a> {
 
             for (cand_id, shared_set) in &two_hop {
                 let shared_count = shared_set.len();
-                if shared_count < 3 {
-                    continue; // Require at least 3 shared meaningful neighbors
+                if shared_count < 4 {
+                    continue; // Require at least 4 shared meaningful neighbors (raised from 3 to cut false positives)
                 }
                 let cand = match id_to_entity.get(cand_id) {
                     Some(e) => e,
@@ -8105,8 +8170,8 @@ impl<'a> Prometheus<'a> {
                 } else {
                     0.0
                 };
-                if jaccard < 0.30 {
-                    continue; // Require strong overlap ratio (raised from 0.15 to reduce 85% rejection rate)
+                if jaccard < 0.35 {
+                    continue; // Require strong overlap ratio (raised from 0.30 to reduce 85% rejection rate)
                 }
 
                 // Infer predicate from shared neighbors' edge labels
