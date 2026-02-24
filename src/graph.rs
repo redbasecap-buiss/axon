@@ -3764,3 +3764,78 @@ pub fn katz_similarity(
 
     Ok(sim)
 }
+
+/// Find entities that haven't been updated recently but have many connections,
+/// indicating potentially stale high-value knowledge that should be re-crawled.
+/// Returns (entity_id, name, degree, days_since_update) sorted by staleness × degree.
+pub fn stale_high_value_entities(
+    brain: &Brain,
+    min_degree: usize,
+    max_results: usize,
+) -> Result<Vec<(i64, String, usize, i64)>, rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let relations = brain.all_relations()?;
+
+    // Build degree map
+    let mut degree: HashMap<i64, usize> = HashMap::new();
+    for r in &relations {
+        *degree.entry(r.subject_id).or_insert(0) += 1;
+        *degree.entry(r.object_id).or_insert(0) += 1;
+    }
+
+    let now = chrono::Utc::now().naive_utc();
+    let mut results: Vec<(i64, String, usize, i64)> = Vec::new();
+
+    for e in &entities {
+        let deg = degree.get(&e.id).copied().unwrap_or(0);
+        if deg < min_degree {
+            continue;
+        }
+        let days_stale = (now - e.last_seen).num_days();
+        if days_stale > 0 {
+            results.push((e.id, e.name.clone(), deg, days_stale));
+        }
+    }
+
+    // Sort by staleness × degree (descending) — high-value stale entities first
+    results.sort_by(|a, b| {
+        let score_a = a.2 as i64 * a.3;
+        let score_b = b.2 as i64 * b.3;
+        score_b.cmp(&score_a)
+    });
+    results.truncate(max_results);
+    Ok(results)
+}
+
+/// Compute predicate diversity score for the graph.
+/// Higher scores indicate a healthier, more diverse knowledge graph.
+/// Returns (num_unique_predicates, shannon_entropy, dominance_ratio).
+pub fn predicate_diversity(brain: &Brain) -> Result<(usize, f64, f64), rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let total = relations.len() as f64;
+    if total == 0.0 {
+        return Ok((0, 0.0, 0.0));
+    }
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for r in &relations {
+        *counts.entry(r.predicate.clone()).or_insert(0) += 1;
+    }
+
+    let num_unique = counts.len();
+    let mut entropy = 0.0_f64;
+    let mut max_count = 0usize;
+
+    for &count in counts.values() {
+        let p = count as f64 / total;
+        if p > 0.0 {
+            entropy -= p * p.ln();
+        }
+        if count > max_count {
+            max_count = count;
+        }
+    }
+
+    let dominance = max_count as f64 / total;
+    Ok((num_unique, entropy, dominance))
+}

@@ -5184,6 +5184,32 @@ impl<'a> Prometheus<'a> {
                 continue;
             }
 
+            // Age-based stale rejection: hypotheses stuck in testing for >48 hours
+            // without accumulating evidence are likely noise. Reject low-confidence
+            // stale hypotheses; promote high-confidence ones that haven't been
+            // contradicted.
+            if let Ok(discovered) =
+                chrono::NaiveDateTime::parse_from_str(&h.discovered_at, "%Y-%m-%d %H:%M:%S")
+            {
+                let now = chrono::Utc::now().naive_utc();
+                let age_hours = (now - discovered).num_hours();
+                if age_hours >= 48 {
+                    if h.confidence < 0.55 {
+                        // Low-confidence and stale — reject
+                        self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                        self.record_outcome(&h.pattern_source, false)?;
+                        rejected += 1;
+                        continue;
+                    } else if age_hours >= 96 && h.confidence < 0.65 {
+                        // Even moderate confidence — reject after 4 days
+                        self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                        self.record_outcome(&h.pattern_source, false)?;
+                        rejected += 1;
+                        continue;
+                    }
+                }
+            }
+
             // Check if a path exists between subject and object (evidence of relation)
             if h.object != "?" {
                 // Reject single-word fragment pairs (NLP noise like "Grace" → "Hopper")
