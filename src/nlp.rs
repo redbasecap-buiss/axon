@@ -2760,6 +2760,24 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "uranoscopia",
     "mechanik",
     "netflix",
+    // Added 2026-02-24 (cron): more generic words from DB cleanup
+    "reduce",
+    "gauge",
+    "dipole",
+    "prose",
+    "ultra",
+    "either",
+    "stormy",
+    "artist",
+    "narrow",
+    "right",
+    "bound",
+    "color",
+    "minute",
+    "jewish",
+    "giant",
+    "nobody",
+    "essai",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -4337,6 +4355,15 @@ fn classify_entity_type(name: &str) -> &'static str {
         "aegospotamos",
         "ahobamba",
         "ailana",
+        // Added 2026-02-24 (cron): places from DB reclassification
+        "vistula",
+        "lintao",
+        "jersey",
+        "muscat",
+        "gospić",
+        "fayum",
+        "zeitun",
+        "magog",
     ];
     if !lower.contains(' ') && KNOWN_PLACES.contains(&lower.as_str()) {
         return "place";
@@ -4506,6 +4533,33 @@ fn classify_entity_type(name: &str) -> &'static str {
         "ackermann",
         "agathoclea",
         "akashdeep",
+        // Added 2026-02-24 (cron): persons from DB reclassification
+        "pompey",
+        "putnam",
+        "lamarck",
+        "colbert",
+        "bullock",
+        "shelah",
+        "tannaka",
+        "kershaw",
+        "mazower",
+        "pietsch",
+        "gefter",
+        "coullet",
+        "udwadia",
+        "minsky",
+        "barak",
+        "pucci",
+        "kummer",
+        "debray",
+        "lovell",
+        "cormen",
+        "vogel",
+        "borel",
+        "munch",
+        "loczy",
+        "stoney",
+        "bivar",
     ];
     if !lower.contains(' ') && KNOWN_PERSONS.contains(&lower.as_str()) {
         return "person";

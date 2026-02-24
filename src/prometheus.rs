@@ -4256,6 +4256,7 @@ impl<'a> Prometheus<'a> {
             pass_merges += self.purge_fragment_islands().unwrap_or(0);
             pass_merges += self.prefix_strip_island_merge().unwrap_or(0);
             pass_merges += self.merge_name_variants().unwrap_or(0);
+            pass_merges += self.merge_abbreviation_variants().unwrap_or(0);
             pass_merges += self.aggressive_prefix_dedup().unwrap_or(0);
             pass_merges += self.merge_high_confidence_prefix_variants().unwrap_or(0);
             pass_merges += self.dissolve_name_fragment_hubs().unwrap_or(0);
@@ -4266,6 +4267,9 @@ impl<'a> Prometheus<'a> {
             }
             convergence_merges += pass_merges;
         }
+
+        // Merge abbreviation variants (St→Saint, Mt→Mount, etc.)
+        let abbreviation_merged = self.merge_abbreviation_variants().unwrap_or(0);
 
         // Merge connected entities where one name contains the other
         let containment_merged = self.merge_connected_containment().unwrap_or(0);
@@ -4413,7 +4417,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -4485,6 +4489,7 @@ impl<'a> Prometheus<'a> {
             country_concat_fixed,
             prefix_noise_merged,
             reversed_names_merged,
+            abbreviation_merged,
             concat_noise_purged,
             token_reconnected,
             name_containment_reconnected,
@@ -6198,11 +6203,12 @@ impl<'a> Prometheus<'a> {
             .collect();
 
         // Build word sets for each entity (lowercase, skip tiny words)
+        // Normalize abbreviations first so "St Gotthard" matches "Saint Gotthard"
         let word_sets: Vec<(i64, &str, &str, HashSet<String>)> = meaningful
             .iter()
             .map(|e| {
-                let words: HashSet<String> = e
-                    .name
+                let normalized = normalize_abbreviations(&e.name);
+                let words: HashSet<String> = normalized
                     .to_lowercase()
                     .split_whitespace()
                     .filter(|w| w.len() >= 3)
@@ -8393,6 +8399,68 @@ impl<'a> Prometheus<'a> {
                 }
             }
         }
+        Ok(merged)
+    }
+
+    /// Merge abbreviation variants: "St Gotthard Pass" → "Saint Gotthard Pass", etc.
+    /// Normalizes common abbreviations and merges into the canonical (longer) form.
+    pub fn merge_abbreviation_variants(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Build normalized_name → (id, name, degree) index
+        let mut norm_to_entities: HashMap<String, Vec<(i64, String, usize)>> = HashMap::new();
+        for e in &entities {
+            if is_noise_type(&e.entity_type) || is_noise_name(&e.name) {
+                continue;
+            }
+            let normalized = normalize_abbreviations(&e.name).to_lowercase();
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            norm_to_entities
+                .entry(normalized)
+                .or_default()
+                .push((e.id, e.name.clone(), deg));
+        }
+
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<i64> = HashSet::new();
+
+        for group in norm_to_entities.values() {
+            if group.len() < 2 {
+                continue;
+            }
+            // Find the canonical entity: prefer longer name (expanded form), then higher degree
+            let canonical = group
+                .iter()
+                .filter(|(id, _, _)| !absorbed.contains(id))
+                .max_by(|(_, name_a, deg_a), (_, name_b, deg_b)| {
+                    name_a.len().cmp(&name_b.len()).then(deg_a.cmp(deg_b))
+                });
+            if let Some((canon_id, canon_name, _)) = canonical {
+                for (eid, ename, _) in group {
+                    if eid == canon_id || absorbed.contains(eid) {
+                        continue;
+                    }
+                    // Only merge if names actually differ (not exact duplicates handled elsewhere)
+                    if ename.to_lowercase() == canon_name.to_lowercase() {
+                        continue;
+                    }
+                    eprintln!(
+                        "[PROMETHEUS] Abbreviation merge: '{}' → '{}'",
+                        ename, canon_name
+                    );
+                    self.brain.merge_entities(*eid, *canon_id)?;
+                    absorbed.insert(*eid);
+                    merged += 1;
+                }
+            }
+        }
+
         Ok(merged)
     }
 
@@ -17703,6 +17771,41 @@ fn is_common_english_word(lower: &str) -> bool {
         "accommodation",
     ];
     EXTRA_NOISE.contains(&lower)
+}
+
+/// Normalize common abbreviations in entity names for better fuzzy matching.
+/// Maps: St→Saint, Mt→Mount, Ft→Fort, Dr→Doctor, Prof→Professor, etc.
+fn normalize_abbreviations(name: &str) -> String {
+    let mappings: &[(&str, &str)] = &[
+        ("St ", "Saint "),
+        ("St. ", "Saint "),
+        ("Mt ", "Mount "),
+        ("Mt. ", "Mount "),
+        ("Ft ", "Fort "),
+        ("Ft. ", "Fort "),
+        ("Dr ", "Doctor "),
+        ("Dr. ", "Doctor "),
+        ("Prof ", "Professor "),
+        ("Prof. ", "Professor "),
+        ("Univ ", "University "),
+        ("Univ. ", "University "),
+        ("Inst ", "Institute "),
+        ("Inst. ", "Institute "),
+    ];
+    let mut result = name.to_string();
+    for (abbr, full) in mappings {
+        // Match at start of name or after space
+        if result.starts_with(abbr) {
+            result = format!("{}{}", full, &result[abbr.len()..]);
+        }
+        // Match after space
+        let space_abbr = format!(" {}", abbr);
+        let space_full = format!(" {}", full);
+        while result.contains(&space_abbr) {
+            result = result.replacen(&space_abbr, &space_full, 1);
+        }
+    }
+    result
 }
 
 fn now_str() -> String {

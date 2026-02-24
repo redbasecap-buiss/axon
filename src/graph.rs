@@ -4329,11 +4329,54 @@ pub fn graph_quality_score(brain: &Brain) -> Result<(f64, HashMap<String, f64>),
     let type_score = (type_entropy / 2.0).min(1.0);
     components.insert("type_diversity".to_string(), type_score);
 
-    // Weighted composite
-    let quality = 0.30 * connectivity
-        + 0.25 * density_score
-        + 0.20 * frag_score
-        + 0.15 * pred_score
+    // 6. Predicate balance (Gini coefficient — 0=equal, 1=one predicate dominates)
+    //    We use 1.0 - gini so higher = better balanced
+    let pred_balance = {
+        let mut pred_counts: Vec<f64> = relations
+            .iter()
+            .fold(HashMap::<String, usize>::new(), |mut acc, r| {
+                *acc.entry(r.predicate.clone()).or_insert(0) += 1;
+                acc
+            })
+            .values()
+            .map(|&c| c as f64)
+            .collect();
+        pred_counts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let k = pred_counts.len() as f64;
+        if k > 1.0 {
+            let total: f64 = pred_counts.iter().sum();
+            let weighted_sum: f64 = pred_counts
+                .iter()
+                .enumerate()
+                .map(|(i, x)| (i as f64 + 1.0) * x)
+                .sum();
+            let gini = (2.0 * weighted_sum) / (k * total) - (k + 1.0) / k;
+            1.0 - gini.clamp(0.0, 1.0)
+        } else {
+            0.0 // single predicate = no balance
+        }
+    };
+    components.insert("predicate_balance".to_string(), pred_balance);
+
+    // 7. Largest component ratio (how much of the graph is in the main component)
+    let lc_ratio = {
+        let comps = connected_components(brain).unwrap_or_default();
+        let biggest = comps.iter().map(|c| c.len()).max().unwrap_or(0) as f64;
+        if n > 0 {
+            biggest / n as f64
+        } else {
+            0.0
+        }
+    };
+    components.insert("largest_component_ratio".to_string(), lc_ratio);
+
+    // Weighted composite (rebalanced to include new metrics)
+    let quality = 0.25 * connectivity
+        + 0.20 * density_score
+        + 0.15 * frag_score
+        + 0.10 * pred_score
+        + 0.10 * pred_balance
+        + 0.10 * lc_ratio
         + 0.10 * type_score;
 
     components.insert("overall".to_string(), quality);
