@@ -2657,6 +2657,40 @@ impl<'a> Prometheus<'a> {
             }
         }
 
+        // Entity degree signal: hypotheses linking well-connected entities
+        // are more trustworthy than those linking peripheral ones.
+        if hypothesis.object != "?" {
+            if let (Some(s_ent), Some(o_ent)) = (
+                self.brain.get_entity_by_name(&hypothesis.subject)?,
+                self.brain.get_entity_by_name(&hypothesis.object)?,
+            ) {
+                let s_deg: i64 = self.brain.with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM relations WHERE subject_id = ?1 OR object_id = ?1",
+                        params![s_ent.id],
+                        |row| row.get(0),
+                    )
+                })?;
+                let o_deg: i64 = self.brain.with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM relations WHERE subject_id = ?1 OR object_id = ?1",
+                        params![o_ent.id],
+                        |row| row.get(0),
+                    )
+                })?;
+                let min_deg = s_deg.min(o_deg);
+                if min_deg >= 5 {
+                    // Both entities are well-connected — more reliable hypothesis
+                    score += 0.08;
+                } else if min_deg >= 2 {
+                    score += 0.03;
+                } else if min_deg == 0 {
+                    // One entity is isolated — hypothesis is speculative
+                    score -= 0.05;
+                }
+            }
+        }
+
         // Apply pattern weight
         let weight = self.get_pattern_weight(&hypothesis.pattern_source)?;
         score *= weight;
@@ -2955,6 +2989,26 @@ impl<'a> Prometheus<'a> {
                         h.subject, s_ent.entity_type, h.predicate, h.object, o_ent.entity_type
                     ));
                     h.confidence = (h.confidence - 0.2).max(0.0);
+                }
+            }
+        }
+
+        // Staleness penalty: entities not seen recently are less reliable subjects
+        if h.object != "?" {
+            if let (Some(s_ent), Some(o_ent)) = (
+                self.brain.get_entity_by_name(&h.subject)?,
+                self.brain.get_entity_by_name(&h.object)?,
+            ) {
+                let now = Utc::now().naive_utc();
+                let s_age_days = (now - s_ent.last_seen).num_days();
+                let o_age_days = (now - o_ent.last_seen).num_days();
+                let max_age = s_age_days.max(o_age_days);
+                if max_age > 90 {
+                    h.evidence_against
+                        .push(format!("Entity staleness: {}d since last seen", max_age));
+                    h.confidence = (h.confidence - 0.08).max(0.0);
+                } else if max_age > 30 {
+                    h.confidence = (h.confidence - 0.03).max(0.0);
                 }
             }
         }

@@ -3935,3 +3935,83 @@ pub fn community_disagreement(brain: &Brain) -> Result<Vec<(i64, usize, usize)>,
     disagreements.truncate(200);
     Ok(disagreements)
 }
+
+/// Ego-network density: for a given entity, compute the density of connections
+/// among its immediate neighbors. High ego density = tightly-knit neighborhood
+/// (strong community signal). Low ego density = entity bridges sparse clusters.
+/// Returns (density, neighbor_count, edges_among_neighbors).
+pub fn ego_network_density(
+    brain: &Brain,
+    entity_id: i64,
+) -> Result<(f64, usize, usize), rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let neighbors: HashSet<i64> = adj
+        .get(&entity_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let n = neighbors.len();
+    if n < 2 {
+        return Ok((0.0, n, 0));
+    }
+    let mut edges = 0usize;
+    let neighbor_vec: Vec<i64> = neighbors.iter().copied().collect();
+    for i in 0..neighbor_vec.len() {
+        if let Some(adj_i) = adj.get(&neighbor_vec[i]) {
+            for j in (i + 1)..neighbor_vec.len() {
+                if adj_i.contains(&neighbor_vec[j]) {
+                    edges += 1;
+                }
+            }
+        }
+    }
+    let max_edges = n * (n - 1) / 2;
+    let density = if max_edges > 0 {
+        edges as f64 / max_edges as f64
+    } else {
+        0.0
+    };
+    Ok((density, n, edges))
+}
+
+/// Batch ego-network density for multiple entities. Returns map of entity_id → density.
+/// More efficient than calling ego_network_density individually since adjacency is built once.
+pub fn batch_ego_density(
+    brain: &Brain,
+    entity_ids: &[i64],
+) -> Result<HashMap<i64, f64>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let mut result = HashMap::new();
+    for &eid in entity_ids {
+        let neighbors: Vec<i64> = adj
+            .get(&eid)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let n = neighbors.len();
+        if n < 2 {
+            result.insert(eid, 0.0);
+            continue;
+        }
+        let mut edges = 0usize;
+        for i in 0..neighbors.len() {
+            if let Some(adj_i) = adj.get(&neighbors[i]) {
+                for j in (i + 1)..neighbors.len() {
+                    if adj_i.contains(&neighbors[j]) {
+                        edges += 1;
+                    }
+                }
+            }
+        }
+        let max_edges = n * (n - 1) / 2;
+        let density = if max_edges > 0 {
+            edges as f64 / max_edges as f64
+        } else {
+            0.0
+        };
+        result.insert(eid, density);
+    }
+    Ok(result)
+}

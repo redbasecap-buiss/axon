@@ -2694,6 +2694,15 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "thirteenth",
     "goldhill",
     "westwood",
+    // Added 2026-02-25 round 2: more noise from DB cleanup
+    "hegemon",
+    "emission",
+    "graphen",
+    "locustella",
+    "gleichmässig",
+    "wertschöpfung",
+    "antinomien",
+    "mathesi",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -4158,6 +4167,20 @@ fn classify_entity_type(name: &str) -> &'static str {
         "machupicchu",
         "kurkut",
         "neuquén",
+        // Added 2026-02-25 round 2: more places from DB reclassification
+        "polotsk",
+        "etruria",
+        "hyphasis",
+        "yarkand",
+        "norpatagonia",
+        "gotland",
+        "mauguio",
+        "demerara",
+        "patavium",
+        "wuchang",
+        "chillán",
+        "chivirkuy",
+        "edgerton",
     ];
     if !lower.contains(' ') && KNOWN_PLACES.contains(&lower.as_str()) {
         return "place";
@@ -4244,6 +4267,18 @@ fn classify_entity_type(name: &str) -> &'static str {
         "thorgest",
         "mithridates",
         "phaedra",
+        // Added 2026-02-25 round 2: more persons from DB reclassification
+        "sorghaghtani",
+        "ottaviani",
+        "górecki",
+        "gagarin",
+        "guralnik",
+        "kitsikis",
+        "radukovskii",
+        "sheehan",
+        "apastamba",
+        "nicolet",
+        "haspar",
     ];
     if !lower.contains(' ') && KNOWN_PERSONS.contains(&lower.as_str()) {
         return "person";
@@ -4431,6 +4466,8 @@ fn classify_entity_type(name: &str) -> &'static str {
         "weg",
         "bahnhof",
         "hauptbahnhof",
+        "friedhof",
+        "horn",
     ];
     if !lower.contains(' ') && lower.len() > 6 {
         if GERMAN_PLACE_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
@@ -4452,6 +4489,16 @@ fn classify_entity_type(name: &str) -> &'static str {
                 "sandberg",
                 "kirchhoff",
                 "kirchner",
+                "waghorn",
+                "blinkhorn",
+                "longhorn",
+                "elkhorn",
+                "buckhorn",
+                "leghorn",
+                "inkhorn",
+                "foghorn",
+                "alphorn",
+                "flügelhorn",
             ];
             if !PERSON_EXCEPTIONS.contains(&lower.as_str()) {
                 return "place";
