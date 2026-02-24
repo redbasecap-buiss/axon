@@ -2421,16 +2421,20 @@ impl<'a> Prometheus<'a> {
                 }
 
                 // Source co-occurrence: both entities appear in the same source URL
-                let s_sources: HashSet<String> = self.brain.get_source_urls_for(s_ent.id)?
-                    .into_iter().collect();
-                let o_sources: HashSet<String> = self.brain.get_source_urls_for(o_ent.id)?
-                    .into_iter().collect();
+                let s_sources: HashSet<String> = self
+                    .brain
+                    .get_source_urls_for(s_ent.id)?
+                    .into_iter()
+                    .collect();
+                let o_sources: HashSet<String> = self
+                    .brain
+                    .get_source_urls_for(o_ent.id)?
+                    .into_iter()
+                    .collect();
                 let shared_sources = s_sources.intersection(&o_sources).count();
                 if shared_sources >= 1 {
-                    h.evidence_for.push(format!(
-                        "Co-occur in {} source URL(s)",
-                        shared_sources
-                    ));
+                    h.evidence_for
+                        .push(format!("Co-occur in {} source URL(s)", shared_sources));
                     h.confidence = (h.confidence + 0.03 * shared_sources as f64).min(1.0);
                 }
             }
