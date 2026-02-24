@@ -5314,6 +5314,53 @@ pub fn structural_similarity_pairs(
 /// Graph evolution rate: compare recent snapshots to measure growth velocity.
 /// Returns (entity_growth_rate, relation_growth_rate, density_trend) per day.
 /// Snapshot tuple: (taken_at, entities, relations, components, largest_pct, avg_degree, isolated, density, frag, modularity)
+/// Detect predicate synonyms by co-occurrence: predicates that connect
+/// the same entity pairs are likely synonymous (e.g. "founded" / "established").
+/// Returns pairs of (pred_a, pred_b, overlap_count, similarity_score).
+pub fn predicate_synonyms(
+    brain: &Brain,
+    min_overlap: usize,
+) -> Result<Vec<(String, String, usize, f64)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+
+    // Build predicate → set of (subject_id, object_id) pairs
+    let mut pred_pairs: HashMap<String, HashSet<(i64, i64)>> = HashMap::new();
+    for r in &relations {
+        pred_pairs
+            .entry(r.predicate.clone())
+            .or_default()
+            .insert((r.subject_id, r.object_id));
+    }
+
+    // Only consider predicates with ≥3 instances (skip singletons)
+    let preds: Vec<(String, HashSet<(i64, i64)>)> = pred_pairs
+        .into_iter()
+        .filter(|(_, pairs)| pairs.len() >= 3)
+        .collect();
+
+    let mut results = Vec::new();
+    for i in 0..preds.len() {
+        for j in (i + 1)..preds.len() {
+            let overlap = preds[i].1.intersection(&preds[j].1).count();
+            if overlap < min_overlap {
+                continue;
+            }
+            let union = preds[i].1.union(&preds[j].1).count();
+            let sim = if union > 0 {
+                overlap as f64 / union as f64
+            } else {
+                0.0
+            };
+            if sim >= 0.3 {
+                results.push((preds[i].0.clone(), preds[j].0.clone(), overlap, sim));
+            }
+        }
+    }
+    results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(50);
+    Ok(results)
+}
+
 pub fn graph_evolution_rate(brain: &Brain) -> Result<(f64, f64, f64), rusqlite::Error> {
     let snapshots = get_graph_snapshots(brain, 10)?;
     if snapshots.len() < 2 {

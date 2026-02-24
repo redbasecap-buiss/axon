@@ -845,6 +845,19 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "poblamiento",
     "bioinformatics",
     "mathematika",
+    // Added 2026-02-24 (brain cleaner round 5)
+    "temperature",
+    "harmonic",
+    "supersonic",
+    "attosecond",
+    "telegraph",
+    "niemand",
+    "hermanos",
+    "campéon",
+    "issues",
+    "ballistics",
+    "computation",
+    "admiralty",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -3200,6 +3213,17 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "autumn",
     "yeast",
     "attempt",
+    // Added 2026-02-24 (brain cleaner round 5)
+    "celebrity",
+    "formulas",
+    "harmonic",
+    "supersonic",
+    "attosecond",
+    "telegraph",
+    "temperature",
+    "computation",
+    "ballistics",
+    "admiralty",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -4906,6 +4930,11 @@ fn classify_entity_type(name: &str) -> &'static str {
         "pedropunt",
         "talayata",
         "whitsunday",
+        // Added 2026-02-24 (brain cleaner round 5)
+        "cyrenaica",
+        "tuscany",
+        "rosaspata",
+        "samnium",
     ];
     if !lower.contains(' ') && KNOWN_PLACES.contains(&lower.as_str()) {
         return "place";
@@ -5183,6 +5212,21 @@ fn classify_entity_type(name: &str) -> &'static str {
         "curtius",
         "dummett",
         "mackinnon",
+        // Added 2026-02-24 (brain cleaner round 5)
+        "blanton",
+        "papademetriou",
+        "albers",
+        "horrocks",
+        "englert",
+        "mcclusky",
+        "ostergård",
+        "leyzorek",
+        "barthold",
+        "ruffini",
+        "kolmogorov",
+        "harden",
+        "tiberius",
+        "augustus",
     ];
     if !lower.contains(' ') && KNOWN_PERSONS.contains(&lower.as_str()) {
         return "person";

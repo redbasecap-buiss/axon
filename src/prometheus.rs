@@ -3126,6 +3126,38 @@ impl<'a> Prometheus<'a> {
             }
         }
 
+        // Cross-pattern corroboration: if other hypotheses from different
+        // pattern sources proposed the same (subject, predicate, object) triple,
+        // that's independent evidence — boost confidence proportional to the
+        // number of corroborating sources.
+        if h.object != "?" && h.id > 0 {
+            let corroborating: usize = self
+                .brain
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(DISTINCT pattern_source) FROM hypotheses
+                     WHERE subject = ?1 AND predicate = ?2 AND object = ?3
+                     AND id != ?4 AND pattern_source != ?5",
+                        params![h.subject, h.predicate, h.object, h.id, h.pattern_source],
+                        |row| row.get(0),
+                    )
+                })
+                .unwrap_or(0);
+            if corroborating >= 2 {
+                h.evidence_for.push(format!(
+                    "Cross-pattern corroboration: {} independent pattern sources agree",
+                    corroborating
+                ));
+                apply_boost(&mut total_boost, 0.12);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            } else if corroborating == 1 {
+                h.evidence_for
+                    .push("Cross-pattern corroboration: 1 independent source agrees".to_string());
+                apply_boost(&mut total_boost, 0.06);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            }
+        }
+
         // Update status based on confidence (use defined thresholds)
         let was_confirmed = h.status == HypothesisStatus::Confirmed;
         if h.confidence >= CONFIRMATION_THRESHOLD {
@@ -7997,8 +8029,8 @@ impl<'a> Prometheus<'a> {
                 } else {
                     0.0
                 };
-                if jaccard < 0.15 {
-                    continue; // Require meaningful overlap ratio
+                if jaccard < 0.30 {
+                    continue; // Require strong overlap ratio (raised from 0.15 to reduce 85% rejection rate)
                 }
 
                 // Infer predicate from shared neighbors' edge labels
@@ -11287,9 +11319,9 @@ impl<'a> Prometheus<'a> {
                         continue;
                     }
                     let jaccard = shared as f64 / total as f64;
-                    // Tighter thresholds: need high overlap (>=0.6) and at least 4 shared predicates
-                    // to reduce noise — this strategy had only ~10% confirmation rate with looser thresholds
-                    if jaccard < 0.6 || shared < 4 {
+                    // Tighter thresholds: need high overlap (>=0.65) and at least 5 shared predicates
+                    // to reduce noise — this strategy had only ~4% confirmation rate with looser thresholds
+                    if jaccard < 0.65 || shared < 5 {
                         continue;
                     }
 
