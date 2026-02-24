@@ -2385,6 +2385,8 @@ impl<'a> Prometheus<'a> {
             "triadic_closure",
             "near_miss",
             "semantic_fingerprint",
+            "rising_star",
+            "preferential_attachment",
         ];
         let skip_neighbor_boost = NEIGHBOR_BASED_STRATEGIES.contains(&h.pattern_source.as_str());
 
@@ -2603,10 +2605,14 @@ impl<'a> Prometheus<'a> {
             // Too few data points — use base confidence
             return Ok(base);
         }
-        // Bayesian blend: shift base toward observed weight
-        let alpha = (total_observations as f64 / (total_observations as f64 + 10.0)).min(0.7);
+        // Bayesian blend: shift base toward observed weight.
+        // Cap alpha at 0.5 and ensure a floor of base*0.4 so strategies
+        // can recover from death spirals (validation can still boost them).
+        let alpha = (total_observations as f64 / (total_observations as f64 + 20.0)).min(0.5);
         let calibrated = base * (1.0 - alpha) + weight * alpha;
-        Ok(calibrated.clamp(0.05, 0.95))
+        // Floor: never suppress below 40% of base confidence
+        let floor = base * 0.4;
+        Ok(calibrated.max(floor).clamp(0.05, 0.95))
     }
 
     /// Deduplicate hypotheses by entity pair: if multiple hypotheses exist about
@@ -3288,6 +3294,17 @@ impl<'a> Prometheus<'a> {
                 pa_hyps.len()
             );
             all_hypotheses.extend(pa_hyps);
+        }
+
+        // 2r. Isolated entity connector (reduce fragmentation)
+        let ic_weight = self.get_pattern_weight("isolated_connector")?;
+        if ic_weight >= 0.05 {
+            let ic_hyps = self.generate_hypotheses_from_isolated_connector()?;
+            eprintln!(
+                "[PROMETHEUS] isolated_connector: {} hypotheses",
+                ic_hyps.len()
+            );
+            all_hypotheses.extend(ic_hyps);
         }
 
         // 2q. Katz similarity link prediction (multi-hop path-based)
@@ -9197,8 +9214,14 @@ impl<'a> Prometheus<'a> {
                 continue;
             }
             // Require at least 1 shared neighbor to reduce false positives
-            let a_nbrs: HashSet<i64> = adj.get(a).map(|v| v.iter().copied().collect()).unwrap_or_default();
-            let b_nbrs: HashSet<i64> = adj.get(b).map(|v| v.iter().copied().collect()).unwrap_or_default();
+            let a_nbrs: HashSet<i64> = adj
+                .get(a)
+                .map(|v| v.iter().copied().collect())
+                .unwrap_or_default();
+            let b_nbrs: HashSet<i64> = adj
+                .get(b)
+                .map(|v| v.iter().copied().collect())
+                .unwrap_or_default();
             let shared_neighbors = a_nbrs.intersection(&b_nbrs).count();
             if shared_neighbors == 0 {
                 continue;
@@ -9340,8 +9363,8 @@ impl<'a> Prometheus<'a> {
                         continue;
                     }
                     let jaccard = shared as f64 / total as f64;
-                    // Need high overlap (>=0.5) and at least 2 shared predicates
-                    if jaccard < 0.4 || shared < 2 {
+                    // Need high overlap (>=0.5) and at least 3 shared predicates
+                    if jaccard < 0.5 || shared < 3 {
                         continue;
                     }
 
@@ -9441,6 +9464,165 @@ impl<'a> Prometheus<'a> {
                         }
                     }
                 }
+            }
+        }
+        hypotheses.truncate(30);
+        Ok(hypotheses)
+    }
+
+    /// Isolated entity connector: find high-value isolated entities (no relations)
+    /// and connect them to the graph via shared facts (same key-value pairs)
+    /// or name substring matching with existing connected entities.
+    /// Targets the 4600+ isolated nodes to reduce graph fragmentation.
+    pub fn generate_hypotheses_from_isolated_connector(&self) -> Result<Vec<Hypothesis>> {
+        let entities = self.brain.all_entities()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let relations = self.brain.all_relations()?;
+
+        // Find connected entity IDs
+        let mut connected_ids: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected_ids.insert(r.subject_id);
+            connected_ids.insert(r.object_id);
+        }
+
+        // Find isolated high-value entities
+        let isolated: Vec<&crate::db::Entity> = entities
+            .iter()
+            .filter(|e| {
+                !connected_ids.contains(&e.id)
+                    && meaningful.contains(&e.id)
+                    && !is_noise_name(&e.name)
+                    && !is_noise_type(&e.entity_type)
+                    && HIGH_VALUE_TYPES.contains(&e.entity_type.as_str())
+            })
+            .take(200) // sample
+            .collect();
+
+        if isolated.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build fact index: (key, value) → list of entity_ids
+        let mut fact_index: HashMap<(String, String), Vec<i64>> = HashMap::new();
+        // Only index connected entities' facts for matching targets
+        for &eid in &connected_ids {
+            if !meaningful.contains(&eid) {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(eid)?;
+            for f in facts {
+                if f.key != "mention_count" && f.key != "url" && f.confidence >= 0.5 {
+                    fact_index
+                        .entry((f.key.clone(), f.value.to_lowercase()))
+                        .or_default()
+                        .push(eid);
+                }
+            }
+        }
+
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        let mut hypotheses = Vec::new();
+        let mut seen_pairs: HashSet<(i64, i64)> = HashSet::new();
+
+        for iso in &isolated {
+            if hypotheses.len() >= 40 {
+                break;
+            }
+            let iso_facts = self.brain.get_facts_for(iso.id)?;
+
+            // Find connected entities sharing fact key-value pairs
+            let mut candidates: HashMap<i64, Vec<String>> = HashMap::new();
+            for f in &iso_facts {
+                if f.key == "mention_count" || f.key == "url" || f.confidence < 0.5 {
+                    continue;
+                }
+                let key = (f.key.clone(), f.value.to_lowercase());
+                if let Some(matches) = fact_index.get(&key) {
+                    for &match_id in matches {
+                        if match_id == iso.id {
+                            continue;
+                        }
+                        let pair = if iso.id < match_id {
+                            (iso.id, match_id)
+                        } else {
+                            (match_id, iso.id)
+                        };
+                        if seen_pairs.contains(&pair) {
+                            continue;
+                        }
+                        candidates
+                            .entry(match_id)
+                            .or_default()
+                            .push(format!("{}={}", f.key, f.value));
+                    }
+                }
+            }
+
+            // Only consider candidates with at least 2 shared facts
+            for (cand_id, shared_facts) in &candidates {
+                if shared_facts.len() < 2 {
+                    continue;
+                }
+                let pair = if iso.id < *cand_id {
+                    (iso.id, *cand_id)
+                } else {
+                    (*cand_id, iso.id)
+                };
+                if !seen_pairs.insert(pair) {
+                    continue;
+                }
+                let cand_name = id_name.get(cand_id).copied().unwrap_or("?");
+                let cand_type = id_type.get(cand_id).copied().unwrap_or("unknown");
+                if is_noise_name(cand_name) {
+                    continue;
+                }
+
+                let predicate = infer_predicate(&iso.entity_type, cand_type, None);
+                let base_conf = (0.4 + shared_facts.len() as f64 * 0.1).min(0.80);
+                let confidence = self
+                    .calibrated_confidence("isolated_connector", base_conf)
+                    .unwrap_or(base_conf);
+
+                hypotheses.push(Hypothesis {
+                    id: 0,
+                    subject: iso.name.clone(),
+                    predicate: predicate.to_string(),
+                    object: cand_name.to_string(),
+                    confidence,
+                    evidence_for: vec![
+                        format!(
+                            "Isolated entity {} shares {} facts with connected entity {}",
+                            iso.name,
+                            shared_facts.len(),
+                            cand_name
+                        ),
+                        format!("Shared facts: {}", shared_facts.join(", ")),
+                    ],
+                    evidence_against: vec![],
+                    reasoning_chain: vec![
+                        format!(
+                            "{} ({}) is isolated (no relations) but has matching facts",
+                            iso.name, iso.entity_type
+                        ),
+                        format!(
+                            "{} ({}) shares {} fact key-value pairs",
+                            cand_name,
+                            cand_type,
+                            shared_facts.len()
+                        ),
+                        "Fact similarity suggests a real-world connection".to_string(),
+                    ],
+                    status: HypothesisStatus::Proposed,
+                    discovered_at: now_str(),
+                    pattern_source: "isolated_connector".to_string(),
+                });
             }
         }
         hypotheses.truncate(30);
@@ -12353,26 +12535,77 @@ impl<'a> Prometheus<'a> {
 
             // 8. Non-name suffixes: "Weather Forecast", "Birth Rate", "Time Zone", etc.
             let nonname_suffixes: HashSet<&str> = [
-                "forecast", "report", "rate", "zone", "index", "ratio",
-                "average", "estimate", "survey", "census", "registry",
-                "catalogue", "catalog", "inventory", "listing", "schedule",
-                "brief", "briefe", "bericht", "berichte", "verzeichnis",
-                "übersicht", "tabelle", "protokoll",
-            ].into_iter().collect();
-            let ends_nonname_suffix = words.last()
+                "forecast",
+                "report",
+                "rate",
+                "zone",
+                "index",
+                "ratio",
+                "average",
+                "estimate",
+                "survey",
+                "census",
+                "registry",
+                "catalogue",
+                "catalog",
+                "inventory",
+                "listing",
+                "schedule",
+                "brief",
+                "briefe",
+                "bericht",
+                "berichte",
+                "verzeichnis",
+                "übersicht",
+                "tabelle",
+                "protokoll",
+            ]
+            .into_iter()
+            .collect();
+            let ends_nonname_suffix = words
+                .last()
                 .is_some_and(|w| nonname_suffixes.contains(w.to_lowercase().as_str()));
 
             // 9. Latin/German document title patterns (multi-word, all capitalized, non-name)
             let latin_doc_words: HashSet<&str> = [
-                "liber", "libri", "opus", "opera", "acta", "annales", "historia",
-                "rerum", "naturalis", "gestarum", "bellum", "civile",
-                "de", "re", "ad", "cum", "pro", "contra", "per", "sub",
-                "commentarii", "epistulae", "fragmenta", "collectanea",
-                "unbekannte", "gesammelte", "sämtliche", "ausgewählte",
-            ].into_iter().collect();
+                "liber",
+                "libri",
+                "opus",
+                "opera",
+                "acta",
+                "annales",
+                "historia",
+                "rerum",
+                "naturalis",
+                "gestarum",
+                "bellum",
+                "civile",
+                "de",
+                "re",
+                "ad",
+                "cum",
+                "pro",
+                "contra",
+                "per",
+                "sub",
+                "commentarii",
+                "epistulae",
+                "fragmenta",
+                "collectanea",
+                "unbekannte",
+                "gesammelte",
+                "sämtliche",
+                "ausgewählte",
+            ]
+            .into_iter()
+            .collect();
             let is_latin_doc = words.len() >= 2
                 && e.confidence < 0.7
-                && lower_words.iter().filter(|w| latin_doc_words.contains(w.as_str())).count() >= 2;
+                && lower_words
+                    .iter()
+                    .filter(|w| latin_doc_words.contains(w.as_str()))
+                    .count()
+                    >= 2;
 
             if has_concept_word
                 || has_place_word
@@ -12478,22 +12711,26 @@ impl<'a> Prometheus<'a> {
 
         // Geographic suffixes common in European place names (German, Swiss, Nordic, etc.)
         let geo_suffixes: &[&str] = &[
-            "brunnen", "berg", "burg", "burg", "stein", "wald", "feld", "dorf",
-            "bach", "bruck", "brücke", "hausen", "heim", "hofen", "kirchen",
-            "stadt", "stetten", "weil", "weiler", "wil", "ikon", "iken",
-            "ikon", "ach", "au", "ow", "in", "itz", "witz",
-            "grad", "gorod", "abad", "pur", "pura", "garh",
-            "fjord", "vik", "ness", "holm", "by", "lund",
-            "polis", "chester", "cester", "minster", "bury", "mouth",
-            "haven", "ford", "bridge", "land", "dale", "vale",
-            "ville", "bourg", "mont",
+            "brunnen", "berg", "burg", "burg", "stein", "wald", "feld", "dorf", "bach", "bruck",
+            "brücke", "hausen", "heim", "hofen", "kirchen", "stadt", "stetten", "weil", "weiler",
+            "wil", "ikon", "iken", "ikon", "ach", "au", "ow", "in", "itz", "witz", "grad", "gorod",
+            "abad", "pur", "pura", "garh", "fjord", "vik", "ness", "holm", "by", "lund", "polis",
+            "chester", "cester", "minster", "bury", "mouth", "haven", "ford", "bridge", "land",
+            "dale", "vale", "ville", "bourg", "mont",
         ];
 
         // Common standalone place-like single words (historical regions, geographic features)
         let standalone_places: HashSet<&str> = [
-            "placentia", "dertosa", "temeswar", "khwarezmia", "santillana",
-            "lauterbrunnen", "uetliberg",
-        ].into_iter().collect();
+            "placentia",
+            "dertosa",
+            "temeswar",
+            "khwarezmia",
+            "santillana",
+            "lauterbrunnen",
+            "uetliberg",
+        ]
+        .into_iter()
+        .collect();
 
         let mut reclassified = 0usize;
         for e in &entities {
