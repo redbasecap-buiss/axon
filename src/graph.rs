@@ -4283,3 +4283,60 @@ pub fn connectivity_evolution(
 
     Ok(result)
 }
+
+/// Composite graph quality score (0.0–1.0) combining connectivity, density,
+/// predicate diversity, and fragmentation metrics. Higher = healthier graph.
+pub fn graph_quality_score(brain: &Brain) -> Result<(f64, HashMap<String, f64>), rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let relations = brain.all_relations()?;
+    let n = entities.len();
+    if n == 0 {
+        return Ok((0.0, HashMap::new()));
+    }
+
+    let mut components = HashMap::new();
+
+    // 1. Connectivity ratio: fraction of entities with at least one relation
+    let mut connected: HashSet<i64> = HashSet::new();
+    for r in &relations {
+        connected.insert(r.subject_id);
+        connected.insert(r.object_id);
+    }
+    let connectivity = connected.len() as f64 / n as f64;
+    components.insert("connectivity".to_string(), connectivity);
+
+    // 2. Density score: avg_degree normalized (target: 3.0 avg degree = 1.0)
+    let avg_degree = if n > 0 {
+        (2.0 * relations.len() as f64) / n as f64
+    } else {
+        0.0
+    };
+    let density_score = (avg_degree / 3.0).min(1.0);
+    components.insert("density".to_string(), density_score);
+
+    // 3. Fragmentation penalty: 1.0 - fragmentation
+    let frag = fragmentation_score(brain).unwrap_or(1.0);
+    let frag_score = 1.0 - frag;
+    components.insert("cohesion".to_string(), frag_score);
+
+    // 4. Predicate diversity: entropy of predicate usage (target: 3.0 bits = 1.0)
+    let pred_entropy = predicate_entropy(brain).map(|(e, _, _)| e).unwrap_or(0.0);
+    let pred_score = (pred_entropy / 3.0).min(1.0);
+    components.insert("predicate_diversity".to_string(), pred_score);
+
+    // 5. Type diversity: entropy of entity types (target: 2.0 bits = 1.0)
+    let type_entropy = type_entropy(brain).map(|(e, _, _, _)| e).unwrap_or(0.0);
+    let type_score = (type_entropy / 2.0).min(1.0);
+    components.insert("type_diversity".to_string(), type_score);
+
+    // Weighted composite
+    let quality = 0.30 * connectivity
+        + 0.25 * density_score
+        + 0.20 * frag_score
+        + 0.15 * pred_score
+        + 0.10 * type_score;
+
+    components.insert("overall".to_string(), quality);
+
+    Ok((quality, components))
+}

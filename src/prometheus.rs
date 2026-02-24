@@ -4367,6 +4367,10 @@ impl<'a> Prometheus<'a> {
         // Save graph snapshot for trend tracking
         let _snapshot_id = crate::graph::save_graph_snapshot(self.brain).unwrap_or(0);
 
+        // Graph quality score
+        let (quality_score, quality_components) =
+            crate::graph::graph_quality_score(self.brain).unwrap_or((0.0, HashMap::new()));
+
         // Track discovery velocity
         let _ = self.track_discovery_velocity(
             all_patterns.len(),
@@ -4526,7 +4530,22 @@ impl<'a> Prometheus<'a> {
                 )
             })
             .unwrap_or_default();
-        let summary = format!("{}{}{}", summary, health_line, diversity_line);
+        let quality_line = format!(
+            ", quality: {:.1}% (conn:{:.0}% dens:{:.0}% coh:{:.0}% pred:{:.0}% type:{:.0}%)",
+            quality_score * 100.0,
+            quality_components.get("connectivity").unwrap_or(&0.0) * 100.0,
+            quality_components.get("density").unwrap_or(&0.0) * 100.0,
+            quality_components.get("cohesion").unwrap_or(&0.0) * 100.0,
+            quality_components
+                .get("predicate_diversity")
+                .unwrap_or(&0.0)
+                * 100.0,
+            quality_components.get("type_diversity").unwrap_or(&0.0) * 100.0,
+        );
+        let summary = format!(
+            "{}{}{}{}",
+            summary, health_line, diversity_line, quality_line
+        );
 
         Ok(DiscoveryReport {
             patterns_found: all_patterns,
@@ -15321,24 +15340,26 @@ impl<'a> Prometheus<'a> {
                 continue;
             }
 
-            // Skip high-confidence entities
-            if e.confidence > 0.7 {
-                continue;
-            }
-
-            let mut is_foreign = false;
-
-            // Non-Latin script check (Cyrillic, Arabic, CJK, Greek, etc.)
+            // Skip high-confidence entities (but allow non-Latin script purge at any confidence)
             let total_alpha = lower.chars().filter(|c| c.is_alphabetic()).count();
             let non_ascii_alpha = lower
                 .chars()
                 .filter(|c| c.is_alphabetic() && !c.is_ascii())
                 .count();
+
+            let mut is_foreign = false;
+
+            // Non-Latin script check (Cyrillic, Arabic, CJK, Greek, etc.) — any confidence
             if total_alpha > 2 && non_ascii_alpha as f64 / total_alpha as f64 > 0.4 {
                 is_foreign = true;
             }
 
-            // Single-word Latin endings (common in Latin/German/French extraction noise)
+            // Skip remaining checks for high-confidence entities
+            if !is_foreign && e.confidence > 0.8 {
+                continue;
+            }
+
+            // Single-word Latin/foreign endings
             if !is_foreign && words.len() == 1 && lower.len() >= 5 {
                 let latin_endings: &[&str] = &["orum", "arum", "ibus", "ius", "iae", "ensis"];
                 for suffix in latin_endings {
@@ -15347,10 +15368,62 @@ impl<'a> Prometheus<'a> {
                         break;
                     }
                 }
+                // Known German/French single words (confidence <= 0.8)
+                if !is_foreign && e.confidence <= 0.8 {
+                    let foreign_single_words: &[&str] = &[
+                        "verschränkung",
+                        "geburtstag",
+                        "beitrag",
+                        "reisenden",
+                        "sonnenallee",
+                        "bilanz",
+                        "streifzüge",
+                        "belgique",
+                        "bibliothèque",
+                        "musique",
+                        "tabulae",
+                        "mechanica",
+                        "politiques",
+                        "économie",
+                        "mathématiques",
+                        "philosophie",
+                        "république",
+                        "révolution",
+                        "civilisation",
+                        "wissenschaft",
+                        "gesellschaft",
+                        "geschichte",
+                        "forschung",
+                        "entwicklung",
+                        "grundlagen",
+                        "zeitschrift",
+                        "abhandlungen",
+                        "mitteilungen",
+                        "verhandlungen",
+                        "archäologie",
+                        "korrespondenz",
+                        "naturwissenschaften",
+                        "sitzungsberichte",
+                    ];
+                    if foreign_single_words.contains(&lower.as_str()) {
+                        is_foreign = true;
+                    }
+                    // German compound suffixes at any confidence
+                    let german_suffixes: &[&str] = &[
+                        "straße", "platz", "allee", "brücke", "kirche", "schule", "burg", "stadt",
+                        "dorf",
+                    ];
+                    for suffix in german_suffixes {
+                        if lower.ends_with(suffix) && lower.len() > suffix.len() + 2 {
+                            is_foreign = true;
+                            break;
+                        }
+                    }
+                }
             }
 
-            // Multi-word foreign language fragments (confidence <= 0.6)
-            if !is_foreign && words.len() >= 2 && e.confidence <= 0.6 {
+            // Multi-word foreign language fragments (confidence <= 0.7)
+            if !is_foreign && words.len() >= 2 && e.confidence <= 0.7 {
                 let foreign_suffixes: &[&str] = &[
                     "ción", "ção", "heit", "keit", "schaft", "ière", "ismus", "ität", "ość",
                     "stvo", "ung",
@@ -15366,7 +15439,7 @@ impl<'a> Prometheus<'a> {
                 if !is_foreign && words.len() >= 2 {
                     if let Some(first) = words.first() {
                         if foreign_articles.contains(&first.to_lowercase().as_str())
-                            && e.confidence <= 0.55
+                            && e.confidence <= 0.6
                         {
                             is_foreign = true;
                         }
@@ -17532,7 +17605,104 @@ fn is_common_english_word(lower: &str) -> bool {
         "inflation",
         "prosperity",
     ];
-    COMMON_WORDS.contains(&lower)
+    if COMMON_WORDS.contains(&lower) {
+        return true;
+    }
+    // Additional noise: English words that appear as isolated concept entities
+    const EXTRA_NOISE: &[&str] = &[
+        "coincidence",
+        "performance",
+        "intermediate",
+        "scarlet",
+        "publisher",
+        "footnote",
+        "overwork",
+        "welcome",
+        "fundamentals",
+        "struggle",
+        "telegraph",
+        "precision",
+        "regime",
+        "ancient",
+        "formaliser",
+        "radixsort",
+        "multi-pivot",
+        "co-developer",
+        "prerequisite",
+        "supplement",
+        "appendix",
+        "bibliography",
+        "compilation",
+        "commentary",
+        "correspondence",
+        "equivalent",
+        "establishment",
+        "expedition",
+        "interpretation",
+        "introduction",
+        "investigation",
+        "laboratory",
+        "manuscript",
+        "observation",
+        "publication",
+        "proceedings",
+        "references",
+        "reproduction",
+        "supplement",
+        "translation",
+        "collection",
+        "contribution",
+        "description",
+        "development",
+        "discovery",
+        "distribution",
+        "examination",
+        "experiment",
+        "expression",
+        "generation",
+        "illustration",
+        "instrument",
+        "measurement",
+        "mechanism",
+        "phenomenon",
+        "preparation",
+        "production",
+        "projection",
+        "proposition",
+        "recognition",
+        "regulation",
+        "representation",
+        "resolution",
+        "specification",
+        "transformation",
+        "verification",
+        "hypothesis",
+        "suggestion",
+        "conclusion",
+        "consideration",
+        "demonstration",
+        "distinction",
+        "explanation",
+        "identification",
+        "implementation",
+        "implication",
+        "modification",
+        "notification",
+        "organization",
+        "participation",
+        "recommendation",
+        "registration",
+        "celebration",
+        "classification",
+        "communication",
+        "determination",
+        "documentation",
+        "acknowledgement",
+        "abbreviation",
+        "acceleration",
+        "accommodation",
+    ];
+    EXTRA_NOISE.contains(&lower)
 }
 
 fn now_str() -> String {
