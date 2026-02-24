@@ -2679,6 +2679,18 @@ const TRAILING_JUNK: &[&str] = &[
     "oct",
     "nov",
     "dec",
+    // Non-name trailing words found in DB analysis 2026-02-24
+    "role",
+    "wall",
+    "regime",
+    "root",
+    "most",
+    "results",
+    "deduced",
+    "investopedia",
+    "navigable",
+    "blockchain",
+    "spektakel",
     // Citation/publisher/academic trailing fragments
     "some",
     "advances",
@@ -2805,6 +2817,17 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     // Reject single-word person titles used alone (President, Queen, etc.)
     if !lower.contains(' ') && PERSON_TITLES.contains(&lower.as_str()) {
         return false;
+    }
+
+    // Reject single-word capitalized adjectives ending in common suffixes (e.g. "Equivariant", "Archaeological")
+    if !lower.contains(' ') && etype == "concept" && trimmed.len() > 6 {
+        let adj_suffixes = [
+            "iant", "ible", "able", "ical", "ious", "eous", "ular", "ular", "atic", "etic", "otic",
+            "ural", "inal", "idal", "imal", "ival",
+        ];
+        if adj_suffixes.iter().any(|s| lower.ends_with(s)) {
+            return false;
+        }
     }
 
     // Reject entities ending with trailing junk words

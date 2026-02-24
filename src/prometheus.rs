@@ -3290,6 +3290,17 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(pa_hyps);
         }
 
+        // 2q. Katz similarity link prediction (multi-hop path-based)
+        let katz_weight = self.get_pattern_weight("katz_similarity")?;
+        if katz_weight >= 0.05 {
+            let katz_hyps = self.generate_hypotheses_from_katz_similarity()?;
+            eprintln!(
+                "[PROMETHEUS] katz_similarity: {} hypotheses",
+                katz_hyps.len()
+            );
+            all_hypotheses.extend(katz_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -8982,6 +8993,127 @@ impl<'a> Prometheus<'a> {
             });
         }
         hypotheses.truncate(40);
+        Ok(hypotheses)
+    }
+
+    /// Katz similarity link prediction: uses multi-hop path counts (weighted by α^depth)
+    /// to find entities that are well-connected through the graph but lack a direct edge.
+    /// Better than single-hop methods for discovering non-obvious connections.
+    pub fn generate_hypotheses_from_katz_similarity(&self) -> Result<Vec<Hypothesis>> {
+        let entities = self.brain.all_entities()?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let relations = self.brain.all_relations()?;
+
+        // Build existing edge set for quick lookup
+        let mut existing_edges: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            existing_edges.insert((r.subject_id, r.object_id));
+            existing_edges.insert((r.object_id, r.subject_id));
+        }
+
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Get top Katz-central entities as candidates (checking all pairs is O(n²))
+        let katz_scores = crate::graph::katz_centrality(self.brain, 0.05, 4, 100)?;
+        let top_n = 80.min(katz_scores.len());
+        let top_ids: Vec<i64> = katz_scores[..top_n].iter().map(|&(id, _)| id).collect();
+
+        // Build adjacency once to avoid reloading relations per pair
+        let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
+        for r in &relations {
+            adj.entry(r.subject_id).or_default().push(r.object_id);
+            adj.entry(r.object_id).or_default().push(r.subject_id);
+        }
+
+        let mut candidates: Vec<(i64, i64, f64)> = Vec::new();
+        let alpha = 0.05_f64;
+        for i in 0..top_ids.len() {
+            for j in (i + 1)..top_ids.len() {
+                let a = top_ids[i];
+                let b = top_ids[j];
+                if !meaningful.contains(&a) || !meaningful.contains(&b) {
+                    continue;
+                }
+                if existing_edges.contains(&(a, b)) {
+                    continue;
+                }
+                // Inline Katz similarity (BFS path counting, depth ≤ 4)
+                let mut sim = 0.0_f64;
+                let mut frontier: HashMap<i64, f64> = HashMap::new();
+                frontier.insert(a, 1.0);
+                for depth in 1..=4_usize {
+                    let mut next: HashMap<i64, f64> = HashMap::new();
+                    for (&node, &count) in &frontier {
+                        if let Some(neighbors) = adj.get(&node) {
+                            for &nbr in neighbors {
+                                *next.entry(nbr).or_insert(0.0) += count;
+                            }
+                        }
+                    }
+                    if let Some(&paths) = next.get(&b) {
+                        sim += alpha.powi(depth as i32) * paths;
+                    }
+                    frontier = next;
+                }
+                if sim > 0.001 {
+                    candidates.push((a, b, sim));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(40);
+
+        let mut hypotheses = Vec::new();
+        for (a, b, sim) in &candidates {
+            let a_name = match id_name.get(a) {
+                Some(n) => *n,
+                None => continue,
+            };
+            let b_name = match id_name.get(b) {
+                Some(n) => *n,
+                None => continue,
+            };
+            if is_noise_name(a_name) || is_noise_name(b_name) {
+                continue;
+            }
+            let a_type = id_type.get(a).copied().unwrap_or("unknown");
+            let b_type = id_type.get(b).copied().unwrap_or("unknown");
+            let predicate = infer_predicate(a_type, b_type, None);
+
+            let base_conf = (0.35 + (sim.ln().max(-5.0) + 5.0) * 0.08).min(0.75);
+            let confidence = self
+                .calibrated_confidence("katz_similarity", base_conf)
+                .unwrap_or(base_conf);
+
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.to_string(),
+                predicate: predicate.to_string(),
+                object: b_name.to_string(),
+                confidence,
+                evidence_for: vec![format!(
+                    "Katz similarity: {:.6} (connected through multiple indirect paths)",
+                    sim
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!(
+                        "{} ({}) and {} ({}) share many multi-hop paths",
+                        a_name, a_type, b_name, b_type
+                    ),
+                    "Katz index: entities reachable through multiple short paths tend to be related"
+                        .to_string(),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "katz_similarity".to_string(),
+            });
+        }
         Ok(hypotheses)
     }
 

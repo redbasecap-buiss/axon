@@ -3672,3 +3672,44 @@ pub fn rising_stars(
     stars.truncate(limit);
     Ok(stars)
 }
+
+/// Katz similarity between two entities: sum of α^l * |paths of length l|.
+/// Uses BFS up to max_depth to count paths. Higher = more connected.
+pub fn katz_similarity(
+    brain: &Brain,
+    entity_a: i64,
+    entity_b: i64,
+    alpha: f64,
+    max_depth: usize,
+) -> Result<f64, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+
+    let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
+    for r in &relations {
+        adj.entry(r.subject_id).or_default().push(r.object_id);
+        adj.entry(r.object_id).or_default().push(r.subject_id);
+    }
+
+    // Count paths of each length from a to b via BFS-like expansion
+    let mut sim = 0.0_f64;
+    // frontier[node] = number of distinct paths from entity_a to node at current depth
+    let mut frontier: HashMap<i64, f64> = HashMap::new();
+    frontier.insert(entity_a, 1.0);
+
+    for depth in 1..=max_depth {
+        let mut next: HashMap<i64, f64> = HashMap::new();
+        for (&node, &count) in &frontier {
+            if let Some(neighbors) = adj.get(&node) {
+                for &nbr in neighbors {
+                    *next.entry(nbr).or_insert(0.0) += count;
+                }
+            }
+        }
+        if let Some(&paths_to_b) = next.get(&entity_b) {
+            sim += alpha.powi(depth as i32) * paths_to_b;
+        }
+        frontier = next;
+    }
+
+    Ok(sim)
+}
