@@ -9,6 +9,7 @@ mod nlp;
 pub mod plugin;
 pub mod prometheus;
 mod query;
+pub mod reasoning;
 mod server;
 mod tui;
 
