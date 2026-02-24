@@ -2864,11 +2864,24 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         }
     }
 
-    // Reject entities with 6+ words — almost always concatenation artifacts
+    // Reject entities with 5+ words unless they contain linking prepositions
+    // (e.g. "University of California at Berkeley" is valid)
     {
         let word_count = trimmed.split_whitespace().count();
         if word_count >= 6 {
             return false;
+        }
+        if word_count == 5 {
+            let lower_str = trimmed.to_lowercase();
+            let lower_words: Vec<&str> = lower_str.split_whitespace().collect();
+            let linking = [
+                "of", "the", "de", "del", "di", "du", "von", "van", "la", "le", "at", "in", "for",
+                "und", "and",
+            ];
+            let has_linking = lower_words.iter().any(|w| linking.contains(w));
+            if !has_linking {
+                return false;
+            }
         }
     }
 
@@ -4097,6 +4110,33 @@ fn classify_entity_type(name: &str) -> &'static str {
         "assyria",
         "pithekoussai",
         "tondidarou",
+        "magnesia",
+        "paphos",
+        "thessaloniki",
+        "savannah",
+        "kythera",
+        "macedon",
+        "waterloo",
+        "epirus",
+        "bithynia",
+        "cappadocia",
+        "cilicia",
+        "phrygia",
+        "lydia",
+        "caria",
+        "lycia",
+        "pamphylia",
+        "galatia",
+        "pontus",
+        "thrace",
+        "epirus",
+        "boeotia",
+        "attica",
+        "arcadia",
+        "messenia",
+        "laconia",
+        "argolis",
+        "achaea",
     ];
     if !lower.contains(' ') && KNOWN_PLACES.contains(&lower.as_str()) {
         return "place";
@@ -4166,6 +4206,11 @@ fn classify_entity_type(name: &str) -> &'static str {
         "wedgwood",
         "ptolemy",
         "marcellus",
+        "imhotep",
+        "kernighan",
+        "heraclides",
+        "callisthenes",
+        "narasimha",
     ];
     if !lower.contains(' ') && KNOWN_PERSONS.contains(&lower.as_str()) {
         return "person";
