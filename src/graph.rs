@@ -956,6 +956,123 @@ pub fn estimated_diameter(
     Ok((max_dist, avg, sources.len()))
 }
 
+/// Effective diameter: 90th-percentile shortest-path distance (sampled BFS).
+/// More useful than max diameter which is dominated by outliers.
+/// Returns (effective_diameter_90, median_distance, sample_count).
+pub fn effective_diameter(
+    brain: &Brain,
+    sample: usize,
+) -> Result<(f64, f64, usize), rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let ids: Vec<i64> = adj.keys().copied().collect();
+    let n = ids.len();
+    if n == 0 {
+        return Ok((0.0, 0.0, 0));
+    }
+
+    let step = if n <= sample { 1 } else { n / sample };
+    let sources: Vec<i64> = ids.iter().step_by(step).copied().take(sample).collect();
+
+    let mut all_distances: Vec<usize> = Vec::new();
+
+    for &s in &sources {
+        let mut visited: HashMap<i64, usize> = HashMap::new();
+        visited.insert(s, 0);
+        let mut queue = VecDeque::new();
+        queue.push_back(s);
+
+        while let Some(v) = queue.pop_front() {
+            let d = visited[&v];
+            if let Some(neighbors) = adj.get(&v) {
+                for &w in neighbors {
+                    if let std::collections::hash_map::Entry::Vacant(e) = visited.entry(w) {
+                        let nd = d + 1;
+                        e.insert(nd);
+                        all_distances.push(nd);
+                        queue.push_back(w);
+                    }
+                }
+            }
+        }
+    }
+
+    if all_distances.is_empty() {
+        return Ok((0.0, 0.0, sources.len()));
+    }
+
+    all_distances.sort_unstable();
+    let p90_idx = (all_distances.len() as f64 * 0.90) as usize;
+    let p50_idx = all_distances.len() / 2;
+    let eff_diam = all_distances[p90_idx.min(all_distances.len() - 1)] as f64;
+    let median = all_distances[p50_idx.min(all_distances.len() - 1)] as f64;
+
+    Ok((eff_diam, median, sources.len()))
+}
+
+/// Connectivity resilience: fraction of the largest component that remains
+/// after removing the top-k highest-degree nodes (hubs). Low resilience
+/// indicates the graph is too dependent on a few hubs.
+pub fn connectivity_resilience(brain: &Brain, remove_top_k: usize) -> Result<f64, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let n = adj.len();
+    if n == 0 {
+        return Ok(0.0);
+    }
+
+    // Find largest component size before removal
+    let components = connected_components(brain)?;
+    let original_largest = components.iter().map(|c| c.len()).max().unwrap_or(0);
+    if original_largest == 0 {
+        return Ok(0.0);
+    }
+
+    // Find top-k hubs by degree
+    let mut degrees: Vec<(i64, usize)> = adj
+        .iter()
+        .map(|(id, neighbors)| (*id, neighbors.len()))
+        .collect();
+    degrees.sort_by(|a, b| b.1.cmp(&a.1));
+    let removed: HashSet<i64> = degrees
+        .iter()
+        .take(remove_top_k)
+        .map(|(id, _)| *id)
+        .collect();
+
+    // BFS on remaining graph to find largest component
+    let remaining: HashSet<i64> = adj
+        .keys()
+        .filter(|id| !removed.contains(id))
+        .copied()
+        .collect();
+    let mut visited: HashSet<i64> = HashSet::new();
+    let mut max_component = 0usize;
+
+    for &start in &remaining {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut size = 0usize;
+        let mut queue = VecDeque::new();
+        queue.push_back(start);
+        visited.insert(start);
+        while let Some(v) = queue.pop_front() {
+            size += 1;
+            if let Some(neighbors) = adj.get(&v) {
+                for &w in neighbors {
+                    if remaining.contains(&w) && visited.insert(w) {
+                        queue.push_back(w);
+                    }
+                }
+            }
+        }
+        if size > max_component {
+            max_component = size;
+        }
+    }
+
+    Ok(max_component as f64 / original_largest as f64)
+}
+
 /// Edge reciprocity: fraction of directed edges that have a reverse edge.
 /// High reciprocity suggests symmetric relationships (knows, related_to).
 /// Low reciprocity suggests hierarchical relationships (part_of, located_in).

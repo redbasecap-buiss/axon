@@ -2693,6 +2693,32 @@ impl<'a> Prometheus<'a> {
                     score -= 0.05;
                 }
 
+                // Shared-neighbor boost: entities with common neighbors are more
+                // likely to be genuinely related (common-neighbors link predictor).
+                let shared_neighbors: i64 = self.brain.with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(DISTINCT n.id) FROM (
+                            SELECT object_id AS id FROM relations WHERE subject_id = ?1
+                            UNION SELECT subject_id FROM relations WHERE object_id = ?1
+                        ) n
+                        INNER JOIN (
+                            SELECT object_id AS id FROM relations WHERE subject_id = ?2
+                            UNION SELECT subject_id FROM relations WHERE object_id = ?2
+                        ) m ON n.id = m.id",
+                        params![s_ent.id, o_ent.id],
+                        |row| row.get(0),
+                    )
+                })?;
+                if shared_neighbors >= 5 {
+                    score += 0.12;
+                    hypothesis.evidence_for.push(format!(
+                        "{} shared neighbors between entities",
+                        shared_neighbors
+                    ));
+                } else if shared_neighbors >= 2 {
+                    score += 0.06;
+                }
+
                 // Entity recency momentum: recently-accessed entities are more
                 // relevant. Entities with high access_count relative to their age
                 // indicate active knowledge areas worth investing in.
@@ -10566,8 +10592,9 @@ impl<'a> Prometheus<'a> {
                         continue;
                     }
                     let jaccard = shared as f64 / total as f64;
-                    // Need high overlap (>=0.5) and at least 3 shared predicates
-                    if jaccard < 0.5 || shared < 3 {
+                    // Tighter thresholds: need high overlap (>=0.6) and at least 4 shared predicates
+                    // to reduce noise — this strategy had only ~10% confirmation rate with looser thresholds
+                    if jaccard < 0.6 || shared < 4 {
                         continue;
                     }
 
@@ -10868,9 +10895,10 @@ impl<'a> Prometheus<'a> {
 
         let mut hypotheses = Vec::new();
         let mut seen: HashSet<(i64, i64)> = HashSet::new();
-        let window = chrono::Duration::hours(2);
+        let window = chrono::Duration::minutes(30);
 
-        // Sliding window: O(n) scan for entities within 2h of each other
+        // Sliding window: O(n) scan for entities within 30min of each other
+        // (tightened from 2h — wider windows had only ~16% confirmation rate)
         let mut start = 0;
         for end in 0..isolated.len() {
             // Advance start past the window
@@ -10904,12 +10932,12 @@ impl<'a> Prometheus<'a> {
                 }
                 let delta_min = (b.first_seen - a.first_seen).num_minutes().unsigned_abs();
                 let predicate = infer_predicate(&a.entity_type, &b.entity_type, None);
-                let base_conf = if delta_min <= 10 {
-                    0.55
-                } else if delta_min <= 60 {
-                    0.45
+                let base_conf = if delta_min <= 5 {
+                    0.60
+                } else if delta_min <= 15 {
+                    0.50
                 } else {
-                    0.35
+                    0.40
                 };
                 let confidence = self
                     .calibrated_confidence("temporal_co_discovery", base_conf)
