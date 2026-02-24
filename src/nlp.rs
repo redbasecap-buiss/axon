@@ -888,6 +888,31 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "briefwechsel",
     "euthanasie",
     "über",
+    // Added 2026-02-24 (brain cleaner round 8): demonyms, generic academic, plurals
+    "revolutionaries",
+    "mathematicians",
+    "theoreticians",
+    "equestrians",
+    "biographies",
+    "commentaries",
+    "controversies",
+    "discrepancies",
+    "supersymmetries",
+    "automathography",
+    "demography",
+    "geomorphology",
+    "iconography",
+    "meteorology",
+    "oceanography",
+    "topography",
+    "massenpunktes",
+    "handlungsreisende",
+    "werkinhalt",
+    "wurzeln",
+    "schiffbauhalle",
+    "interpretatio",
+    "revolutionibus",
+    "ultramicroscopy",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -3424,6 +3449,13 @@ const TRAILING_JUNK: &[&str] = &[
     "economist",
     "linguist",
     "archaeologist",
+    // Added 2026-02-24 (brain cleaner round 8)
+    "cylinder",
+    "vacuum",
+    "trapdoor",
+    "forsaken",
+    "confessor",
+    "species",
 ];
 
 fn is_valid_entity(name: &str, etype: &str) -> bool {
@@ -5976,10 +6008,19 @@ fn extract_capitalized_inner(
             }
             let name = phrase.join(" ");
             if name.len() > 1 {
-                let etype = if name.len() > 12 && !name.contains(' ') {
+                let classified = classify_entity_type(&name);
+                // Long single words default to concept only if classifier returns person
+                // (likely a false positive from the Capitalized heuristic).
+                // Known places/orgs/tech keep their type regardless of length.
+                let etype = if name.len() > 12
+                    && !name.contains(' ')
+                    && classified == "person"
+                    && !name.contains('-')
+                    && !name.contains('–')
+                {
                     "concept"
                 } else {
-                    classify_entity_type(&name)
+                    classified
                 };
                 entities.push((name, etype.to_string()));
             }
