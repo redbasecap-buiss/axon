@@ -3631,6 +3631,12 @@ impl<'a> Prometheus<'a> {
         // Purge mistyped person islands (multi-word "person" entities that aren't people)
         let mistyped_person_purged = self.purge_mistyped_person_islands().unwrap_or(0);
 
+        // Purge low-confidence concept islands (NLP noise with confidence ≤ 0.55 and no facts)
+        let low_conf_purged = self.purge_low_confidence_concept_islands(0.60).unwrap_or(0);
+
+        // Reclassify concept islands that match known place names
+        let concepts_to_places = self.reclassify_concept_islands_as_places().unwrap_or(0);
+
         // Fix country-concatenation entities (e.g., "Netherlands Oskar Klein" → merge into "Oskar Klein")
         let country_concat_fixed = self.fix_country_concatenation_entities().unwrap_or(0);
 
@@ -3728,7 +3734,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} contemporary_of refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} contemporary_of refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, \
              {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
              motifs: {}△ {}ff {}ch {}↔{}",
@@ -3791,6 +3797,8 @@ impl<'a> Prometheus<'a> {
             fragment_islands_purged,
             concept_islands_purged,
             mistyped_person_purged,
+            low_conf_purged,
+            concepts_to_places,
             country_concat_fixed,
             prefix_noise_merged,
             reversed_names_merged,
@@ -12362,6 +12370,107 @@ impl<'a> Prometheus<'a> {
 
     /// Fix entities that are concatenated country/place names mistyped as persons.
     /// E.g., "Switzerland Germany Italy" (person) → delete or retype to "place".
+    /// Purge low-confidence concept islands: isolated concept entities with
+    /// confidence < threshold and no facts are almost certainly NLP extraction noise.
+    /// This is more aggressive than suffix-based purging — it uses confidence as signal.
+    pub fn purge_low_confidence_concept_islands(&self, max_confidence: f64) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        let mut purged = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            if e.entity_type != "concept" && e.entity_type != "unknown" {
+                continue;
+            }
+            if e.confidence > max_confidence {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+            let name = e.name.trim();
+            let words: Vec<&str> = name.split_whitespace().collect();
+            let should_purge = if words.len() >= 3 {
+                true
+            } else if words.len() == 1 {
+                let is_lowercase_start = name.chars().next().is_some_and(|c| c.is_lowercase());
+                is_lowercase_start || name.len() <= 4
+            } else if words.len() == 2 && e.confidence <= 0.5 {
+                words
+                    .iter()
+                    .all(|w| w.chars().next().is_some_and(|c| c.is_lowercase()))
+            } else {
+                false
+            };
+            if should_purge {
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                    Ok(())
+                })?;
+                purged += 1;
+            }
+        }
+        if purged > 0 {
+            eprintln!("  [low-conf-concept-purge] removed {} low-confidence concept islands (threshold {:.2})", purged, max_confidence);
+        }
+        Ok(purged)
+    }
+
+    /// Reclassify concept islands that are actually places by checking if their name
+    /// exactly matches a connected place entity name.
+    pub fn reclassify_concept_islands_as_places(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        let place_names: HashSet<String> = entities
+            .iter()
+            .filter(|e| connected.contains(&e.id) && e.entity_type == "place")
+            .map(|e| e.name.to_lowercase())
+            .collect();
+
+        let mut reclassified = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            if e.entity_type != "concept" {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            if place_names.contains(&lower) {
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE entities SET entity_type = 'place' WHERE id = ?1",
+                        params![e.id],
+                    )?;
+                    Ok(())
+                })?;
+                reclassified += 1;
+            }
+        }
+        if reclassified > 0 {
+            eprintln!(
+                "  [concept→place] reclassified {} concept islands matching known places",
+                reclassified
+            );
+        }
+        Ok(reclassified)
+    }
+
     /// Also merges connected country-prefixed person entities into their canonical form.
     /// E.g., "Netherlands Oskar Klein" (11 rels) → merge into "Oskar Klein".
     /// Returns count of entities fixed.
