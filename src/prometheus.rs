@@ -4708,6 +4708,12 @@ impl<'a> Prometheus<'a> {
         // Refine overused "pioneered" into type-specific predicates
         let pioneered_refined = self.refine_pioneered().unwrap_or(0);
 
+        // Refine mismatched "active_in" relations by entity type pairs
+        let active_in_refined = self.refine_active_in().unwrap_or(0);
+
+        // Demote weak contemporary_of relations lacking shared-neighbor evidence
+        let weak_contemporary_demoted = self.demote_weak_contemporary().unwrap_or(0);
+
         // Promote mature testing hypotheses (>7 days, confidence >= 0.75)
         let promoted = self.promote_mature_hypotheses(7, 0.75).unwrap_or(0);
 
@@ -4790,7 +4796,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -4885,6 +4891,8 @@ impl<'a> Prometheus<'a> {
             related_to_refined,
             contemporary_refined,
             pioneered_refined,
+            active_in_refined,
+            weak_contemporary_demoted,
             promoted,
             fragment_cleaned,
             concat_hyp_rejected,
@@ -14026,8 +14034,34 @@ impl<'a> Prometheus<'a> {
                 || o_name.contains("engine")
                 || o_name.contains("device")
                 || o_name.contains("instrument")
+                || o_name.contains("computer")
+                || o_name.contains("processor")
             {
                 "invented"
+            } else if o_name.contains("language")
+                || o_name.contains("notation")
+                || o_name.contains("syntax")
+                || o_name.contains("calculus")
+            {
+                "created"
+            } else if o_name.contains("movement")
+                || o_name.contains("school of")
+                || o_name.contains("philosophy")
+                || o_name.contains("ism")
+            {
+                "founded"
+            } else if o_name.contains("discovery")
+                || o_name.contains("element")
+                || o_name.contains("particle")
+                || o_name.contains("radiation")
+            {
+                "discovered"
+            } else if o_name.contains("architecture")
+                || o_name.contains("framework")
+                || o_name.contains("system")
+                || o_name.contains("standard")
+            {
+                "designed"
             } else {
                 continue; // Keep as "pioneered" — it's the right generic
             };
@@ -14054,6 +14088,111 @@ impl<'a> Prometheus<'a> {
         }
 
         Ok(updated)
+    }
+
+    /// Refine "active_in" relations where entity types don't match the expected
+    /// person→place pattern. Fixes misclassified relations from NLP extraction.
+    pub fn refine_active_in(&self) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let id_to_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        let mut updated = 0usize;
+
+        for r in &relations {
+            if r.predicate != "active_in" {
+                continue;
+            }
+            let s_type = id_to_type.get(&r.subject_id).copied().unwrap_or("unknown");
+            let o_type = id_to_type.get(&r.object_id).copied().unwrap_or("unknown");
+
+            // person→place is correct — skip
+            if s_type == "person" && o_type == "place" {
+                continue;
+            }
+
+            let new_pred = match (s_type, o_type) {
+                ("place", "person") => "birthplace_of",
+                ("place", "place") => "located_near",
+                ("person", "person") => "contemporary_of",
+                ("person", "organization") => "affiliated_with",
+                ("person", "concept") => "works_on",
+                ("organization", "place") => "based_in",
+                ("concept", "place") => "relevant_to",
+                ("place", "concept") => "relevant_to",
+                ("organization", "person") => "employed",
+                ("organization", "organization") => "partner_of",
+                _ => "associated_with",
+            };
+
+            let ok = self.brain.with_conn(|conn| {
+                let res = conn.execute(
+                    "UPDATE relations SET predicate = ?1 WHERE id = ?2",
+                    params![new_pred, r.id],
+                );
+                match res {
+                    Ok(_) => Ok(true),
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                }
+            })?;
+            if ok {
+                updated += 1;
+            }
+        }
+
+        Ok(updated)
+    }
+
+    /// Demote weak `contemporary_of` relations: reduce confidence of person-person
+    /// contemporary_of relations that have no shared neighbors (no corroborating evidence).
+    /// These were typically inferred from co-occurrence in the same article without
+    /// any deeper structural connection in the knowledge graph.
+    pub fn demote_weak_contemporary(&self) -> Result<usize> {
+        let demoted: usize = self.brain.with_conn(|conn| {
+            // Find contemporary_of relations between persons with no shared non-contemporary neighbors
+            let count = conn.execute(
+                "UPDATE relations SET confidence = confidence * 0.8
+                 WHERE predicate = 'contemporary_of'
+                 AND confidence > 0.3
+                 AND subject_id IN (SELECT id FROM entities WHERE entity_type = 'person')
+                 AND object_id IN (SELECT id FROM entities WHERE entity_type = 'person')
+                 AND NOT EXISTS (
+                     SELECT 1 FROM relations r2
+                     JOIN relations r3 ON (r2.object_id = r3.object_id OR r2.object_id = r3.subject_id)
+                     WHERE r2.subject_id = relations.subject_id
+                     AND (r3.subject_id = relations.object_id OR r3.object_id = relations.object_id)
+                     AND r2.predicate != 'contemporary_of'
+                     AND r3.predicate != 'contemporary_of'
+                     AND r2.id != r3.id
+                 )",
+                [],
+            )?;
+            Ok(count)
+        })?;
+        // Delete contemporary_of relations that have decayed below threshold
+        let pruned: usize = self.brain.with_conn(|conn| {
+            let count = conn.execute(
+                "DELETE FROM relations WHERE predicate = 'contemporary_of' AND confidence < 0.2",
+                [],
+            )?;
+            Ok(count)
+        })?;
+        if pruned > 0 {
+            eprintln!(
+                "[PROMETHEUS] Pruned {} sub-threshold contemporary_of relations",
+                pruned
+            );
+        }
+        Ok(demoted + pruned)
     }
 
     /// Promote high-confidence testing hypotheses to confirmed if they've been
