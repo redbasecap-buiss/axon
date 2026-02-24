@@ -1,7 +1,7 @@
 mod chat;
 mod config;
-pub mod criticality;
 mod crawler;
+pub mod criticality;
 mod db;
 #[allow(dead_code)]
 mod embeddings;
@@ -202,12 +202,10 @@ async fn main() -> anyhow::Result<()> {
                 "   Added to watch list. Use `axon crawl` or `axon daemon` to check for updates."
             );
         }
-        Commands::Ask { question } => {
-            match chat::answer_question(&brain, &question)? {
-                Some(answer) => print!("{}", chat::format_answer(&answer)),
-                None => println!("🤷 I don't know anything about that yet. Try feeding me some URLs!"),
-            }
-        }
+        Commands::Ask { question } => match chat::answer_question(&brain, &question)? {
+            Some(answer) => print!("{}", chat::format_answer(&answer)),
+            None => println!("🤷 I don't know anything about that yet. Try feeding me some URLs!"),
+        },
         Commands::Chat => {
             chat::run_chat(&brain).map_err(|e| anyhow::anyhow!("{}", e))?;
         }

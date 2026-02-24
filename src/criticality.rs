@@ -912,8 +912,7 @@ pub fn criticality_report(brain: &Brain) -> Result<CriticalityReport> {
         )
     };
 
-    let (avalanche_sizes, avalanche_exponent, avalanche_is_power_law) =
-        avalanche_detection(brain)?;
+    let (avalanche_sizes, avalanche_exponent, avalanche_is_power_law) = avalanche_detection(brain)?;
 
     let recommendation = generate_criticality_recommendation(
         &regime,
@@ -926,9 +925,8 @@ pub fn criticality_report(brain: &Brain) -> Result<CriticalityReport> {
     // Fetch CDP history
     let cdp_history = brain.with_conn(|conn| {
         ensure_criticality_tables(conn)?;
-        let mut stmt = conn.prepare(
-            "SELECT recorded_at, cdp FROM criticality_log ORDER BY id DESC LIMIT 20",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT recorded_at, cdp FROM criticality_log ORDER BY id DESC LIMIT 20")?;
         let rows: Vec<(String, f64)> = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
@@ -1047,7 +1045,10 @@ pub fn format_criticality_report(report: &CriticalityReport) -> String {
         "  Critical Discovery Parameter:     {:.4}",
         report.cdp
     ));
-    lines.push(format!("  Regime:                           {}", report.regime));
+    lines.push(format!(
+        "  Regime:                           {}",
+        report.regime
+    ));
     lines.push(String::new());
 
     lines.push(format!(
@@ -1058,8 +1059,8 @@ pub fn format_criticality_report(report: &CriticalityReport) -> String {
     lines.push(String::new());
 
     if !report.avalanche_sizes.is_empty() {
-        let avg_size: f64 =
-            report.avalanche_sizes.iter().sum::<usize>() as f64 / report.avalanche_sizes.len() as f64;
+        let avg_size: f64 = report.avalanche_sizes.iter().sum::<usize>() as f64
+            / report.avalanche_sizes.len() as f64;
         let max_size = report.avalanche_sizes.iter().max().unwrap_or(&0);
         lines.push(format!(
             "  Avalanches: {} recorded, avg size {:.1}, max {}",
@@ -1200,10 +1201,7 @@ pub fn abduce(brain: &Brain, observation: &str) -> Result<AbductiveHypothesis> {
     });
 
     let best = explanations.first().cloned();
-    let confidence = best
-        .as_ref()
-        .map(|e| e.combined_score)
-        .unwrap_or(0.0);
+    let confidence = best.as_ref().map(|e| e.combined_score).unwrap_or(0.0);
 
     Ok(AbductiveHypothesis {
         observation: observation.to_string(),
@@ -1286,11 +1284,7 @@ fn explain_via_shared_neighborhood(
     }
 
     let parsimony = 1.0 / (1.0 + chain.len() as f64);
-    let consistency = chain
-        .iter()
-        .map(|s| s.confidence)
-        .sum::<f64>()
-        / chain.len().max(1) as f64;
+    let consistency = chain.iter().map(|s| s.confidence).sum::<f64>() / chain.len().max(1) as f64;
     let combined = parsimony * coverage * consistency;
 
     let summary = format!(
@@ -1440,10 +1434,7 @@ fn explain_entity_prominence(
 }
 
 /// Pattern-based explanation when no entities are found.
-fn explain_via_pattern_matching(
-    brain: &Brain,
-    observation: &str,
-) -> Result<Option<Explanation>> {
+fn explain_via_pattern_matching(brain: &Brain, observation: &str) -> Result<Option<Explanation>> {
     // Search for related facts
     let results = brain.search_facts(observation)?;
 
@@ -1486,9 +1477,9 @@ pub fn explain_gap(brain: &Brain, entity_a: &str, entity_b: &str) -> Result<Vec<
 
     // Check if they're actually connected (maybe indirect)
     let rels_a = brain.get_relations_for(ea.id)?;
-    let direct = rels_a.iter().any(|(s, _, o, _)| {
-        (s == entity_a && o == entity_b) || (s == entity_b && o == entity_a)
-    });
+    let direct = rels_a
+        .iter()
+        .any(|(s, _, o, _)| (s == entity_a && o == entity_b) || (s == entity_b && o == entity_a));
 
     if direct {
         explanations.push(Explanation {
@@ -1663,7 +1654,9 @@ pub fn predict_next_discovery(brain: &Brain) -> Result<Vec<DiscoveryPrediction>>
             continue;
         }
         let d = degree.get(&e.id).copied().unwrap_or(0) as f64;
-        let entry = type_avg_degree.entry(e.entity_type.as_str()).or_insert((0.0, 0));
+        let entry = type_avg_degree
+            .entry(e.entity_type.as_str())
+            .or_insert((0.0, 0));
         entry.0 += d;
         entry.1 += 1;
     }
@@ -1682,21 +1675,14 @@ pub fn predict_next_discovery(brain: &Brain) -> Result<Vec<DiscoveryPrediction>>
 
         let d = degree.get(&e.id).copied().unwrap_or(0) as f64;
         let avg = type_avg.get(e.entity_type.as_str()).copied().unwrap_or(1.0);
-        let pred_count = entity_predicates
-            .get(&e.id)
-            .map(|s| s.len())
-            .unwrap_or(0) as f64;
+        let pred_count = entity_predicates.get(&e.id).map(|s| s.len()).unwrap_or(0) as f64;
 
         // Degree growth rate: access_count correlates with how much attention entity gets
         let growth_rate = e.access_count as f64 / 10.0;
 
         // Neighborhood density change: entities below average degree for their type
         // are more likely to gain connections (regression to the mean)
-        let density_change = if avg > 0.0 {
-            (avg - d) / avg
-        } else {
-            0.0
-        };
+        let density_change = if avg > 0.0 { (avg - d) / avg } else { 0.0 };
 
         // Predicate acquisition rate: entities with few unique predicates relative to
         // their degree have room for new types of connections
@@ -1707,7 +1693,8 @@ pub fn predict_next_discovery(brain: &Brain) -> Result<Vec<DiscoveryPrediction>>
         };
 
         // Combined prediction score
-        let score = 0.4 * growth_rate.min(1.0) + 0.35 * density_change.clamp(0.0, 1.0) + 0.25 * pred_rate;
+        let score =
+            0.4 * growth_rate.min(1.0) + 0.35 * density_change.clamp(0.0, 1.0) + 0.25 * pred_rate;
 
         if score > 0.2 {
             let reason = if density_change > 0.3 {
@@ -1907,7 +1894,10 @@ pub struct TemporalPrediction {
 }
 
 /// Predict when an entity will gain its next connection.
-pub fn predict_temporal_pattern(brain: &Brain, entity_name: &str) -> Result<Option<TemporalPrediction>> {
+pub fn predict_temporal_pattern(
+    brain: &Brain,
+    entity_name: &str,
+) -> Result<Option<TemporalPrediction>> {
     let entity = brain.get_entity_by_name(entity_name)?;
     let entity = match entity {
         Some(e) => e,
@@ -1927,8 +1917,8 @@ pub fn predict_temporal_pattern(brain: &Brain, entity_name: &str) -> Result<Opti
     // Compute inter-event intervals
     let mut intervals: Vec<f64> = Vec::new();
     for i in 1..entity_events.len() {
-        let diff = (entity_events[i].timestamp - entity_events[i - 1].timestamp)
-            .num_seconds() as f64
+        let diff = (entity_events[i].timestamp - entity_events[i - 1].timestamp).num_seconds()
+            as f64
             / 3600.0;
         if diff > 0.0 {
             intervals.push(diff);
@@ -2023,7 +2013,8 @@ pub fn temporal_anomalies(brain: &Brain) -> Result<Vec<TemporalAnomaly>> {
         if let Some(times) = entity_event_times.get(&e.id) {
             if times.len() >= 2 {
                 let span = (times.last().unwrap().and_utc().timestamp()
-                    - times.first().unwrap().and_utc().timestamp()) as f64
+                    - times.first().unwrap().and_utc().timestamp())
+                    as f64
                     / 3600.0;
                 type_spans
                     .entry(e.entity_type.clone())
@@ -2227,11 +2218,7 @@ pub fn small_world_coefficient(brain: &Brain) -> Result<(f64, String)> {
     } else {
         1.0
     };
-    let sigma = if lambda > 0.0 {
-        gamma / lambda
-    } else {
-        0.0
-    };
+    let sigma = if lambda > 0.0 { gamma / lambda } else { 0.0 };
 
     let assessment = if sigma > 3.0 {
         format!(
@@ -2537,10 +2524,7 @@ pub fn hub_vulnerability(brain: &Brain) -> Result<Vec<(String, f64)>> {
         })
         .collect();
 
-    result.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     result.truncate(20);
 
     Ok(result)
@@ -2826,18 +2810,9 @@ pub fn format_introspection(mc: &MetaCognition) -> String {
     lines.push("╚══════════════════════════════════════════════════╝".to_string());
     lines.push(String::new());
 
-    lines.push(format!(
-        "  Entities:            {}",
-        mc.entity_count
-    ));
-    lines.push(format!(
-        "  Relations:           {}",
-        mc.relation_count
-    ));
-    lines.push(format!(
-        "  Facts:               {}",
-        mc.fact_count
-    ));
+    lines.push(format!("  Entities:            {}", mc.entity_count));
+    lines.push(format!("  Relations:           {}", mc.relation_count));
+    lines.push(format!("  Facts:               {}", mc.fact_count));
     lines.push(String::new());
 
     lines.push(format!(
@@ -2914,58 +2889,126 @@ mod tests {
         let germany = brain.upsert_entity("Germany", "place").unwrap();
 
         // Newton
-        brain.upsert_relation(newton, "pioneered", gravity, "test").unwrap();
-        brain.upsert_relation(newton, "contributed_to", physics, "test").unwrap();
-        brain.upsert_relation(newton, "contributed_to", mathematics, "test").unwrap();
-        brain.upsert_relation(newton, "member_of", royal_society, "test").unwrap();
-        brain.upsert_relation(newton, "studied_at", cambridge, "test").unwrap();
-        brain.upsert_relation(newton, "born_in", england, "test").unwrap();
+        brain
+            .upsert_relation(newton, "pioneered", gravity, "test")
+            .unwrap();
+        brain
+            .upsert_relation(newton, "contributed_to", physics, "test")
+            .unwrap();
+        brain
+            .upsert_relation(newton, "contributed_to", mathematics, "test")
+            .unwrap();
+        brain
+            .upsert_relation(newton, "member_of", royal_society, "test")
+            .unwrap();
+        brain
+            .upsert_relation(newton, "studied_at", cambridge, "test")
+            .unwrap();
+        brain
+            .upsert_relation(newton, "born_in", england, "test")
+            .unwrap();
 
         // Einstein
-        brain.upsert_relation(einstein, "pioneered", relativity, "test").unwrap();
-        brain.upsert_relation(einstein, "contributed_to", physics, "test").unwrap();
-        brain.upsert_relation(einstein, "born_in", germany, "test").unwrap();
-        brain.upsert_relation(einstein, "influenced", gravity, "test").unwrap();
+        brain
+            .upsert_relation(einstein, "pioneered", relativity, "test")
+            .unwrap();
+        brain
+            .upsert_relation(einstein, "contributed_to", physics, "test")
+            .unwrap();
+        brain
+            .upsert_relation(einstein, "born_in", germany, "test")
+            .unwrap();
+        brain
+            .upsert_relation(einstein, "influenced", gravity, "test")
+            .unwrap();
 
         // Darwin
-        brain.upsert_relation(darwin, "pioneered", evolution, "test").unwrap();
-        brain.upsert_relation(darwin, "contributed_to", biology, "test").unwrap();
-        brain.upsert_relation(darwin, "member_of", royal_society, "test").unwrap();
-        brain.upsert_relation(darwin, "born_in", england, "test").unwrap();
+        brain
+            .upsert_relation(darwin, "pioneered", evolution, "test")
+            .unwrap();
+        brain
+            .upsert_relation(darwin, "contributed_to", biology, "test")
+            .unwrap();
+        brain
+            .upsert_relation(darwin, "member_of", royal_society, "test")
+            .unwrap();
+        brain
+            .upsert_relation(darwin, "born_in", england, "test")
+            .unwrap();
 
         // Galileo
-        brain.upsert_relation(galileo, "pioneered", heliocentrism, "test").unwrap();
-        brain.upsert_relation(galileo, "contributed_to", physics, "test").unwrap();
+        brain
+            .upsert_relation(galileo, "pioneered", heliocentrism, "test")
+            .unwrap();
+        brain
+            .upsert_relation(galileo, "contributed_to", physics, "test")
+            .unwrap();
 
         // Tesla
-        brain.upsert_relation(tesla, "pioneered", electricity, "test").unwrap();
-        brain.upsert_relation(tesla, "contributed_to", physics, "test").unwrap();
+        brain
+            .upsert_relation(tesla, "pioneered", electricity, "test")
+            .unwrap();
+        brain
+            .upsert_relation(tesla, "contributed_to", physics, "test")
+            .unwrap();
 
         // Curie
-        brain.upsert_relation(curie, "pioneered", radioactivity, "test").unwrap();
-        brain.upsert_relation(curie, "contributed_to", physics, "test").unwrap();
+        brain
+            .upsert_relation(curie, "pioneered", radioactivity, "test")
+            .unwrap();
+        brain
+            .upsert_relation(curie, "contributed_to", physics, "test")
+            .unwrap();
 
         // Turing
-        brain.upsert_relation(turing, "pioneered", computation, "test").unwrap();
-        brain.upsert_relation(turing, "contributed_to", mathematics, "test").unwrap();
-        brain.upsert_relation(turing, "studied_at", cambridge, "test").unwrap();
-        brain.upsert_relation(turing, "born_in", england, "test").unwrap();
+        brain
+            .upsert_relation(turing, "pioneered", computation, "test")
+            .unwrap();
+        brain
+            .upsert_relation(turing, "contributed_to", mathematics, "test")
+            .unwrap();
+        brain
+            .upsert_relation(turing, "studied_at", cambridge, "test")
+            .unwrap();
+        brain
+            .upsert_relation(turing, "born_in", england, "test")
+            .unwrap();
 
         // Ada
-        brain.upsert_relation(ada, "pioneered", computation, "test").unwrap();
-        brain.upsert_relation(ada, "contributed_to", mathematics, "test").unwrap();
-        brain.upsert_relation(ada, "born_in", england, "test").unwrap();
+        brain
+            .upsert_relation(ada, "pioneered", computation, "test")
+            .unwrap();
+        brain
+            .upsert_relation(ada, "contributed_to", mathematics, "test")
+            .unwrap();
+        brain
+            .upsert_relation(ada, "born_in", england, "test")
+            .unwrap();
 
         // Cross-domain links
-        brain.upsert_relation(gravity, "led_to", relativity, "test").unwrap();
-        brain.upsert_relation(newton, "influenced", einstein, "test").unwrap();
+        brain
+            .upsert_relation(gravity, "led_to", relativity, "test")
+            .unwrap();
+        brain
+            .upsert_relation(newton, "influenced", einstein, "test")
+            .unwrap();
 
         // Facts
-        brain.upsert_fact(newton, "birth_year", "1643", "test").unwrap();
-        brain.upsert_fact(einstein, "birth_year", "1879", "test").unwrap();
-        brain.upsert_fact(darwin, "birth_year", "1809", "test").unwrap();
-        brain.upsert_fact(newton, "nationality", "English", "test").unwrap();
-        brain.upsert_fact(einstein, "nationality", "German", "test").unwrap();
+        brain
+            .upsert_fact(newton, "birth_year", "1643", "test")
+            .unwrap();
+        brain
+            .upsert_fact(einstein, "birth_year", "1879", "test")
+            .unwrap();
+        brain
+            .upsert_fact(darwin, "birth_year", "1809", "test")
+            .unwrap();
+        brain
+            .upsert_fact(newton, "nationality", "English", "test")
+            .unwrap();
+        brain
+            .upsert_fact(einstein, "nationality", "German", "test")
+            .unwrap();
 
         brain
     }
@@ -2995,7 +3038,10 @@ mod tests {
     fn test_von_neumann_entropy_populated() {
         let brain = populated_brain();
         let entropy = von_neumann_graph_entropy(&brain).unwrap();
-        assert!(entropy > 0.0, "Populated graph should have positive entropy");
+        assert!(
+            entropy > 0.0,
+            "Populated graph should have positive entropy"
+        );
     }
 
     #[test]
@@ -3044,7 +3090,10 @@ mod tests {
     fn test_semantic_entropy_populated() {
         let brain = populated_brain();
         let entropy = semantic_entropy(&brain).unwrap();
-        assert!(entropy > 0.0, "Populated graph should have semantic diversity");
+        assert!(
+            entropy > 0.0,
+            "Populated graph should have semantic diversity"
+        );
     }
 
     #[test]
@@ -3168,10 +3217,7 @@ mod tests {
             format!("{}", CriticalityRegime::Critical),
             "Critical (Discovery Zone)"
         );
-        assert_eq!(
-            format!("{}", CriticalityRegime::Subcritical),
-            "Subcritical"
-        );
+        assert_eq!(format!("{}", CriticalityRegime::Subcritical), "Subcritical");
     }
 
     // ───────────────────────────────────────────────────────────────────────
@@ -3442,7 +3488,11 @@ mod tests {
         brain.upsert_entity("O1", "organization").unwrap();
         brain.upsert_entity("O2", "organization").unwrap();
         let gini = domain_balance_score(&brain).unwrap();
-        assert!(gini < 0.1, "Balanced types should have low Gini, got {}", gini);
+        assert!(
+            gini < 0.1,
+            "Balanced types should have low Gini, got {}",
+            gini
+        );
     }
 
     #[test]
@@ -3453,7 +3503,11 @@ mod tests {
         }
         brain.upsert_entity("P1", "person").unwrap();
         let gini = domain_balance_score(&brain).unwrap();
-        assert!(gini > 0.3, "Unbalanced types should have high Gini, got {}", gini);
+        assert!(
+            gini > 0.3,
+            "Unbalanced types should have high Gini, got {}",
+            gini
+        );
     }
 
     #[test]
@@ -3527,7 +3581,11 @@ mod tests {
     fn test_shannon_entropy_uniform() {
         let counts = vec![10, 10, 10, 10];
         let entropy = shannon_entropy_from_counts(counts.iter());
-        assert!((entropy - 2.0).abs() < 0.01, "Uniform 4 categories should be 2 bits, got {}", entropy);
+        assert!(
+            (entropy - 2.0).abs() < 0.01,
+            "Uniform 4 categories should be 2 bits, got {}",
+            entropy
+        );
     }
 
     #[test]
@@ -3609,7 +3667,11 @@ mod tests {
         let eigenvalues = tridiagonal_eigenvalues(&alpha, &beta);
         assert_eq!(eigenvalues.len(), 3);
         for &ev in &eigenvalues {
-            assert!((ev - 1.0).abs() < 0.1, "Identity eigenvalue should be ~1.0, got {}", ev);
+            assert!(
+                (ev - 1.0).abs() < 0.1,
+                "Identity eigenvalue should be ~1.0, got {}",
+                ev
+            );
         }
     }
 
@@ -3689,7 +3751,11 @@ mod tests {
         }
 
         let entropy = von_neumann_graph_entropy(&brain).unwrap();
-        assert!(entropy >= 0.0, "Fully connected graph entropy should be non-negative, got {}", entropy);
+        assert!(
+            entropy >= 0.0,
+            "Fully connected graph entropy should be non-negative, got {}",
+            entropy
+        );
 
         let surprise = surprise_edge_fraction(&brain).unwrap();
         assert!(surprise >= 0.0);

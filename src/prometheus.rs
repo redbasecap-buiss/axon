@@ -4611,6 +4611,17 @@ impl<'a> Prometheus<'a> {
         // Boost confidence of well-known entities
         let known_boosted = self.boost_known_entity_confidence().unwrap_or(0);
 
+        // Auto-seed frontier with Wikipedia URLs for high-value isolated entities
+        let frontier_seeded = self.seed_frontier_for_isolated_entities(50).unwrap_or(0);
+
+        // Detect discovery plateau and log recommendation
+        let (is_plateau, _plateau_metric, plateau_rec) = self
+            .detect_discovery_plateau(10)
+            .unwrap_or((false, 0.0, String::new()));
+        if is_plateau {
+            eprintln!("[PROMETHEUS] ⚠ Discovery plateau detected: {}", plateau_rec);
+        }
+
         // Refine generic predicates using entity type pairs
         let predicates_refined = self.refine_associated_with().unwrap_or(0);
         let contextual_refined = self.refine_associated_with_contextual().unwrap_or(0);
@@ -4836,9 +4847,19 @@ impl<'a> Prometheus<'a> {
                 * 100.0,
             quality_components.get("type_diversity").unwrap_or(&0.0) * 100.0,
         );
+        let plateau_line = if is_plateau {
+            format!(", ⚠ PLATEAU: {}", plateau_rec)
+        } else {
+            String::new()
+        };
+        let frontier_line = if frontier_seeded > 0 {
+            format!(", {} frontier URLs seeded", frontier_seeded)
+        } else {
+            String::new()
+        };
         let summary = format!(
-            "{}{}{}{}",
-            summary, health_line, diversity_line, quality_line
+            "{}{}{}{}{}{}",
+            summary, health_line, diversity_line, quality_line, plateau_line, frontier_line
         );
 
         Ok(DiscoveryReport {
@@ -6523,6 +6544,284 @@ impl<'a> Prometheus<'a> {
             "Discovery trend: {} (avg Δrels: {:.1}). {}{}{}{}",
             trend, avg_delta, recommendation, velocity_note, cluster_note, evolution_note
         ))
+    }
+
+    // -----------------------------------------------------------------------
+    // Frontier auto-seeding
+    // -----------------------------------------------------------------------
+
+    /// Seed the crawl frontier with Wikipedia URLs for high-value isolated entities.
+    /// These are well-known entities (high confidence) that have zero relations and
+    /// zero facts — crawling their Wikipedia pages would integrate them into the graph.
+    /// Returns the number of URLs added to the frontier.
+    pub fn seed_frontier_for_isolated_entities(&self, max_seeds: usize) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        let mut connected_ids: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected_ids.insert(r.subject_id);
+            connected_ids.insert(r.object_id);
+        }
+
+        // High-value isolated entities: meaningful, high confidence, multi-word names
+        let mut candidates: Vec<&crate::db::Entity> = entities
+            .iter()
+            .filter(|e| {
+                !connected_ids.contains(&e.id)
+                    && meaningful.contains(&e.id)
+                    && e.confidence >= 0.8
+                    && !is_noise_name(&e.name)
+                    && HIGH_VALUE_TYPES.contains(&e.entity_type.as_str())
+                    && e.name.len() >= 3
+            })
+            .collect();
+
+        // Prioritize: multi-word names first (more likely to have Wikipedia pages),
+        // then by confidence, then by entity type (person > place > concept > org)
+        candidates.sort_by(|a, b| {
+            let a_words = a.name.split_whitespace().count();
+            let b_words = b.name.split_whitespace().count();
+            let type_priority = |t: &str| -> u8 {
+                match t {
+                    "person" => 0,
+                    "place" => 1,
+                    "organization" => 2,
+                    "concept" => 3,
+                    "technology" => 4,
+                    _ => 5,
+                }
+            };
+            b_words
+                .cmp(&a_words)
+                .then(
+                    b.confidence
+                        .partial_cmp(&a.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+                .then(type_priority(&a.entity_type).cmp(&type_priority(&b.entity_type)))
+        });
+
+        let mut seeded = 0usize;
+        for ent in candidates.iter().take(max_seeds) {
+            // Generate Wikipedia URL from entity name
+            let wiki_title = ent.name.replace(' ', "_");
+            let url = format!("https://en.wikipedia.org/wiki/{}", wiki_title);
+            // Priority: higher for persons and places (more likely to exist)
+            let priority = match ent.entity_type.as_str() {
+                "person" => 8,
+                "place" => 7,
+                "organization" => 6,
+                _ => 5,
+            };
+            if self.brain.add_to_frontier(&url, priority).is_ok() {
+                seeded += 1;
+            }
+        }
+
+        if seeded > 0 {
+            eprintln!(
+                "[PROMETHEUS] Seeded frontier with {} Wikipedia URLs for isolated entities",
+                seeded
+            );
+        }
+        Ok(seeded)
+    }
+
+    // -----------------------------------------------------------------------
+    // Confidence band accuracy (meta-learning)
+    // -----------------------------------------------------------------------
+
+    /// Analyze historical accuracy of hypotheses grouped by confidence band.
+    /// Returns Vec of (band_label, total, confirmed, rejected, accuracy).
+    /// Used to calibrate future hypothesis confidence — if 0.6-0.7 band has
+    /// only 50% accuracy, we know to be more conservative in that range.
+    pub fn confidence_band_accuracy(&self) -> Result<Vec<(String, i64, i64, i64, f64)>> {
+        let bands = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT
+                    CASE
+                        WHEN confidence < 0.3 THEN '0.0-0.3'
+                        WHEN confidence < 0.5 THEN '0.3-0.5'
+                        WHEN confidence < 0.6 THEN '0.5-0.6'
+                        WHEN confidence < 0.7 THEN '0.6-0.7'
+                        WHEN confidence < 0.8 THEN '0.7-0.8'
+                        WHEN confidence < 0.9 THEN '0.8-0.9'
+                        ELSE '0.9-1.0'
+                    END as band,
+                    COUNT(*) as total,
+                    SUM(CASE WHEN status='confirmed' THEN 1 ELSE 0 END) as confirmed,
+                    SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) as rejected
+                 FROM hypotheses
+                 WHERE status IN ('confirmed', 'rejected')
+                 GROUP BY band
+                 ORDER BY band",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let band: String = row.get(0)?;
+                let total: i64 = row.get(1)?;
+                let confirmed: i64 = row.get(2)?;
+                let rejected: i64 = row.get(3)?;
+                let accuracy = if total > 0 {
+                    confirmed as f64 / total as f64
+                } else {
+                    0.0
+                };
+                Ok((band, total, confirmed, rejected, accuracy))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?;
+        Ok(bands)
+    }
+
+    // -----------------------------------------------------------------------
+    // Discovery plateau detection
+    // -----------------------------------------------------------------------
+
+    /// Detect when discovery is plateauing by analyzing recent graph snapshots.
+    /// Returns (is_plateauing, plateau_metric, recommendation).
+    /// Plateau = fragmentation hasn't improved by >0.5% over last N snapshots.
+    pub fn detect_discovery_plateau(&self, lookback: usize) -> Result<(bool, f64, String)> {
+        let snapshots = crate::graph::get_graph_snapshots(self.brain, lookback.max(3))?;
+        if snapshots.len() < 3 {
+            return Ok((
+                false,
+                0.0,
+                "Insufficient data for plateau detection".to_string(),
+            ));
+        }
+
+        // Tuple: (taken_at, entities, relations, components, largest_pct, avg_degree, isolated, density, fragmentation, modularity)
+        // Check fragmentation trend
+        let recent_frag = snapshots[0].8;
+        let oldest_frag = snapshots[snapshots.len() - 1].8;
+        let frag_improvement = oldest_frag - recent_frag; // positive = improving
+
+        // Check density trend
+        let recent_density = snapshots[0].7;
+        let oldest_density = snapshots[snapshots.len() - 1].7;
+        let density_improvement = recent_density - oldest_density; // positive = improving
+
+        // Check if isolated count is stable
+        let recent_isolated = snapshots[0].6 as f64;
+        let oldest_isolated = snapshots[snapshots.len() - 1].6 as f64;
+        let isolation_reduction = oldest_isolated - recent_isolated; // positive = improving
+
+        let is_plateauing = frag_improvement.abs() < 0.005
+            && density_improvement.abs() < 1e-6
+            && isolation_reduction.abs() < 50.0;
+
+        let recommendation = if is_plateauing {
+            let mut rec = Vec::new();
+            if recent_frag > 0.8 {
+                rec.push("High fragmentation persists — seed frontier with isolated entity Wikipedia pages");
+            }
+            if recent_density < 0.001 {
+                rec.push("Very low density — focus on enriching existing entities over discovering new ones");
+            }
+            if isolation_reduction < 10.0 {
+                rec.push("Island reduction stalled — try aggressive name-token matching or targeted crawls");
+            }
+            if rec.is_empty() {
+                "Discovery plateau detected but metrics are healthy".to_string()
+            } else {
+                rec.join("; ")
+            }
+        } else if frag_improvement > 0.01 {
+            format!(
+                "Healthy convergence: fragmentation improved by {:.1}%",
+                frag_improvement * 100.0
+            )
+        } else if frag_improvement < -0.005 {
+            "Fragmentation worsening — new entities being added faster than they're being connected"
+                .to_string()
+        } else {
+            "Stable — minimal changes in graph structure".to_string()
+        };
+
+        Ok((is_plateauing, frag_improvement, recommendation))
+    }
+
+    /// Generate targeted crawl suggestions for the most impactful entities to enrich.
+    /// Combines isolated entity importance, name recognizability, and type diversity.
+    /// Returns Vec of (entity_name, entity_type, priority_score, reason).
+    pub fn suggest_targeted_crawls(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, f64, String)>> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut connected_ids: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected_ids.insert(r.subject_id);
+            connected_ids.insert(r.object_id);
+        }
+
+        let meaningful = meaningful_ids(self.brain)?;
+
+        let mut suggestions: Vec<(String, String, f64, String)> = Vec::new();
+
+        for e in &entities {
+            if connected_ids.contains(&e.id) || !meaningful.contains(&e.id) {
+                continue;
+            }
+            if is_noise_name(&e.name) || is_noise_type(&e.entity_type) {
+                continue;
+            }
+            if e.confidence < 0.7 {
+                continue;
+            }
+
+            let mut score: f64 = e.confidence;
+            let mut reasons: Vec<String> = Vec::new();
+
+            // Multi-word names are more likely to be unique/crawlable
+            let word_count = e.name.split_whitespace().count();
+            if word_count >= 2 {
+                score += 0.15;
+                reasons.push(format!("{}-word name", word_count));
+            }
+
+            // Entity type priority
+            match e.entity_type.as_str() {
+                "person" => {
+                    score += 0.1;
+                    reasons.push("person (high crawl value)".to_string());
+                }
+                "organization" => {
+                    score += 0.08;
+                    reasons.push("organization".to_string());
+                }
+                "place" => {
+                    score += 0.06;
+                    reasons.push("place".to_string());
+                }
+                "technology" | "concept" => {
+                    score += 0.04;
+                    reasons.push(e.entity_type.clone());
+                }
+                _ => {}
+            }
+
+            // High confidence = more likely real entity
+            if e.confidence >= 0.95 {
+                score += 0.05;
+                reasons.push("very high confidence".to_string());
+            }
+
+            suggestions.push((
+                e.name.clone(),
+                e.entity_type.clone(),
+                score,
+                reasons.join(", "),
+            ));
+        }
+
+        suggestions.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        suggestions.truncate(limit);
+        Ok(suggestions)
     }
 
     // -----------------------------------------------------------------------

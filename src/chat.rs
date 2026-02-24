@@ -317,7 +317,11 @@ pub fn answer_question(brain: &Brain, question: &str) -> Result<Option<Answer>, 
             });
         }
     }
-    relations.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    relations.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Related entities (just names, top unique ones not already in relations)
     let raw_related = brain.get_related_entities(entity.id)?;
@@ -377,7 +381,10 @@ pub fn format_answer(answer: &Answer) -> String {
 
     // Related entities
     if !answer.related_entities.is_empty() {
-        out.push_str(&format!("💡 Related: {}\n", answer.related_entities.join(", ")));
+        out.push_str(&format!(
+            "💡 Related: {}\n",
+            answer.related_entities.join(", ")
+        ));
     }
 
     out
@@ -480,7 +487,10 @@ mod tests {
 
     #[test]
     fn test_parse_tell_me_about() {
-        assert_eq!(parse_question("Tell me about quantum physics"), "quantum physics");
+        assert_eq!(
+            parse_question("Tell me about quantum physics"),
+            "quantum physics"
+        );
     }
 
     #[test]
@@ -520,7 +530,10 @@ mod tests {
 
     #[test]
     fn test_parse_was_ist() {
-        assert_eq!(parse_question("Was ist Quantenmechanik?"), "Quantenmechanik");
+        assert_eq!(
+            parse_question("Was ist Quantenmechanik?"),
+            "Quantenmechanik"
+        );
     }
 
     #[test]
