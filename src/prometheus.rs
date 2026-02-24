@@ -4131,6 +4131,14 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(ir_hyps);
         }
 
+        // 2z. Multi-hop transitive inference (A→B→C ⇒ A~C)
+        let mh_weight = self.get_pattern_weight("multi_hop")?;
+        if mh_weight >= 0.05 {
+            let mh_hyps = self.generate_hypotheses_from_multi_hop()?;
+            eprintln!("[PROMETHEUS] multi_hop: {} hypotheses", mh_hyps.len());
+            all_hypotheses.extend(mh_hyps);
+        }
+
         // 2y. Co-fact hypothesis (entities sharing same fact key-value pairs)
         let cf_weight = self.get_pattern_weight("co_fact")?;
         if cf_weight >= 0.05 {
@@ -12036,6 +12044,129 @@ impl<'a> Prometheus<'a> {
                 break;
             }
         }
+        Ok(hypotheses)
+    }
+
+    /// Multi-hop transitive inference: if A→p1→B and B→p2→C exist but A↛C,
+    /// hypothesize A→inferred_pred→C.  Focuses on high-value entity types and
+    /// avoids noise by requiring both endpoints to be meaningful.
+    pub fn generate_hypotheses_from_multi_hop(&self) -> Result<Vec<Hypothesis>> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let meaningful = meaningful_ids(self.brain)?;
+
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Build adjacency: subject → [(object, predicate)]
+        let mut outgoing: HashMap<i64, Vec<(i64, &str)>> = HashMap::new();
+        let mut connected_pairs: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            outgoing
+                .entry(r.subject_id)
+                .or_default()
+                .push((r.object_id, &r.predicate));
+            outgoing
+                .entry(r.object_id)
+                .or_default()
+                .push((r.subject_id, &r.predicate));
+            connected_pairs.insert((r.subject_id, r.object_id));
+            connected_pairs.insert((r.object_id, r.subject_id));
+        }
+
+        let mut hypotheses = Vec::new();
+        let mut seen: HashSet<(i64, i64)> = HashSet::new();
+
+        // Sample high-value entities as starting points (limit computation)
+        let high_value: Vec<i64> = entities
+            .iter()
+            .filter(|e| {
+                meaningful.contains(&e.id)
+                    && HIGH_VALUE_TYPES.contains(&e.entity_type.as_str())
+                    && e.confidence >= 0.7
+            })
+            .map(|e| e.id)
+            .collect();
+
+        for &a in high_value.iter().take(500) {
+            let a_neighbors = match outgoing.get(&a) {
+                Some(ns) => ns,
+                None => continue,
+            };
+            for &(b, p1) in a_neighbors.iter().take(20) {
+                if !meaningful.contains(&b) {
+                    continue;
+                }
+                let b_neighbors = match outgoing.get(&b) {
+                    Some(ns) => ns,
+                    None => continue,
+                };
+                for &(c, p2) in b_neighbors.iter().take(20) {
+                    if c == a || !meaningful.contains(&c) {
+                        continue;
+                    }
+                    if connected_pairs.contains(&(a, c)) {
+                        continue;
+                    }
+                    if seen.contains(&(a, c)) || seen.contains(&(c, a)) {
+                        continue;
+                    }
+                    let a_name = id_name.get(&a).copied().unwrap_or("?");
+                    let c_name = id_name.get(&c).copied().unwrap_or("?");
+                    if is_noise_name(a_name) || is_noise_name(c_name) {
+                        continue;
+                    }
+                    if is_generic_predicate(p1) || is_generic_predicate(p2) {
+                        continue;
+                    }
+                    let a_type = id_type.get(&a).copied().unwrap_or("?");
+                    let c_type = id_type.get(&c).copied().unwrap_or("?");
+                    if !types_compatible(a_type, c_type) {
+                        continue;
+                    }
+
+                    let b_name = id_name.get(&b).copied().unwrap_or("?");
+                    let predicate = infer_predicate(a_type, c_type, None);
+                    let base_conf = 0.40;
+                    let confidence = self
+                        .calibrated_confidence("multi_hop", base_conf)
+                        .unwrap_or(base_conf);
+
+                    seen.insert((a, c));
+                    hypotheses.push(Hypothesis {
+                        id: 0,
+                        subject: a_name.to_string(),
+                        predicate: predicate.to_string(),
+                        object: c_name.to_string(),
+                        confidence,
+                        evidence_for: vec![format!(
+                            "Transitive: {}→{}→{} via {} ({}→{}, {}→{})",
+                            a_name, b_name, c_name, b_name, p1, b_name, p2, c_name
+                        )],
+                        evidence_against: vec![],
+                        reasoning_chain: vec![
+                            format!("{} --[{}]--> {}", a_name, p1, b_name),
+                            format!("{} --[{}]--> {}", b_name, p2, c_name),
+                            format!(
+                                "No direct link {} ↔ {} — infer transitive {}",
+                                a_name, c_name, predicate
+                            ),
+                        ],
+                        status: HypothesisStatus::Proposed,
+                        discovered_at: now_str(),
+                        pattern_source: "multi_hop".to_string(),
+                    });
+                    if hypotheses.len() >= 50 {
+                        return Ok(hypotheses);
+                    }
+                }
+            }
+        }
+        hypotheses.truncate(50);
         Ok(hypotheses)
     }
 
