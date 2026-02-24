@@ -2651,6 +2651,10 @@ impl<'a> Prometheus<'a> {
             // Predicates appearing in <5% of relations get a small bonus
             if pred_freq < 0.05 {
                 score += 0.05;
+            } else if pred_freq > 0.35 {
+                // Heavily saturated predicates (>35% of graph) get a stronger penalty
+                // to force discovery of more diverse relationship types.
+                score -= 0.08;
             } else if pred_freq > 0.25 {
                 // Dominant predicates get a slight penalty to promote diversity
                 score -= 0.03;
@@ -2687,6 +2691,22 @@ impl<'a> Prometheus<'a> {
                 } else if min_deg == 0 {
                     // One entity is isolated — hypothesis is speculative
                     score -= 0.05;
+                }
+
+                // Entity recency momentum: recently-accessed entities are more
+                // relevant. Entities with high access_count relative to their age
+                // indicate active knowledge areas worth investing in.
+                let max_access = s_ent.access_count.max(o_ent.access_count);
+                let now = Utc::now().naive_utc();
+                let newest_age_days = (now - s_ent.last_seen)
+                    .num_days()
+                    .min((now - o_ent.last_seen).num_days())
+                    .max(1);
+                let momentum = max_access as f64 / newest_age_days as f64;
+                if momentum > 2.0 {
+                    score += 0.06; // high-momentum entities
+                } else if momentum > 0.5 {
+                    score += 0.02;
                 }
             }
         }
@@ -4103,6 +4123,9 @@ impl<'a> Prometheus<'a> {
         // Predicate normalization (reduce "is" overuse)
         let normalized = self.normalize_predicates().unwrap_or(0);
 
+        // Demote uniform-predicate hubs (entities where >90% of relations use one predicate)
+        let uniform_demoted = self.demote_uniform_hubs(5, 0.90).unwrap_or(0);
+
         // Island reconnection
         let reconnected = self.reconnect_islands().unwrap_or(0);
 
@@ -4288,7 +4311,7 @@ impl<'a> Prometheus<'a> {
              {} exact-name deduped, {} reverse-containment merged, {} bulk-rejected stale, \
              {} fuzzy duplicates ({} auto-merge, {} auto-merged), {} sparse topic domains, \
              {} name subsumptions found, {} types fixed, {} types inferred from neighborhood, {} noise entities purged, \
-             {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} islands reconnected, \
+             {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} uniform-hub demoted, {} islands reconnected, \
              {} fact-inferred relations, {} name cross-references, \
              {} compound relations + {} compound merged, {} concat split ({}r/{}c), {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
@@ -4333,6 +4356,7 @@ impl<'a> Prometheus<'a> {
             bulk_cleaned,
             deep_cleaned,
             normalized,
+            uniform_demoted,
             reconnected,
             fact_inferred,
             name_crossrefs,
@@ -9490,7 +9514,16 @@ impl<'a> Prometheus<'a> {
     /// Entities sharing the same (predicate, object) patterns are likely related
     /// even if not directly connected.
     pub fn generate_hypotheses_from_semantic_similarity(&self) -> Result<Vec<Hypothesis>> {
-        let similar = crate::graph::semantic_fingerprint_similarity(self.brain, 2, 30)?;
+        // Two passes: strict (min_shared=2, top 40) and relaxed for high-value types (min_shared=1, top 20)
+        let mut similar = crate::graph::semantic_fingerprint_similarity(self.brain, 2, 40)?;
+        let relaxed = crate::graph::semantic_fingerprint_similarity(self.brain, 1, 20)?;
+        // Merge relaxed results that aren't already present
+        let existing: HashSet<(i64, i64)> = similar.iter().map(|(a, b, _, _)| (*a, *b)).collect();
+        for item in relaxed {
+            if !existing.contains(&(item.0, item.1)) && !existing.contains(&(item.1, item.0)) {
+                similar.push(item);
+            }
+        }
         let meaningful = meaningful_ids(self.brain)?;
         let entities = self.brain.all_entities()?;
         let id_name: HashMap<i64, &str> =
@@ -14678,6 +14711,48 @@ impl<'a> Prometheus<'a> {
 
         report.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
         Ok(report)
+    }
+
+    /// Demote or remove uniform-predicate hubs: entities with degree ≥ 5 where
+    /// >90% of relations use the same predicate. These are often NLP artifacts
+    /// (e.g., entity connected to many others only via "contemporary_of").
+    /// Removes relations from the dominant predicate if they're low confidence,
+    /// keeping the entity but reducing its artificial inflation.
+    pub fn demote_uniform_hubs(&self, min_degree: usize, max_dominant_frac: f64) -> Result<usize> {
+        let entropy_data = crate::graph::per_entity_predicate_entropy(self.brain, min_degree)?;
+        let entities = self.brain.all_entities()?;
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+
+        let mut demoted = 0usize;
+        for (eid, _entropy, dominant_pred, dominant_frac) in &entropy_data {
+            if *dominant_frac < max_dominant_frac {
+                continue; // healthy diversity
+            }
+            // Skip well-known high-value entity types that legitimately have uniform predicates
+            let name = id_name.get(eid).copied().unwrap_or("");
+            if name.is_empty() || is_noise_name(name) {
+                continue;
+            }
+
+            // Remove low-confidence relations using the dominant predicate
+            let removed: usize = self.brain.with_conn(|conn| {
+                let count: usize = conn.query_row(
+                    "SELECT COUNT(*) FROM relations WHERE (subject_id = ?1 OR object_id = ?1) AND predicate = ?2 AND confidence < 0.6",
+                    params![eid, dominant_pred],
+                    |row| row.get(0),
+                )?;
+                if count > 0 {
+                    conn.execute(
+                        "DELETE FROM relations WHERE (subject_id = ?1 OR object_id = ?1) AND predicate = ?2 AND confidence < 0.6",
+                        params![eid, dominant_pred],
+                    )?;
+                }
+                Ok(count)
+            })?;
+            demoted += removed;
+        }
+        Ok(demoted)
     }
 }
 

@@ -4015,3 +4015,91 @@ pub fn batch_ego_density(
     }
     Ok(result)
 }
+
+/// Per-entity predicate entropy: measures how diverse each entity's relationships are.
+/// Entities with low entropy (all edges use the same predicate) are likely NLP artifacts.
+/// Returns (entity_id, entropy, dominant_predicate, dominant_fraction).
+pub fn per_entity_predicate_entropy(
+    brain: &Brain,
+    min_degree: usize,
+) -> Result<Vec<(i64, f64, String, f64)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let mut entity_preds: HashMap<i64, HashMap<String, usize>> = HashMap::new();
+    for r in &relations {
+        *entity_preds
+            .entry(r.subject_id)
+            .or_default()
+            .entry(r.predicate.clone())
+            .or_insert(0) += 1;
+        *entity_preds
+            .entry(r.object_id)
+            .or_default()
+            .entry(r.predicate.clone())
+            .or_insert(0) += 1;
+    }
+    let mut results = Vec::new();
+    for (eid, preds) in &entity_preds {
+        let total: usize = preds.values().sum();
+        if total < min_degree {
+            continue;
+        }
+        let mut entropy = 0.0_f64;
+        let mut dominant = String::new();
+        let mut dominant_frac = 0.0_f64;
+        for (pred, &count) in preds {
+            let p = count as f64 / total as f64;
+            if p > 0.0 {
+                entropy -= p * p.ln();
+            }
+            if p > dominant_frac {
+                dominant_frac = p;
+                dominant = pred.clone();
+            }
+        }
+        results.push((*eid, entropy, dominant, dominant_frac));
+    }
+    // Sort by entropy ascending (lowest entropy = most uniform = most suspicious)
+    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(results)
+}
+
+/// Hub quality score: combines degree, predicate diversity, and clustering coefficient.
+/// High-quality hubs have high degree + diverse predicates + moderate clustering.
+/// Returns (entity_id, quality_score, degree, pred_count).
+pub fn hub_quality(
+    brain: &Brain,
+    min_degree: usize,
+) -> Result<Vec<(i64, f64, usize, usize)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let mut degree: HashMap<i64, usize> = HashMap::new();
+    let mut entity_preds: HashMap<i64, HashSet<String>> = HashMap::new();
+    for r in &relations {
+        *degree.entry(r.subject_id).or_insert(0) += 1;
+        *degree.entry(r.object_id).or_insert(0) += 1;
+        entity_preds
+            .entry(r.subject_id)
+            .or_default()
+            .insert(r.predicate.clone());
+        entity_preds
+            .entry(r.object_id)
+            .or_default()
+            .insert(r.predicate.clone());
+    }
+    let clustering = clustering_coefficients(brain)?;
+    let mut results = Vec::new();
+    for (&eid, &deg) in &degree {
+        if deg < min_degree {
+            continue;
+        }
+        let pred_count = entity_preds.get(&eid).map(|s| s.len()).unwrap_or(0);
+        let cc = clustering.get(&eid).copied().unwrap_or(0.0);
+        // Quality = log(degree) * predicate_diversity_ratio * (1 - excessive_clustering_penalty)
+        // High clustering (>0.8) means the hub is just a clique member, not a true bridge
+        let clustering_factor = if cc > 0.8 { 0.5 } else { 1.0 - (cc * 0.3) };
+        let diversity = pred_count as f64 / (deg as f64).max(1.0);
+        let quality = (deg as f64).ln() * diversity * clustering_factor;
+        results.push((eid, quality, deg, pred_count));
+    }
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(results)
+}
