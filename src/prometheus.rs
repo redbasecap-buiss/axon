@@ -4,7 +4,7 @@
 //! Pattern discovery, gap detection, hypothesis generation, validation,
 //! and meta-learning over the axon knowledge graph.
 
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -4322,10 +4322,16 @@ impl<'a> Prometheus<'a> {
         // TF-IDF weighted island reconnection (semantic token matching)
         let tfidf_reconnected = self.tfidf_island_reconnect().unwrap_or(0);
 
+        // Source-cohort island reconnection (temporal co-extraction)
+        let source_reconnected = self.reconnect_islands_by_source().unwrap_or(0);
+
         // Refine generic predicates using entity type pairs
         let predicates_refined = self.refine_associated_with().unwrap_or(0);
         let contextual_refined = self.refine_associated_with_contextual().unwrap_or(0);
         let contributed_refined = self.refine_contributed_to().unwrap_or(0);
+
+        // Refine generic "related_to" predicates into type-specific ones
+        let related_to_refined = self.refine_related_to().unwrap_or(0);
 
         // Refine contemporary_of using shared-neighbor evidence
         let contemporary_refined = self.refine_contemporary_of().unwrap_or(0);
@@ -4394,7 +4400,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} contemporary_of refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -4472,9 +4478,11 @@ impl<'a> Prometheus<'a> {
             single_word_reconnected,
             cross_component_merged,
             tfidf_reconnected,
+            source_reconnected,
             predicates_refined,
             contextual_refined,
             contributed_refined,
+            related_to_refined,
             contemporary_refined,
             promoted,
             fragment_cleaned,
@@ -11538,6 +11546,70 @@ impl<'a> Prometheus<'a> {
         Ok(scored)
     }
 
+    /// Refine overly generic `related_to` predicates into more specific ones
+    /// based on entity type pairs. `related_to` is the most common predicate in
+    /// confirmed hypotheses — specializing it dramatically improves graph semantics.
+    pub fn refine_related_to(&self) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let id_to_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        let mut updated = 0usize;
+        for r in &relations {
+            if r.predicate != "related_to" {
+                continue;
+            }
+            let s_type = id_to_type.get(&r.subject_id).copied().unwrap_or("unknown");
+            let o_type = id_to_type.get(&r.object_id).copied().unwrap_or("unknown");
+            let new_pred = match (s_type, o_type) {
+                ("person", "person") => "contemporary_of",
+                ("person", "place") | ("place", "person") => "active_in",
+                ("person", "organization") | ("organization", "person") => "affiliated_with",
+                ("person", "concept") => "contributed_to",
+                ("concept", "person") => "pioneered_by",
+                ("person", "event") | ("event", "person") => "participated_in",
+                ("organization", "place") | ("place", "organization") => "based_in",
+                ("organization", "organization") => "partner_of",
+                ("organization", "concept") | ("concept", "organization") => "works_on",
+                ("concept", "concept") => "related_concept",
+                ("concept", "place") | ("place", "concept") => "relevant_to",
+                ("place", "place") => "located_near",
+                ("event", "place") | ("place", "event") => "held_in",
+                ("event", "event") => "concurrent_with",
+                ("technology", "person") | ("person", "technology") => "created_by",
+                ("technology", "concept") | ("concept", "technology") => "implements",
+                ("technology", "organization") | ("organization", "technology") => "develops",
+                ("company", "person") | ("person", "company") => "affiliated_with",
+                ("company", "place") | ("place", "company") => "headquartered_in",
+                ("company", "company") => "partner_of",
+                _ => continue,
+            };
+            let ok = self.brain.with_conn(|conn| {
+                let res = conn.execute(
+                    "UPDATE relations SET predicate = ?1 WHERE id = ?2",
+                    params![new_pred, r.id],
+                );
+                match res {
+                    Ok(_) => Ok(true),
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                }
+            })?;
+            if ok {
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
     /// Refine overly generic `contributed_to` predicates into more specific ones
     /// based on entity types. `contributed_to` makes up ~33% of all relations —
     /// specializing it improves semantic precision and discovery quality.
@@ -14729,6 +14801,157 @@ impl<'a> Prometheus<'a> {
             }
         }
 
+        Ok(reconnected)
+    }
+
+    /// Reconnect isolated entities by grouping them with connected entities that
+    /// share the same source URL. If an isolated entity was extracted from the same
+    /// page as a connected entity, they likely belong in the same topic cluster.
+    pub fn reconnect_islands_by_source(&self) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+
+        // Build set of connected entity IDs
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Build source_url → Vec<entity_id> for connected entities
+        let mut source_to_connected: HashMap<String, Vec<i64>> = HashMap::new();
+        for r in &relations {
+            if let Some(ref url) = Some(&r.source_url) {
+                if !url.is_empty() {
+                    source_to_connected
+                        .entry(url.to_string())
+                        .or_default()
+                        .push(r.subject_id);
+                    source_to_connected
+                        .entry(url.to_string())
+                        .or_default()
+                        .push(r.object_id);
+                }
+            }
+        }
+        // Dedup within each source
+        for ids in source_to_connected.values_mut() {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+
+        let entities = self.brain.all_entities()?;
+        let id_to_entity: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+
+        // For each isolated entity, check if any source URL in its relations connects
+        // it to a connected entity. We look at the entity's name in relation source_urls.
+        // Alternative: use the entity's first_seen timestamp to find co-temporal sources.
+        //
+        // Strategy: find isolated entities that appear in a relation's source_url context
+        // by checking if the entity was created from the same source as connected entities.
+        // Since isolated entities have NO relations, we need another signal.
+        // Use temporal co-discovery: entities first_seen within 1 second of each other
+        // were likely extracted from the same page.
+
+        // Group entities by first_seen timestamp (truncated to nearest 2 seconds)
+        let mut time_cohorts: HashMap<String, Vec<i64>> = HashMap::new();
+        for e in &entities {
+            if is_noise_type(&e.entity_type) || is_noise_name(&e.name) {
+                continue;
+            }
+            // Truncate to nearest 2 seconds for fuzzy matching
+            let ts_str = e.first_seen.format("%Y-%m-%dT%H:%M:%S").to_string();
+            let secs = e.first_seen.second();
+            let ts_key = format!("{}{}", &ts_str[..17], secs / 2 * 2);
+            time_cohorts.entry(ts_key).or_default().push(e.id);
+        }
+
+        let mut reconnected = 0usize;
+        for (_ts, cohort) in &time_cohorts {
+            if cohort.len() < 2 || cohort.len() > 20 {
+                continue; // Skip singletons and overly large batches
+            }
+            // Find connected entities in this cohort
+            let connected_in_cohort: Vec<i64> = cohort
+                .iter()
+                .filter(|id| connected.contains(id))
+                .copied()
+                .collect();
+            if connected_in_cohort.is_empty() {
+                continue;
+            }
+            // Pick the highest-degree connected entity as the hub
+            let hub_id = *connected_in_cohort
+                .iter()
+                .max_by_key(|&&id| {
+                    relations
+                        .iter()
+                        .filter(|r| r.subject_id == id || r.object_id == id)
+                        .count()
+                })
+                .unwrap();
+            let hub_entity = match id_to_entity.get(&hub_id) {
+                Some(e) => e,
+                None => continue,
+            };
+
+            // Connect isolated entities in this cohort to the hub
+            for &eid in cohort {
+                if connected.contains(&eid) || eid == hub_id {
+                    continue;
+                }
+                let island = match id_to_entity.get(&eid) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                // Only connect same high-value types or complementary types
+                let type_compatible = matches!(
+                    (island.entity_type.as_str(), hub_entity.entity_type.as_str()),
+                    ("person", "person")
+                        | ("person", "concept")
+                        | ("concept", "person")
+                        | ("person", "organization")
+                        | ("organization", "person")
+                        | ("person", "place")
+                        | ("place", "person")
+                        | ("concept", "concept")
+                        | ("organization", "concept")
+                        | ("concept", "organization")
+                        | ("place", "place")
+                        | ("organization", "organization")
+                );
+                if !type_compatible {
+                    continue;
+                }
+                // Determine predicate based on type pair
+                let pred = match (island.entity_type.as_str(), hub_entity.entity_type.as_str()) {
+                    ("person", "person") => "contemporary_of",
+                    ("person", "place") | ("place", "person") => "active_in",
+                    ("person", "organization") | ("organization", "person") => "affiliated_with",
+                    ("person", "concept") => "contributed_to",
+                    ("concept", "person") => "pioneered_by",
+                    ("concept", "concept") => "related_concept",
+                    ("organization", "concept") | ("concept", "organization") => "works_on",
+                    ("organization", "organization") => "partner_of",
+                    ("place", "place") => "located_near",
+                    _ => "related_to",
+                };
+                let ok = self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO relations (subject_id, predicate, object_id, confidence, source_url, learned_at)
+                         VALUES (?1, ?2, ?3, 0.4, 'temporal_cohort', ?4)",
+                        params![eid, pred, hub_id, Utc::now().to_rfc3339()],
+                    )?;
+                    Ok(())
+                })?;
+                let _ = ok;
+                connected.insert(eid);
+                reconnected += 1;
+                if reconnected >= 500 {
+                    return Ok(reconnected);
+                }
+            }
+        }
         Ok(reconnected)
     }
 
