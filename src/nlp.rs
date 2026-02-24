@@ -442,6 +442,30 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "civil order",
     "human pressure",
     "personnel colours",
+    // Transitional/conjunctive adverbs that get picked up as entity tails
+    "meanwhile",
+    "nachlass",
+    "elsewhere",
+    "perhaps",
+    "apparently",
+    "regardless",
+    "nonetheless",
+    "subsequently",
+    "accordingly",
+    "consequently",
+    "simultaneously",
+    "alternatively",
+    "approximately",
+    "predominantly",
+    "traditionally",
+    "essentially",
+    "respectively",
+    "particularly",
+    "significantly",
+    "substantially",
+    "independently",
+    "occasionally",
+    "ultimately",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -4547,6 +4571,22 @@ fn extract_capitalized_inner(
                     } else {
                         break;
                     }
+                } else {
+                    break;
+                }
+            }
+            // Strip trailing words that are blacklisted (e.g. "Tibet Meanwhile" → "Tibet")
+            // But keep org/place indicators as valid trailing words
+            while phrase.len() > 1 {
+                let last_lower = phrase.last().unwrap().to_lowercase();
+                let last_clean = last_lower.trim_matches(|c: char| !c.is_alphanumeric());
+                if ORG_INDICATORS.contains(&last_clean) || PLACE_INDICATORS.contains(&last_clean) {
+                    break;
+                }
+                if ENTITY_BLACKLIST.contains(&last_lower.as_str())
+                    || GENERIC_SINGLE_WORDS.contains(&last_lower.as_str())
+                {
+                    phrase.pop();
                 } else {
                     break;
                 }
