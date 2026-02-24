@@ -3782,6 +3782,18 @@ const TRAILING_JUNK: &[&str] = &[
     "forsaken",
     "confessor",
     "species",
+    // Added 2026-02-25: adjective/noun trailing junk from DB cleanup
+    "territorial",
+    "industrial",
+    "behind",
+    "hits",
+    "online",
+    "sand",
+    "greatest",
+    "macedonian",
+    "traveler",
+    "transparency",
+    "timeline",
 ];
 
 fn is_valid_entity(name: &str, etype: &str) -> bool {
