@@ -3920,6 +3920,12 @@ impl<'a> Prometheus<'a> {
             &mut all_hypotheses[..]
         };
         let _ = self.boost_hypotheses_with_graph_structure(boost_slice);
+        let lp_slice = if all_hypotheses.len() > 200 {
+            &mut all_hypotheses[..200]
+        } else {
+            &mut all_hypotheses[..]
+        };
+        let _ = self.boost_with_label_propagation(lp_slice);
         for h in all_hypotheses.iter().take(200) {
             let _ = self.save_hypothesis(h);
         }
@@ -3972,6 +3978,15 @@ impl<'a> Prometheus<'a> {
 
         // Auto-resolve existing testing hypotheses
         let (auto_confirmed, auto_rejected) = self.auto_resolve_hypotheses().unwrap_or((0, 0));
+
+        // Resolve mutual exclusions (contradictory hypotheses for same entity pair)
+        let (excl_promoted, excl_rejected) = self.resolve_mutual_exclusions().unwrap_or((0, 0));
+        if excl_promoted + excl_rejected > 0 {
+            eprintln!(
+                "[PROMETHEUS] Mutual exclusion: {} promoted, {} rejected",
+                excl_promoted, excl_rejected
+            );
+        }
 
         // Find connectable islands
         let connectable = self.find_connectable_islands().unwrap_or_default();
@@ -4227,6 +4242,7 @@ impl<'a> Prometheus<'a> {
              {} connected-containment merged, {} aggressive-prefix deduped, \
              {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} contemporary_of refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
+             {} mutual-exclusion ({}✓ {}✗), \
              {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
              motifs: {}△ {}ff {}ch {}↔{}",
             all_patterns.len(),
@@ -4306,6 +4322,9 @@ impl<'a> Prometheus<'a> {
             promoted,
             fragment_cleaned,
             concat_hyp_rejected,
+            excl_promoted + excl_rejected,
+            excl_promoted,
+            excl_rejected,
             pair_deduped,
             hyp_capped,
             max_k,
@@ -5566,6 +5585,109 @@ impl<'a> Prometheus<'a> {
                         "Both entities well-connected ({}/{} relations)",
                         s_rels, o_rels
                     ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve mutual exclusions among testing hypotheses.
+    /// If two hypotheses predict contradictory predicates for the same entity pair
+    /// (e.g., A "allied_with" B vs A "opposed_to" B), reject the weaker one.
+    pub fn resolve_mutual_exclusions(&self) -> Result<(usize, usize)> {
+        let testing = self.list_hypotheses(Some(HypothesisStatus::Testing))?;
+        if testing.len() < 2 {
+            return Ok((0, 0));
+        }
+
+        // Group hypotheses by normalized entity pair (alphabetically sorted)
+        let mut pair_groups: HashMap<(String, String), Vec<&Hypothesis>> = HashMap::new();
+        for h in &testing {
+            if h.object == "?" {
+                continue;
+            }
+            let key = if h.subject <= h.object {
+                (h.subject.clone(), h.object.clone())
+            } else {
+                (h.object.clone(), h.subject.clone())
+            };
+            pair_groups.entry(key).or_default().push(h);
+        }
+
+        let mut promoted = 0usize;
+        let mut rejected = 0usize;
+
+        for (_pair, group) in &pair_groups {
+            if group.len() < 2 {
+                continue;
+            }
+
+            for (i, hi) in group.iter().enumerate() {
+                for hj in group.iter().skip(i + 1) {
+                    if is_contradicting_predicate(&hi.predicate, &hj.predicate) {
+                        let (winner, loser) = if hi.confidence >= hj.confidence {
+                            (hi, hj)
+                        } else {
+                            (hj, hi)
+                        };
+
+                        self.update_hypothesis_status(loser.id, HypothesisStatus::Rejected)?;
+                        self.record_outcome(&loser.pattern_source, false)?;
+                        rejected += 1;
+
+                        if winner.confidence >= 0.65 {
+                            self.update_hypothesis_status(winner.id, HypothesisStatus::Confirmed)?;
+                            self.record_outcome(&winner.pattern_source, true)?;
+                            let evidence = vec![format!(
+                                "Confirmed by mutual exclusion: contradicts weaker hypothesis (pred='{}', conf={:.2})",
+                                loser.predicate, loser.confidence
+                            )];
+                            let _ = self.save_discovery(winner.id, &evidence);
+                            promoted += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((promoted, rejected))
+    }
+
+    /// Boost hypotheses using label propagation communities as an alternative
+    /// signal to Louvain. Cross-method agreement strengthens confidence.
+    pub fn boost_with_label_propagation(&self, hypotheses: &mut [Hypothesis]) -> Result<()> {
+        let lp_communities = crate::graph::label_propagation(self.brain, 20)?;
+
+        // Invert: entity_id → community label
+        let mut entity_to_lp: HashMap<i64, usize> = HashMap::new();
+        for (&lbl, members) in &lp_communities {
+            for &id in members {
+                entity_to_lp.insert(id, lbl);
+            }
+        }
+
+        let entities = self.brain.all_entities()?;
+        let name_to_id: HashMap<String, i64> = entities
+            .iter()
+            .map(|e| (e.name.to_lowercase(), e.id))
+            .collect();
+
+        for h in hypotheses.iter_mut() {
+            if h.object == "?" {
+                continue;
+            }
+            let s_id = name_to_id.get(&h.subject.to_lowercase()).copied();
+            let o_id = name_to_id.get(&h.object.to_lowercase()).copied();
+
+            if let (Some(sid), Some(oid)) = (s_id, o_id) {
+                if let (Some(&lp_s), Some(&lp_o)) = (entity_to_lp.get(&sid), entity_to_lp.get(&oid))
+                {
+                    if lp_s == lp_o {
+                        h.confidence = (h.confidence + 0.08).min(1.0);
+                        h.evidence_for.push(
+                            "Same label-propagation community (independent of Louvain)".to_string(),
+                        );
+                    }
                 }
             }
         }

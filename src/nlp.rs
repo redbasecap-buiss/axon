@@ -2682,6 +2682,18 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "reconnaissance",
     "existence",
     "residence",
+    // Added 2026-02-25: more generic words from DB cleanup
+    "butterfly",
+    "conformational",
+    "governorates",
+    "transformer",
+    "congregational",
+    "institutional",
+    "magistrates",
+    "nineteenth",
+    "thirteenth",
+    "goldhill",
+    "westwood",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -4137,6 +4149,15 @@ fn classify_entity_type(name: &str) -> &'static str {
         "laconia",
         "argolis",
         "achaea",
+        // Added 2026-02-25: places from DB reclassification
+        "warszawa",
+        "taganrog",
+        "kildare",
+        "bergfelde",
+        "almopia",
+        "machupicchu",
+        "kurkut",
+        "neuquén",
     ];
     if !lower.contains(' ') && KNOWN_PLACES.contains(&lower.as_str()) {
         return "place";
@@ -4211,6 +4232,18 @@ fn classify_entity_type(name: &str) -> &'static str {
         "heraclides",
         "callisthenes",
         "narasimha",
+        // Added 2026-02-25: persons from DB reclassification
+        "fairbank",
+        "walecka",
+        "lippold",
+        "dicke",
+        "skrabec",
+        "lemmermeyer",
+        "bolloten",
+        "senemut",
+        "thorgest",
+        "mithridates",
+        "phaedra",
     ];
     if !lower.contains(' ') && KNOWN_PERSONS.contains(&lower.as_str()) {
         return "person";

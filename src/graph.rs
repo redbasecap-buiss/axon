@@ -3839,3 +3839,99 @@ pub fn predicate_diversity(brain: &Brain) -> Result<(usize, f64, f64), rusqlite:
     let dominance = max_count as f64 / total;
     Ok((num_unique, entropy, dominance))
 }
+
+// ---------------------------------------------------------------------------
+// Label Propagation community detection
+// ---------------------------------------------------------------------------
+
+/// Fast label propagation community detection.
+/// Each node starts with its own label, then iteratively adopts the most
+/// frequent label among its neighbors. Converges in O(edges) per iteration.
+/// Returns a map from community_id → list of entity IDs.
+pub fn label_propagation(
+    brain: &Brain,
+    max_iters: usize,
+) -> Result<HashMap<usize, Vec<i64>>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let all_ids: Vec<i64> = adj.keys().copied().collect();
+    if all_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Each node starts with its own label (= its id as usize)
+    let mut labels: HashMap<i64, usize> = HashMap::new();
+    for (i, &id) in all_ids.iter().enumerate() {
+        labels.insert(id, i);
+    }
+
+    // Deterministic shuffle order (rotate start each iteration for stability)
+    for iter in 0..max_iters {
+        let mut changed = false;
+        let offset = iter % all_ids.len();
+        for idx in 0..all_ids.len() {
+            let node = all_ids[(idx + offset) % all_ids.len()];
+            let neighbors = match adj.get(&node) {
+                Some(n) if !n.is_empty() => n,
+                _ => continue,
+            };
+            // Count neighbor labels
+            let mut label_counts: HashMap<usize, usize> = HashMap::new();
+            for &nbr in neighbors {
+                if let Some(&lbl) = labels.get(&nbr) {
+                    *label_counts.entry(lbl).or_insert(0) += 1;
+                }
+            }
+            // Pick most frequent label (tie-break: smallest label for determinism)
+            if let Some((&best_label, _)) = label_counts.iter().max_by(|a, b| {
+                a.1.cmp(b.1).then(b.0.cmp(a.0)) // max count, then min label
+            }) {
+                let current = labels[&node];
+                if best_label != current {
+                    labels.insert(node, best_label);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Group by label
+    let mut communities: HashMap<usize, Vec<i64>> = HashMap::new();
+    for (&id, &lbl) in &labels {
+        communities.entry(lbl).or_default().push(id);
+    }
+    Ok(communities)
+}
+
+/// Compare Louvain and label propagation to find entities that are in
+/// different Louvain communities but same LP community (or vice versa).
+/// These boundary entities are interesting for hypothesis generation.
+pub fn community_disagreement(brain: &Brain) -> Result<Vec<(i64, usize, usize)>, rusqlite::Error> {
+    let louvain = louvain_communities(brain)?;
+    let lp = label_propagation(brain, 20)?;
+
+    // Invert LP communities → node → label
+    let mut lp_labels: HashMap<i64, usize> = HashMap::new();
+    for (&lbl, members) in &lp {
+        for &id in members {
+            lp_labels.insert(id, lbl);
+        }
+    }
+
+    let mut disagreements = Vec::new();
+    for (&id, &louv_comm) in &louvain {
+        if let Some(&lp_comm) = lp_labels.get(&id) {
+            // Compare: are their community-mates different?
+            // Simple heuristic: flag if Louvain comm != LP comm mapping
+            // We only care about nodes where the two methods disagree significantly
+            if louv_comm != lp_comm {
+                disagreements.push((id, louv_comm, lp_comm));
+            }
+        }
+    }
+    // Limit to most interesting (those at boundaries)
+    disagreements.truncate(200);
+    Ok(disagreements)
+}
