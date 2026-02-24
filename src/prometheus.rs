@@ -8851,16 +8851,42 @@ impl<'a> Prometheus<'a> {
             connected.insert(key);
         }
 
+        // Pre-compute adjacency lists for shared-neighbor checks
+        let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+        for r in &relations {
+            adj.entry(r.subject_id).or_default().insert(r.object_id);
+            adj.entry(r.object_id).or_default().insert(r.subject_id);
+        }
+
+        // Also pre-compute source URLs per entity for co-occurrence evidence
+        let mut entity_sources: HashMap<i64, HashSet<String>> = HashMap::new();
+        for r in &relations {
+            let url = &r.source_url;
+            if !url.is_empty() {
+                entity_sources
+                    .entry(r.subject_id)
+                    .or_default()
+                    .insert(url.clone());
+                entity_sources
+                    .entry(r.object_id)
+                    .or_default()
+                    .insert(url.clone());
+            }
+        }
+
         let mut hypotheses = Vec::new();
         for (star_id, star_name, momentum, degree) in &stars {
             if !meaningful.contains(star_id) || is_noise_name(star_name) {
                 continue;
             }
             let star_type = id_type.get(star_id).copied().unwrap_or("unknown");
+            let star_neighbors = adj.get(star_id).cloned().unwrap_or_default();
+            let star_sources = entity_sources.get(star_id).cloned().unwrap_or_default();
 
             // Find top hubs in the same type that aren't already connected
+            // but REQUIRE shared neighbors or source co-occurrence as evidence
             if let Some(hubs) = type_hubs.get(star_type) {
-                for &(hub_id, hub_pr) in hubs.iter().take(3) {
+                for &(hub_id, hub_pr) in hubs.iter().take(5) {
                     if hub_id == *star_id {
                         continue;
                     }
@@ -8876,6 +8902,20 @@ impl<'a> Prometheus<'a> {
                     if is_noise_name(hub_name) {
                         continue;
                     }
+
+                    // Require at least 1 shared neighbor OR shared source URL
+                    let hub_neighbors = adj.get(&hub_id).cloned().unwrap_or_default();
+                    let shared_neighbors: Vec<i64> = star_neighbors
+                        .intersection(&hub_neighbors)
+                        .copied()
+                        .collect();
+                    let hub_sources = entity_sources.get(&hub_id).cloned().unwrap_or_default();
+                    let shared_sources = star_sources.intersection(&hub_sources).count();
+
+                    if shared_neighbors.is_empty() && shared_sources == 0 {
+                        continue; // No evidence of relatedness — skip
+                    }
+
                     let predicate = match star_type {
                         "person" => "contemporary_of",
                         "concept" => "related_concept",
@@ -8883,25 +8923,51 @@ impl<'a> Prometheus<'a> {
                         "technology" => "builds_on",
                         _ => "related_to",
                     };
+
+                    let neighbor_bonus = (shared_neighbors.len() as f64 * 0.05).min(0.2);
+                    let source_bonus = (shared_sources as f64 * 0.03).min(0.1);
                     let confidence = self
                         .calibrated_confidence(
                             "rising_star",
-                            (0.35 + (momentum * 0.1).min(0.3) + (hub_pr * 10.0).min(0.2)).min(0.85),
+                            (0.35
+                                + (momentum * 0.1).min(0.3)
+                                + neighbor_bonus
+                                + source_bonus
+                                + (hub_pr * 10.0).min(0.1))
+                            .min(0.85),
                         )
                         .unwrap_or(0.45);
+
+                    let mut evidence = vec![
+                        format!(
+                            "Rising star: momentum {:.3}, degree {} (rapidly growing)",
+                            momentum, degree
+                        ),
+                        format!("Hub PageRank: {:.4}", hub_pr),
+                    ];
+                    if !shared_neighbors.is_empty() {
+                        let shared_names: Vec<&str> = shared_neighbors
+                            .iter()
+                            .take(3)
+                            .filter_map(|id| id_name.get(id).copied())
+                            .collect();
+                        evidence.push(format!(
+                            "Shared {} neighbor(s): {}",
+                            shared_neighbors.len(),
+                            shared_names.join(", ")
+                        ));
+                    }
+                    if shared_sources > 0 {
+                        evidence.push(format!("Co-occur in {} source(s)", shared_sources));
+                    }
+
                     hypotheses.push(Hypothesis {
                         id: 0,
                         subject: star_name.clone(),
                         predicate: predicate.to_string(),
                         object: hub_name.to_string(),
                         confidence,
-                        evidence_for: vec![
-                            format!(
-                                "Rising star: momentum {:.3}, degree {} (rapidly growing)",
-                                momentum, degree
-                            ),
-                            format!("Hub PageRank: {:.4}", hub_pr),
-                        ],
+                        evidence_for: evidence,
                         evidence_against: vec![],
                         reasoning_chain: vec![
                             format!(
@@ -8912,7 +8978,11 @@ impl<'a> Prometheus<'a> {
                                 "{} is a top hub in the same domain (PageRank {:.4})",
                                 hub_name, hub_pr
                             ),
-                            "Rapidly growing entities likely connect to domain hubs".to_string(),
+                            format!(
+                                "Evidence: {} shared neighbors, {} shared sources",
+                                shared_neighbors.len(),
+                                shared_sources
+                            ),
                         ],
                         status: HypothesisStatus::Proposed,
                         discovered_at: now_str(),
@@ -8935,12 +9005,20 @@ impl<'a> Prometheus<'a> {
         }
         let meaningful = meaningful_ids(self.brain)?;
         let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
         let id_name: HashMap<i64, &str> =
             entities.iter().map(|e| (e.id, e.name.as_str())).collect();
         let id_type: HashMap<i64, &str> = entities
             .iter()
             .map(|e| (e.id, e.entity_type.as_str()))
             .collect();
+
+        // Build adjacency for shared-neighbor check
+        let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+        for r in &relations {
+            adj.entry(r.subject_id).or_default().insert(r.object_id);
+            adj.entry(r.object_id).or_default().insert(r.subject_id);
+        }
 
         let mut hypotheses = Vec::new();
         for (a, b, score) in &predictions {
@@ -8960,14 +9038,35 @@ impl<'a> Prometheus<'a> {
             }
             let a_type = id_type.get(a).copied().unwrap_or("unknown");
             let b_type = id_type.get(b).copied().unwrap_or("unknown");
+
+            // Skip incompatible type pairs (PA alone is too weak without type alignment)
+            if is_type_incompatible(a_type, b_type, "related_to") {
+                continue;
+            }
+
+            // Require at least 1 shared neighbor for PA hypotheses
+            let a_neighbors = adj.get(a).cloned().unwrap_or_default();
+            let b_neighbors = adj.get(b).cloned().unwrap_or_default();
+            let shared: Vec<i64> = a_neighbors.intersection(&b_neighbors).copied().collect();
+            if shared.is_empty() {
+                continue;
+            }
+
             let predicate = infer_predicate(a_type, b_type, None);
 
             // Normalize score: PA scores can be very large (degree_a * degree_b)
-            let norm_score = (*score as f64).ln().max(1.0) / 15.0; // ln(e^15) ≈ max
-            let base_conf = (0.3 + norm_score * 0.3).min(0.75);
+            let norm_score = (*score as f64).ln().max(1.0) / 15.0;
+            let neighbor_bonus = (shared.len() as f64 * 0.05).min(0.15);
+            let base_conf = (0.3 + norm_score * 0.3 + neighbor_bonus).min(0.80);
             let confidence = self
                 .calibrated_confidence("preferential_attachment", base_conf)
                 .unwrap_or(base_conf);
+
+            let shared_names: Vec<&str> = shared
+                .iter()
+                .take(3)
+                .filter_map(|id| id_name.get(id).copied())
+                .collect();
 
             hypotheses.push(Hypothesis {
                 id: 0,
@@ -8975,17 +9074,25 @@ impl<'a> Prometheus<'a> {
                 predicate: predicate.to_string(),
                 object: b_name.to_string(),
                 confidence,
-                evidence_for: vec![format!(
-                    "Preferential attachment score: {:.0} (high-degree nodes not yet connected)",
-                    score
-                )],
+                evidence_for: vec![
+                    format!(
+                        "Preferential attachment score: {:.0} (high-degree nodes not yet connected)",
+                        score
+                    ),
+                    format!(
+                        "Shared {} neighbor(s): {}",
+                        shared.len(),
+                        shared_names.join(", ")
+                    ),
+                ],
                 evidence_against: vec![],
                 reasoning_chain: vec![
                     format!(
                         "{} ({}) and {} ({}) are both high-degree hubs",
                         a_name, a_type, b_name, b_type
                     ),
-                    "Preferential attachment principle: high-degree nodes tend to form new connections".to_string(),
+                    format!("Connected through {} shared neighbors", shared.len()),
+                    "Preferential attachment + shared context: likely to form connection".to_string(),
                 ],
                 status: HypothesisStatus::Proposed,
                 discovered_at: now_str(),
