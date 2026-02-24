@@ -376,6 +376,14 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "researchers",
     "researchgate",
     "mathpages",
+    "mathworld",
+    "wolfram",
+    "pubmed",
+    "academia.edu",
+    "scholarpedia",
+    "springer",
+    "elsevier",
+    "wiley",
     // Generic standalone words that aren't meaningful entities
     "number",
     "response",
@@ -2589,6 +2597,25 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     // Reject single generic words
     if !lower.contains(' ') && GENERIC_SINGLE_WORDS.contains(&lower.as_str()) {
         return false;
+    }
+
+    // Reject single-word entities that look like truncated citation references (e.g. "Annu", "Beig", "Plut")
+    // These are typically 4-char fragments ending in consonant clusters that aren't real words
+    if !lower.contains(' ') && trimmed.len() == 4 && etype == "concept" {
+        // If it's a 4-char capitalized word with default confidence, likely truncated
+        let chars: Vec<char> = trimmed.chars().collect();
+        if chars[0].is_uppercase()
+            && chars[1..].iter().all(|c| c.is_lowercase())
+            && !lower.ends_with('a')
+            && !lower.ends_with('e')
+            && !lower.ends_with('i')
+            && !lower.ends_with('o')
+            && !lower.ends_with('y')
+        {
+            // Words ending in consonants that are 4 chars and classified as concept are likely noise
+            // (real 4-letter concepts like "Yoga" or "Dojo" end in vowels)
+            return false;
+        }
     }
 
     // Reject taxonomic/scientific family names (e.g. Candonidae, Baicaliinae, Spongillidae)

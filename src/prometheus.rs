@@ -5312,6 +5312,56 @@ impl<'a> Prometheus<'a> {
                 updated += 1;
             }
         }
+        // Phase 2: consolidate low-frequency verb synonyms into canonical predicates
+        let verb_synonyms: &[(&[&str], &str)] = &[
+            (
+                &["killed", "murdered", "assassinated", "poisoned"],
+                "killed",
+            ),
+            (&["defeated", "conquered"], "defeated"),
+            (&["captured", "seized", "taken"], "captured"),
+            (&["founded", "established", "formed"], "founded"),
+            (&["built", "constructed", "created"], "built"),
+            (&["invented", "developed", "designed"], "invented"),
+            (&["wrote", "published", "authored"], "wrote"),
+            (&["hired", "recruited", "appointed", "elected"], "appointed"),
+            (&["joined", "enrolled", "readmitted"], "joined"),
+            (&["inspired", "influenced", "informed"], "influenced"),
+            (&["supported", "approved", "endorsed"], "supported"),
+            (&["introduced", "launched", "released"], "launched"),
+            (&["replaced", "succeeded", "relieved"], "replaced"),
+            (&["portrayed", "described", "depicted"], "portrayed"),
+            (&["colonized", "invaded", "raided", "attacked"], "invaded"),
+            (&["signed", "agreed", "ratified"], "signed"),
+            (&["named", "named_after", "called"], "named_after"),
+            (&["based_in", "co_located_in", "located_in"], "located_in"),
+        ];
+        for (synonyms, canonical) in verb_synonyms {
+            for syn in *synonyms {
+                if *syn == *canonical {
+                    continue;
+                }
+                let count: i64 = self.brain.with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM relations WHERE predicate = ?1",
+                        params![syn],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+                })?;
+                if count > 0 {
+                    self.brain.with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE relations SET predicate = ?1 WHERE predicate = ?2",
+                            params![canonical, syn],
+                        )?;
+                        Ok(())
+                    })?;
+                    updated += count as usize;
+                }
+            }
+        }
+
         Ok(updated)
     }
 
