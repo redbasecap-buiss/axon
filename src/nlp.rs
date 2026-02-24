@@ -3966,6 +3966,57 @@ fn classify_entity_type(name: &str) -> &'static str {
         }
     }
 
+    // German compound place names (suffixes like -strasse, -platz, -brücke, etc.)
+    const GERMAN_PLACE_SUFFIXES: &[&str] = &[
+        "strasse",
+        "straße",
+        "platz",
+        "gasse",
+        "brücke",
+        "kirche",
+        "burg",
+        "dorf",
+        "heim",
+        "stadt",
+        "berg",
+        "feld",
+        "wald",
+        "hafen",
+        "turm",
+        "tor",
+        "hof",
+        "allee",
+        "weg",
+        "bahnhof",
+        "hauptbahnhof",
+    ];
+    if !lower.contains(' ') && lower.len() > 6 {
+        if GERMAN_PLACE_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+            // Exclude known person names ending in these (e.g. Ginzburg, Hausdorff)
+            const PERSON_EXCEPTIONS: &[&str] = &[
+                "ginzburg",
+                "hausdorff",
+                "hamburg",
+                "salzburg",
+                "heidelberg",
+                "nuremberg",
+                "gutenberg",
+                "goldberg",
+                "rosenberg",
+                "weinberg",
+                "spielberg",
+                "zuckerberg",
+                "bloomberg",
+                "sandberg",
+                "kirchhoff",
+                "kirchner",
+            ];
+            if !PERSON_EXCEPTIONS.contains(&lower.as_str()) {
+                return "place";
+            }
+        }
+    }
+
     // Check for concept indicators (before person heuristic)
     for w in &words {
         let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
