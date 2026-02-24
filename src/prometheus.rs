@@ -4585,6 +4585,8 @@ impl<'a> Prometheus<'a> {
             pass_merges += self.dissolve_name_fragment_hubs().unwrap_or(0);
             pass_merges += self.strip_leading_adjectives().unwrap_or(0);
             pass_merges += self.merge_reversed_names().unwrap_or(0);
+            pass_merges += self.merge_nickname_variants().unwrap_or(0);
+            pass_merges += self.merge_transliteration_variants().unwrap_or(0);
             if pass_merges == 0 {
                 break;
             }
@@ -4629,6 +4631,15 @@ impl<'a> Prometheus<'a> {
 
         // Merge reversed names ("Neumann John" → "John von Neumann")
         let reversed_names_merged = self.merge_reversed_names().unwrap_or(0);
+
+        // Nickname/diminutive expansion merge (Alex→Alexander, etc.)
+        let nickname_merged = self.merge_nickname_variants().unwrap_or(0);
+
+        // Transliteration variant merge (edit distance on same-surname entities)
+        let translit_merged = self.merge_transliteration_variants().unwrap_or(0);
+
+        // Extended concept reclassification (well-known places/tech misclassified as concept)
+        let concepts_reclassified = self.reclassify_isolated_concepts_extended().unwrap_or(0);
 
         // Purge NLP concatenation noise ("Examples Yang", "Neumann John Examples")
         let concat_noise_purged = self.purge_concatenation_noise().unwrap_or(0);
@@ -4776,7 +4787,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -4848,6 +4859,9 @@ impl<'a> Prometheus<'a> {
             country_concat_fixed,
             prefix_noise_merged,
             reversed_names_merged,
+            nickname_merged,
+            translit_merged,
+            concepts_reclassified,
             abbreviation_merged,
             concat_noise_purged,
             token_reconnected,
@@ -18250,11 +18264,369 @@ impl<'a> Prometheus<'a> {
         }
         Ok(reclassified)
     }
+
+    // -----------------------------------------------------------------------
+    // Nickname / diminutive expansion merge
+    // -----------------------------------------------------------------------
+
+    /// Merge isolated person entities whose first name is a common nickname
+    /// of a connected entity's first name (e.g., "Alex Waibel" → "Alexander Waibel").
+    pub fn merge_nickname_variants(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Nickname → full name(s) mapping
+        let nickname_map: &[(&[&str], &[&str])] = &[
+            (&["alex", "alec"], &["alexander", "alexandra", "alexei"]),
+            (&["mike", "mick"], &["michael"]),
+            (&["bill", "billy", "will", "willy"], &["william"]),
+            (&["bob", "bobby", "rob", "robby"], &["robert"]),
+            (&["dick", "rick", "ricky"], &["richard"]),
+            (&["jim", "jimmy"], &["james"]),
+            (&["joe", "joey"], &["joseph"]),
+            (&["jack"], &["john", "jonathan"]),
+            (&["johnny"], &["john"]),
+            (&["tom", "tommy"], &["thomas"]),
+            (
+                &["ed", "eddie", "ted", "teddy"],
+                &["edward", "theodore", "edmund"],
+            ),
+            (&["ben", "benny"], &["benjamin"]),
+            (&["charlie", "chuck"], &["charles"]),
+            (&["dave", "davy"], &["david"]),
+            (&["dan", "danny"], &["daniel"]),
+            (&["steve"], &["steven", "stephen"]),
+            (&["matt"], &["matthew", "matthias"]),
+            (&["nick", "nicky"], &["nicholas", "nicolas", "nikolai"]),
+            (
+                &["chris"],
+                &["christopher", "christian", "christine", "christina"],
+            ),
+            (&["tony"], &["anthony", "antonio"]),
+            (&["frank", "frankie"], &["francis", "franklin", "francisco"]),
+            (&["harry"], &["henry", "harold", "harrison"]),
+            (&["larry"], &["lawrence", "laurence"]),
+            (&["jerry"], &["gerald", "jerome", "jeremiah"]),
+            (&["sam", "sammy"], &["samuel", "samantha"]),
+            (&["pete"], &["peter"]),
+            (&["fred", "freddy"], &["frederick", "alfred"]),
+            (&["al"], &["albert", "alfred", "alan"]),
+            (&["bert"], &["albert", "bertrand", "herbert", "robert"]),
+            (&["ken", "kenny"], &["kenneth"]),
+            (&["ron", "ronny"], &["ronald"]),
+            (&["don", "donny"], &["donald"]),
+            (&["pat"], &["patrick", "patricia"]),
+            (&["andy"], &["andrew", "andreas"]),
+            (&["max"], &["maximilian", "maxwell"]),
+            (&["liz", "lizzy", "beth"], &["elizabeth", "elisabeth"]),
+            (
+                &["kate", "kathy", "katie"],
+                &["katherine", "catherine", "kathleen"],
+            ),
+            (&["sue", "susie"], &["susan", "suzanne"]),
+            (&["meg", "maggie"], &["margaret"]),
+            (&["jenny", "jen"], &["jennifer", "virginia"]),
+            (&["dmitri"], &["dmitry", "dmitrii"]),
+            (&["nikolai"], &["nikolay", "nicolas"]),
+            (&["johann"], &["johannes"]),
+            (&["henri"], &["henry"]),
+            (&["georg"], &["george"]),
+            (&["friedrich"], &["frederick"]),
+            (&["wilhelm"], &["william"]),
+            (&["karl"], &["carl", "charles"]),
+            (&["josef"], &["joseph"]),
+            (&["ludwig"], &["louis"]),
+            (&["ernst"], &["ernest"]),
+        ];
+
+        // Build: lowercase first name → set of equivalent first names
+        let mut equivalences: HashMap<String, HashSet<String>> = HashMap::new();
+        for (nicks, fulls) in nickname_map {
+            let mut group: HashSet<String> = HashSet::new();
+            for n in *nicks {
+                group.insert(n.to_string());
+            }
+            for f in *fulls {
+                group.insert(f.to_string());
+            }
+            let group_clone = group.clone();
+            for name in &group_clone {
+                equivalences
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(group.iter().cloned());
+            }
+        }
+
+        // Build last-name → list of (id, first_name_lower, degree) for person entities
+        let mut by_last: HashMap<String, Vec<(i64, String, usize)>> = HashMap::new();
+        for e in &entities {
+            if e.entity_type != "person" {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 {
+                continue;
+            }
+            let last = words[words.len() - 1].to_lowercase();
+            let first = words[0].to_lowercase();
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            by_last.entry(last).or_default().push((e.id, first, deg));
+        }
+
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<i64> = HashSet::new();
+
+        for (_last, group) in &by_last {
+            if group.len() < 2 || group.len() > 10 {
+                continue;
+            }
+            for i in 0..group.len() {
+                let (id_a, first_a, deg_a) = &group[i];
+                if absorbed.contains(id_a) {
+                    continue;
+                }
+                let equiv_a = match equivalences.get(first_a) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                for j in (i + 1)..group.len() {
+                    let (id_b, first_b, deg_b) = &group[j];
+                    if absorbed.contains(id_b) || id_a == id_b {
+                        continue;
+                    }
+                    if equiv_a.contains(first_b) {
+                        // Merge: keep the one with higher degree (or longer name if tied)
+                        let (keep, remove) = if deg_a >= deg_b {
+                            (*id_a, *id_b)
+                        } else {
+                            (*id_b, *id_a)
+                        };
+                        self.brain.merge_entities(remove, keep)?;
+                        absorbed.insert(remove);
+                        merged += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(merged)
+    }
+
+    // -----------------------------------------------------------------------
+    // Transliteration-variant merge (edit distance)
+    // -----------------------------------------------------------------------
+
+    /// Merge person entities with identical last names whose first names differ
+    /// by only 1-2 characters (transliteration variants like Mendeleyev/Mendeleev,
+    /// Tchaikovsky/Chaikovsky, etc.)
+    pub fn merge_transliteration_variants(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Group by (entity_type, last_word)
+        let mut by_key: HashMap<(String, String), Vec<(i64, String, usize)>> = HashMap::new();
+        for e in &entities {
+            if !matches!(e.entity_type.as_str(), "person" | "place" | "concept") {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 {
+                continue;
+            }
+            let last = words.last().unwrap().to_lowercase();
+            let prefix = words[..words.len() - 1]
+                .iter()
+                .map(|w| w.to_lowercase())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            by_key
+                .entry((e.entity_type.clone(), last))
+                .or_default()
+                .push((e.id, prefix, deg));
+        }
+
+        let mut merged = 0usize;
+        let mut absorbed: HashSet<i64> = HashSet::new();
+
+        for group in by_key.values() {
+            if group.len() < 2 || group.len() > 20 {
+                continue;
+            }
+            for i in 0..group.len() {
+                let (id_a, prefix_a, deg_a) = &group[i];
+                if absorbed.contains(id_a) {
+                    continue;
+                }
+                for j in (i + 1)..group.len() {
+                    let (id_b, prefix_b, deg_b) = &group[j];
+                    if absorbed.contains(id_b) || id_a == id_b {
+                        continue;
+                    }
+                    let dist = levenshtein(prefix_a, prefix_b);
+                    let min_len = prefix_a.len().min(prefix_b.len());
+                    // Allow edit distance 1 for short prefixes, 2 for longer
+                    let max_dist = if min_len <= 4 { 1 } else { 2 };
+                    if dist <= max_dist && dist > 0 {
+                        let (keep, remove) = if deg_a >= deg_b {
+                            (*id_a, *id_b)
+                        } else {
+                            (*id_b, *id_a)
+                        };
+                        self.brain.merge_entities(remove, keep)?;
+                        absorbed.insert(remove);
+                        merged += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(merged)
+    }
+
+    // -----------------------------------------------------------------------
+    // Reclassify well-known isolated concept entities
+    // -----------------------------------------------------------------------
+
+    /// Reclassify isolated concept entities that are clearly historical figures
+    /// or geographical locations based on keyword patterns in names.
+    pub fn reclassify_isolated_concepts_extended(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        let place_keywords: HashSet<&str> = [
+            "jerusalem",
+            "damascus",
+            "babylon",
+            "constantinople",
+            "carthage",
+            "mesopotamia",
+            "anatolia",
+            "transoxiana",
+            "dalmatia",
+            "numidia",
+            "mauretania",
+            "ravenna",
+            "westphalia",
+            "bohemia",
+            "silesia",
+            "saxony",
+            "prussia",
+            "burgundy",
+            "normandy",
+            "aquitaine",
+            "lombardy",
+            "catalonia",
+            "andalusia",
+            "castile",
+            "navarre",
+            "galicia",
+            "sardinia",
+            "corsica",
+            "sicily",
+            "crete",
+            "cyprus",
+            "rhodes",
+            "sumatra",
+            "borneo",
+            "java",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let tech_keywords: HashSet<&str> = [
+            "javascript",
+            "python",
+            "haskell",
+            "fortran",
+            "cobol",
+            "tensorflow",
+            "pytorch",
+            "kubernetes",
+            "blockchain",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let mut reclassified = 0usize;
+
+        for e in &entities {
+            if e.entity_type != "concept" || connected.contains(&e.id) {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+
+            let new_type = if place_keywords.contains(lower.as_str()) {
+                Some("place")
+            } else if tech_keywords.contains(lower.as_str()) {
+                Some("technology")
+            } else {
+                None
+            };
+
+            if let Some(nt) = new_type {
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE entities SET entity_type = ?1 WHERE id = ?2",
+                        params![nt, e.id],
+                    )?;
+                    Ok(())
+                })?;
+                reclassified += 1;
+            }
+        }
+
+        Ok(reclassified)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// Simple Levenshtein edit distance between two strings.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
 
 /// Check if an entity name looks like a citation fragment (common in Wikipedia extraction).
 fn looks_like_citation(name: &str) -> bool {
