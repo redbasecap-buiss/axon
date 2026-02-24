@@ -4325,6 +4325,15 @@ impl<'a> Prometheus<'a> {
         // Source-cohort island reconnection (temporal co-extraction)
         let source_reconnected = self.reconnect_islands_by_source().unwrap_or(0);
 
+        // Domain-keyword island reconnection (high-value entities with shared name tokens)
+        let domain_reconnected = self.reconnect_islands_by_domain().unwrap_or(0);
+
+        // Purge foreign-language extraction noise from islands
+        let foreign_purged = self.purge_foreign_language_islands().unwrap_or(0);
+
+        // Boost confidence of well-known entities
+        let known_boosted = self.boost_known_entity_confidence().unwrap_or(0);
+
         // Refine generic predicates using entity type pairs
         let predicates_refined = self.refine_associated_with().unwrap_or(0);
         let contextual_refined = self.refine_associated_with_contextual().unwrap_or(0);
@@ -4400,7 +4409,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -4479,6 +4488,9 @@ impl<'a> Prometheus<'a> {
             cross_component_merged,
             tfidf_reconnected,
             source_reconnected,
+            domain_reconnected,
+            foreign_purged,
+            known_boosted,
             predicates_refined,
             contextual_refined,
             contributed_refined,
@@ -15280,6 +15292,342 @@ impl<'a> Prometheus<'a> {
             demoted += removed;
         }
         Ok(demoted)
+    }
+
+    /// Purge isolated entities whose names are clearly non-English extraction noise.
+    /// Detects Latin suffixes, non-Latin scripts, and foreign-language fragments
+    /// that NLP extractors pull from multilingual Wikipedia articles.
+    pub fn purge_foreign_language_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        let mut purged = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            let name = e.name.trim();
+            let lower = name.to_lowercase();
+            let words: Vec<&str> = name.split_whitespace().collect();
+
+            // Skip entities with facts
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+
+            // Skip high-confidence entities
+            if e.confidence > 0.7 {
+                continue;
+            }
+
+            let mut is_foreign = false;
+
+            // Non-Latin script check (Cyrillic, Arabic, CJK, Greek, etc.)
+            let total_alpha = lower.chars().filter(|c| c.is_alphabetic()).count();
+            let non_ascii_alpha = lower
+                .chars()
+                .filter(|c| c.is_alphabetic() && !c.is_ascii())
+                .count();
+            if total_alpha > 2 && non_ascii_alpha as f64 / total_alpha as f64 > 0.4 {
+                is_foreign = true;
+            }
+
+            // Single-word Latin endings (common in Latin/German/French extraction noise)
+            if !is_foreign && words.len() == 1 && lower.len() >= 5 {
+                let latin_endings: &[&str] = &["orum", "arum", "ibus", "ius", "iae", "ensis"];
+                for suffix in latin_endings {
+                    if lower.ends_with(suffix) && !is_common_english_word(&lower) {
+                        is_foreign = true;
+                        break;
+                    }
+                }
+            }
+
+            // Multi-word foreign language fragments (confidence <= 0.6)
+            if !is_foreign && words.len() >= 2 && e.confidence <= 0.6 {
+                let foreign_suffixes: &[&str] = &[
+                    "ción", "ção", "heit", "keit", "schaft", "ière", "ismus", "ität", "ość",
+                    "stvo", "ung",
+                ];
+                for suffix in foreign_suffixes {
+                    if lower.ends_with(suffix) {
+                        is_foreign = true;
+                        break;
+                    }
+                }
+                // German/French/Spanish articles as first word
+                let foreign_articles = ["der", "die", "das", "les", "des", "une", "del", "los"];
+                if !is_foreign && words.len() >= 2 {
+                    if let Some(first) = words.first() {
+                        if foreign_articles.contains(&first.to_lowercase().as_str())
+                            && e.confidence <= 0.55
+                        {
+                            is_foreign = true;
+                        }
+                    }
+                }
+            }
+
+            if is_foreign {
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                    Ok(())
+                })?;
+                purged += 1;
+            }
+        }
+        if purged > 0 {
+            eprintln!(
+                "  [foreign-language-purge] removed {} non-English island entities",
+                purged
+            );
+        }
+        Ok(purged)
+    }
+
+    /// Reconnect high-value isolated entities to the knowledge graph using
+    /// domain keyword matching. Maps persons/concepts to relevant connected
+    /// hub entities based on shared meaningful name tokens.
+    pub fn reconnect_islands_by_domain(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+        let id_to_entity: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+
+        // Build degree map
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        // Build token → connected entity ids (only well-connected hubs, tokens >= 4 chars)
+        let stopwords: HashSet<&str> = [
+            "the", "and", "for", "from", "with", "that", "this", "have", "been", "were", "they",
+            "their", "which", "about", "into", "over", "also",
+        ]
+        .iter()
+        .copied()
+        .collect();
+        let mut token_to_connected: HashMap<String, Vec<(i64, usize)>> = HashMap::new();
+        for e in &entities {
+            if !connected.contains(&e.id) {
+                continue;
+            }
+            let deg = degree.get(&e.id).copied().unwrap_or(0);
+            if deg < 3 {
+                continue;
+            }
+            for word in e.name.to_lowercase().split_whitespace() {
+                if word.len() < 4 || stopwords.contains(word) {
+                    continue;
+                }
+                token_to_connected
+                    .entry(word.to_string())
+                    .or_default()
+                    .push((e.id, deg));
+            }
+        }
+
+        let mut reconnected = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            if e.confidence < 0.7 {
+                continue;
+            }
+            if !HIGH_VALUE_TYPES.contains(&e.entity_type.as_str()) {
+                continue;
+            }
+            if is_noise_name(&e.name) || e.name.len() < 4 {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 {
+                continue; // Only multi-word entities (single-word handled elsewhere)
+            }
+
+            let tokens: Vec<String> = e
+                .name
+                .to_lowercase()
+                .split_whitespace()
+                .filter(|w| w.len() >= 4 && !stopwords.contains(w))
+                .map(|s| s.to_string())
+                .collect();
+            if tokens.is_empty() {
+                continue;
+            }
+
+            // Score candidates by shared tokens and degree
+            let mut candidate_scores: HashMap<i64, (usize, usize)> = HashMap::new();
+            for tok in &tokens {
+                if let Some(hits) = token_to_connected.get(tok) {
+                    for &(cid, deg) in hits {
+                        if cid == e.id {
+                            continue;
+                        }
+                        let entry = candidate_scores.entry(cid).or_insert((0, deg));
+                        entry.0 += 1;
+                    }
+                }
+            }
+
+            // Pick the best candidate: prefer type-compatible, high degree
+            let best = candidate_scores
+                .iter()
+                .filter(|(cid, (shared, _))| {
+                    if *shared < 1 {
+                        return false;
+                    }
+                    if let Some(ce) = id_to_entity.get(cid) {
+                        let sl = e.name.to_lowercase();
+                        let cl = ce.name.to_lowercase();
+                        if sl.contains(&cl) || cl.contains(&sl) {
+                            return false;
+                        }
+                        let sf = e.name.split_whitespace().next().unwrap_or("");
+                        let cf = ce.name.split_whitespace().next().unwrap_or("");
+                        if !sf.is_empty() && sf == cf {
+                            return false;
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .max_by_key(|(cid, (shared, deg))| {
+                    let type_bonus = if let Some(ce) = id_to_entity.get(cid) {
+                        if types_compatible(&e.entity_type, &ce.entity_type) {
+                            10
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    (*shared * 100 + type_bonus, *deg)
+                });
+
+            if let Some((&cid, _)) = best {
+                if let Some(ce) = id_to_entity.get(&cid) {
+                    let pred = infer_predicate(&e.entity_type, &ce.entity_type, None);
+                    self.brain.with_conn(|conn| {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO relations (subject_id, predicate, object_id, confidence, source_url, learned_at)
+                             VALUES (?1, ?2, ?3, 0.45, 'domain_keyword_reconnect', ?4)",
+                            params![e.id, pred, cid, Utc::now().to_rfc3339()],
+                        )?;
+                        Ok(())
+                    })?;
+                    connected.insert(e.id);
+                    reconnected += 1;
+                    if reconnected >= 300 {
+                        break;
+                    }
+                }
+            }
+        }
+        if reconnected > 0 {
+            eprintln!(
+                "  [domain-keyword-reconnect] connected {} island entities to graph",
+                reconnected
+            );
+        }
+        Ok(reconnected)
+    }
+
+    /// Batch-upgrade confidence of isolated entities that are well-known names.
+    pub fn boost_known_entity_confidence(&self) -> Result<usize> {
+        let famous_names: HashSet<&str> = [
+            "albert einstein",
+            "isaac newton",
+            "charles darwin",
+            "nikola tesla",
+            "marie curie",
+            "galileo galilei",
+            "leonardo da vinci",
+            "aristotle",
+            "plato",
+            "socrates",
+            "archimedes",
+            "pythagoras",
+            "euclid",
+            "michael faraday",
+            "james maxwell",
+            "niels bohr",
+            "max planck",
+            "erwin schrödinger",
+            "werner heisenberg",
+            "paul dirac",
+            "richard feynman",
+            "enrico fermi",
+            "lise meitner",
+            "emmy noether",
+            "bernhard riemann",
+            "georg cantor",
+            "david hilbert",
+            "alan turing",
+            "john von neumann",
+            "kurt gödel",
+            "ada lovelace",
+            "grace hopper",
+            "joseph stalin",
+            "napoleon bonaparte",
+            "julius caesar",
+            "alexander the great",
+            "cleopatra",
+            "genghis khan",
+            "william shakespeare",
+            "jane austen",
+            "leo tolstoy",
+            "ludwig van beethoven",
+            "wolfgang amadeus mozart",
+            "johann sebastian bach",
+            "ernest rutherford",
+            "niels henrik abel",
+            "évariste galois",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let entities = self.brain.all_entities()?;
+        let mut boosted = 0usize;
+        for e in &entities {
+            if e.confidence >= 0.9 {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            if famous_names.contains(lower.as_str()) {
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE entities SET confidence = MAX(confidence, 0.95) WHERE id = ?1",
+                        params![e.id],
+                    )?;
+                    Ok(())
+                })?;
+                boosted += 1;
+            }
+        }
+        if boosted > 0 {
+            eprintln!(
+                "  [known-entity-boost] upgraded confidence of {} well-known entities",
+                boosted
+            );
+        }
+        Ok(boosted)
     }
 }
 

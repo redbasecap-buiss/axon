@@ -2885,6 +2885,9 @@ const TRAILING_JUNK: &[&str] = &[
     "optimized",
     "cook",
     "dictionary",
+    "handbook",
+    "notation",
+    "annals",
     "software",
     "hardware",
     "colours",
@@ -3288,6 +3291,32 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     // Reject "List of" patterns (Wikipedia list article titles)
     if lower.starts_with("list of ") {
         return false;
+    }
+
+    // Reject multi-word entities containing publication/reference title keywords
+    // e.g. "Bernardo José-Miguel Handbook", "Complete Patents of Nikola Tesla"
+    if lower.contains(' ') {
+        const PUB_TITLE_WORDS: &[&str] = &[
+            "handbook",
+            "dictionary",
+            "encyclopedia",
+            "encyclopaedia",
+            "annals",
+            "patents",
+            "inventions",
+            "brochure",
+            "proceedings",
+            "transactions",
+            "letters correspondence",
+            "homepage",
+            "travelchinaguide",
+            "encyclopædia britannica",
+        ];
+        for kw in PUB_TITLE_WORDS {
+            if lower.contains(kw) {
+                return false;
+            }
+        }
     }
 
     // Reject "-language" suffix entries (Wikipedia language metadata like "French-language")
