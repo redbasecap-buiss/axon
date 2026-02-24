@@ -2874,6 +2874,19 @@ impl<'a> Prometheus<'a> {
         ];
         let skip_neighbor_boost = NEIGHBOR_BASED_STRATEGIES.contains(&h.pattern_source.as_str());
 
+        // Track cumulative boost to apply diminishing returns — each successive
+        // piece of evidence contributes less (prevents confidence inflation).
+        let base_confidence = h.confidence;
+        let mut total_boost: f64 = 0.0;
+        let apply_boost = |total: &mut f64, amount: f64| -> f64 {
+            // Diminishing returns: each boost is scaled by (1 - total_boost_so_far)
+            // First boost applies fully, subsequent boosts contribute less
+            let headroom = (1.0 - base_confidence - *total).max(0.0);
+            let effective = (amount * (1.0 - *total * 0.5)).min(headroom);
+            *total += effective;
+            effective
+        };
+
         // Search for supporting/contradicting evidence in the graph
         let subj = self.brain.search_entities(&h.subject)?;
         let _obj = if h.object != "?" {
@@ -2894,7 +2907,9 @@ impl<'a> Prometheus<'a> {
                         "Found relation: {} {} {} (confidence: {:.2})",
                         sname, pred, oname, conf
                     ));
-                    h.confidence = (h.confidence + 0.2).min(1.0);
+                    let boost = apply_boost(&mut total_boost, 0.2);
+                    h.confidence = (base_confidence + total_boost).min(1.0);
+                    let _ = boost; // suppress unused warning
                     direct_evidence = true;
                 }
             }
@@ -2932,7 +2947,9 @@ impl<'a> Prometheus<'a> {
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
-                    h.confidence = (h.confidence + 0.05 * shared.len() as f64).min(1.0);
+                    let raw = 0.05 * shared.len().min(4) as f64; // cap at 4 neighbors
+                    apply_boost(&mut total_boost, raw);
+                    h.confidence = (base_confidence + total_boost).min(1.0);
                 }
             }
         }
@@ -2953,7 +2970,8 @@ impl<'a> Prometheus<'a> {
                 if shared_keys >= 1 {
                     h.evidence_for
                         .push(format!("Shared {} fact keys across entities", shared_keys));
-                    h.confidence = (h.confidence + 0.05 * shared_keys as f64).min(1.0);
+                    apply_boost(&mut total_boost, 0.05 * shared_keys.min(3) as f64);
+                    h.confidence = (base_confidence + total_boost).min(1.0);
                 }
 
                 // Source co-occurrence: both entities appear in the same source URL
@@ -2971,7 +2989,8 @@ impl<'a> Prometheus<'a> {
                 if shared_sources >= 1 {
                     h.evidence_for
                         .push(format!("Co-occur in {} source URL(s)", shared_sources));
-                    h.confidence = (h.confidence + 0.03 * shared_sources as f64).min(1.0);
+                    apply_boost(&mut total_boost, 0.03 * shared_sources.min(3) as f64);
+                    h.confidence = (base_confidence + total_boost).min(1.0);
                 }
 
                 // Temporal proximity: entities first seen within 24h of each other
@@ -2983,11 +3002,13 @@ impl<'a> Prometheus<'a> {
                     if delta <= 1 {
                         h.evidence_for
                             .push("Entities discovered within 1 hour of each other".to_string());
-                        h.confidence = (h.confidence + 0.08).min(1.0);
+                        apply_boost(&mut total_boost, 0.08);
+                        h.confidence = (base_confidence + total_boost).min(1.0);
                     } else if delta <= 24 {
                         h.evidence_for
                             .push("Entities discovered within 24 hours of each other".to_string());
-                        h.confidence = (h.confidence + 0.03).min(1.0);
+                        apply_boost(&mut total_boost, 0.03);
+                        h.confidence = (base_confidence + total_boost).min(1.0);
                     }
                 }
             }
@@ -3011,11 +3032,13 @@ impl<'a> Prometheus<'a> {
                 if hops == 2 {
                     h.evidence_for
                         .push("Connected via 2-hop path through graph".to_string());
-                    h.confidence = (h.confidence + 0.10).min(1.0);
+                    apply_boost(&mut total_boost, 0.10);
+                    h.confidence = (base_confidence + total_boost).min(1.0);
                 } else if hops == 3 {
                     h.evidence_for
                         .push("Connected via 3-hop path through graph".to_string());
-                    h.confidence = (h.confidence + 0.05).min(1.0);
+                    apply_boost(&mut total_boost, 0.05);
+                    h.confidence = (base_confidence + total_boost).min(1.0);
                 }
                 // 1-hop means already directly connected — handled by direct evidence above
             }
@@ -3059,15 +3082,15 @@ impl<'a> Prometheus<'a> {
             }
         }
 
-        // Update status based on confidence
+        // Update status based on confidence (use defined thresholds)
         let was_confirmed = h.status == HypothesisStatus::Confirmed;
-        if h.confidence >= 0.8 {
+        if h.confidence >= CONFIRMATION_THRESHOLD {
             h.status = HypothesisStatus::Confirmed;
             // Record discovery if newly confirmed
             if !was_confirmed && h.id > 0 {
                 let _ = self.save_discovery(h.id, &h.evidence_for);
             }
-        } else if h.confidence <= 0.1 {
+        } else if h.confidence <= REJECTION_THRESHOLD {
             h.status = HypothesisStatus::Rejected;
         } else {
             h.status = HypothesisStatus::Testing;

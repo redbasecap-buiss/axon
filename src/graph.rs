@@ -4730,3 +4730,114 @@ pub fn cross_domain_bridges(
     bridges.sort_by(|a, b| b.2.len().cmp(&a.2.len()));
     Ok(bridges)
 }
+
+/// Structural hole score for each entity: measures how much an entity's
+/// neighbors are NOT connected to each other (Burt's constraint metric).
+/// High score = entity bridges otherwise disconnected clusters.
+/// Returns (entity_id, name, score) sorted by score descending.
+pub fn structural_hole_scores(
+    brain: &Brain,
+    top_k: usize,
+) -> Result<Vec<(i64, String, f64)>, rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let relations = brain.all_relations()?;
+
+    // Build undirected adjacency
+    let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+    for r in &relations {
+        adj.entry(r.subject_id).or_default().insert(r.object_id);
+        adj.entry(r.object_id).or_default().insert(r.subject_id);
+    }
+
+    let id_name: HashMap<i64, &str> = entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+
+    let mut scores: Vec<(i64, String, f64)> = Vec::new();
+    for (eid, neighbors) in &adj {
+        let k = neighbors.len();
+        if k < 2 {
+            continue;
+        }
+        // Count edges among neighbors
+        let mut neighbor_edges = 0usize;
+        let neighbor_vec: Vec<i64> = neighbors.iter().copied().collect();
+        for (i, &ni) in neighbor_vec.iter().enumerate() {
+            for &nj in &neighbor_vec[(i + 1)..] {
+                if adj.get(&ni).is_some_and(|s| s.contains(&nj)) {
+                    neighbor_edges += 1;
+                }
+            }
+        }
+        // Structural hole = 1 - density of ego network (excluding ego)
+        let max_edges = k * (k - 1) / 2;
+        let hole_score = if max_edges > 0 {
+            1.0 - (neighbor_edges as f64 / max_edges as f64)
+        } else {
+            0.0
+        };
+        let name = id_name.get(eid).copied().unwrap_or("?").to_string();
+        scores.push((*eid, name, hole_score));
+    }
+    scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    scores.truncate(top_k);
+    Ok(scores)
+}
+
+/// Clustering anomaly detection: find entities whose local clustering coefficient
+/// deviates significantly from the expected clustering for their degree.
+/// Returns entities with z-score > threshold (surprisingly low or high clustering).
+pub fn clustering_anomalies(
+    brain: &Brain,
+    z_threshold: f64,
+) -> Result<Vec<(i64, String, f64, f64, f64)>, rusqlite::Error> {
+    // (entity_id, name, actual_cc, expected_cc, z_score)
+    let cc = clustering_coefficients(brain)?;
+    let relations = brain.all_relations()?;
+    let entities = brain.all_entities()?;
+    let id_name: HashMap<i64, &str> = entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+
+    // Build degree map
+    let mut degree: HashMap<i64, usize> = HashMap::new();
+    for r in &relations {
+        *degree.entry(r.subject_id).or_insert(0) += 1;
+        *degree.entry(r.object_id).or_insert(0) += 1;
+    }
+
+    // Group clustering coefficients by degree to compute mean/std per degree
+    let mut by_degree: HashMap<usize, Vec<f64>> = HashMap::new();
+    for (&eid, &c) in &cc {
+        let d = degree.get(&eid).copied().unwrap_or(0);
+        by_degree.entry(d).or_default().push(c);
+    }
+
+    let mut degree_stats: HashMap<usize, (f64, f64)> = HashMap::new(); // (mean, std)
+    for (d, vals) in &by_degree {
+        if vals.len() < 3 {
+            continue; // need enough samples
+        }
+        let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+        let variance =
+            vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (vals.len() - 1) as f64;
+        let std = variance.sqrt();
+        if std > 1e-9 {
+            degree_stats.insert(*d, (mean, std));
+        }
+    }
+
+    let mut anomalies = Vec::new();
+    for (&eid, &c) in &cc {
+        let d = degree.get(&eid).copied().unwrap_or(0);
+        if let Some(&(mean, std)) = degree_stats.get(&d) {
+            let z = (c - mean) / std;
+            if z.abs() > z_threshold {
+                let name = id_name.get(&eid).copied().unwrap_or("?").to_string();
+                anomalies.push((eid, name, c, mean, z));
+            }
+        }
+    }
+    anomalies.sort_by(|a, b| {
+        b.4.abs()
+            .partial_cmp(&a.4.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(anomalies)
+}
