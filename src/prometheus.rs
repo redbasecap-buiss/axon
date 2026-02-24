@@ -4309,6 +4309,21 @@ impl<'a> Prometheus<'a> {
             &mut all_hypotheses[..]
         };
         let _ = self.boost_with_label_propagation(lp_slice);
+        // Boost/penalize based on predicate diversity impact
+        let diversity_slice = if all_hypotheses.len() > 200 {
+            &mut all_hypotheses[..200]
+        } else {
+            &mut all_hypotheses[..]
+        };
+        let diversity_boosted = self
+            .boost_diversity_increasing_hypotheses(diversity_slice)
+            .unwrap_or(0);
+        if diversity_boosted > 0 {
+            eprintln!(
+                "[PROMETHEUS] Diversity-boosted {} hypotheses",
+                diversity_boosted
+            );
+        }
         for h in all_hypotheses.iter().take(200) {
             let _ = self.save_hypothesis(h);
         }
@@ -4582,6 +4597,14 @@ impl<'a> Prometheus<'a> {
         // Domain-keyword island reconnection (high-value entities with shared name tokens)
         let domain_reconnected = self.reconnect_islands_by_domain().unwrap_or(0);
 
+        // Predicate-object token island reconnection (match island names to relation objects)
+        let pred_obj_reconnected = self
+            .reconnect_islands_by_predicate_object_tokens()
+            .unwrap_or(0);
+
+        // Reclassify island concepts by token-type voting from connected graph
+        let token_type_reclassified = self.reclassify_islands_by_token_type().unwrap_or(0);
+
         // Purge foreign-language extraction noise from islands
         let foreign_purged = self.purge_foreign_language_islands().unwrap_or(0);
 
@@ -4681,7 +4704,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -4762,6 +4785,8 @@ impl<'a> Prometheus<'a> {
             tfidf_reconnected,
             source_reconnected,
             domain_reconnected,
+            pred_obj_reconnected,
+            token_type_reclassified,
             foreign_purged,
             known_boosted,
             predicates_refined,
@@ -17391,6 +17416,287 @@ impl<'a> Prometheus<'a> {
             );
         }
         Ok(boosted)
+    }
+
+    /// Reconnect isolated entities by matching their name tokens against
+    /// predicate-object pairs in the connected graph.
+    ///
+    /// Example: isolated "Quantum Entanglement" can connect to "Albert Einstein"
+    /// if Einstein has a relation "pioneered → Quantum Mechanics" and the tokens
+    /// overlap sufficiently.
+    pub fn reconnect_islands_by_predicate_object_tokens(&self) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let id_to_entity: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Build token index: token → Vec<(entity_id, predicate)> from connected entities' relation objects
+        let stopwords: HashSet<&str> = [
+            "the", "of", "and", "in", "to", "a", "is", "for", "on", "with", "at", "by", "from",
+            "or", "an", "be", "as", "was", "are", "it", "its", "has", "had", "not", "but",
+        ]
+        .into_iter()
+        .collect();
+
+        let mut token_to_subjects: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+        for r in &relations {
+            if r.confidence < 0.5 || is_generic_predicate(&r.predicate) {
+                continue;
+            }
+            if let Some(obj_ent) = id_to_entity.get(&r.object_id) {
+                if is_noise_type(&obj_ent.entity_type) || is_noise_name(&obj_ent.name) {
+                    continue;
+                }
+                for word in obj_ent.name.to_lowercase().split_whitespace() {
+                    let w = word.trim_matches(|c: char| !c.is_alphanumeric());
+                    if w.len() >= 4 && !stopwords.contains(w) {
+                        token_to_subjects
+                            .entry(w.to_string())
+                            .or_default()
+                            .push((r.subject_id, r.predicate.clone()));
+                    }
+                }
+            }
+        }
+
+        // For each isolated entity, find connected subjects whose relation objects share tokens
+        let mut reconnected = 0usize;
+        let max_reconnect = 200;
+        for e in &entities {
+            if reconnected >= max_reconnect {
+                break;
+            }
+            if connected.contains(&e.id) || is_noise_type(&e.entity_type) || is_noise_name(&e.name)
+            {
+                continue;
+            }
+            if e.name.split_whitespace().count() < 2 {
+                continue; // Skip single-word entities (too ambiguous)
+            }
+
+            // Collect matching subjects by counting shared tokens
+            let mut subject_scores: HashMap<i64, (usize, String)> = HashMap::new();
+            let tokens: Vec<String> = e
+                .name
+                .to_lowercase()
+                .split_whitespace()
+                .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+                .filter(|w| w.len() >= 4 && !stopwords.contains(w.as_str()))
+                .collect();
+
+            if tokens.is_empty() {
+                continue;
+            }
+
+            for tok in &tokens {
+                if let Some(subjects) = token_to_subjects.get(tok) {
+                    for (sid, pred) in subjects {
+                        if let Some(subj_ent) = id_to_entity.get(sid) {
+                            // Don't connect to same type if types are too different
+                            if subj_ent.entity_type == e.entity_type {
+                                continue; // Same-type token matching is handled by other strategies
+                            }
+                        }
+                        let entry = subject_scores.entry(*sid).or_insert((0, pred.clone()));
+                        entry.0 += 1;
+                    }
+                }
+            }
+
+            // Require at least 2 shared tokens or 50%+ token overlap
+            let min_overlap = if tokens.len() <= 2 {
+                2
+            } else {
+                (tokens.len() + 1) / 2
+            };
+            let best = subject_scores
+                .iter()
+                .filter(|(_, (score, _))| *score >= min_overlap)
+                .max_by_key(|(_, (score, _))| *score);
+
+            if let Some((&subject_id, (_, _pred))) = best {
+                let predicate = if e.entity_type == "concept"
+                    && id_to_entity
+                        .get(&subject_id)
+                        .map(|s| s.entity_type.as_str())
+                        == Some("person")
+                {
+                    "pioneered".to_string()
+                } else {
+                    format!("related_to")
+                };
+                let _ = self.brain.upsert_relation(
+                    subject_id,
+                    &predicate,
+                    e.id,
+                    "prometheus:predicate_object_token_reconnect",
+                );
+                reconnected += 1;
+            }
+        }
+
+        if reconnected > 0 {
+            eprintln!(
+                "  [predicate-object-token-reconnect] connected {} island entities to graph",
+                reconnected
+            );
+        }
+        Ok(reconnected)
+    }
+
+    /// Hypothesis quality scoring boost: hypotheses that would increase
+    /// predicate diversity for their subject get a confidence boost.
+    /// This helps avoid "pioneered-everything" hub formation.
+    pub fn boost_diversity_increasing_hypotheses(
+        &self,
+        hypotheses: &mut [Hypothesis],
+    ) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let name_to_id: HashMap<&str, i64> =
+            entities.iter().map(|e| (e.name.as_str(), e.id)).collect();
+
+        // Build per-entity predicate distribution
+        let mut entity_predicates: HashMap<i64, HashMap<String, usize>> = HashMap::new();
+        for r in &relations {
+            *entity_predicates
+                .entry(r.subject_id)
+                .or_default()
+                .entry(r.predicate.clone())
+                .or_insert(0) += 1;
+            *entity_predicates
+                .entry(r.object_id)
+                .or_default()
+                .entry(r.predicate.clone())
+                .or_insert(0) += 1;
+        }
+
+        let mut boosted = 0usize;
+        for h in hypotheses.iter_mut() {
+            if h.status != HypothesisStatus::Testing && h.status != HypothesisStatus::Proposed {
+                continue;
+            }
+            if let Some(&subj_id) = name_to_id.get(h.subject.as_str()) {
+                if let Some(pred_counts) = entity_predicates.get(&subj_id) {
+                    let total: usize = pred_counts.values().sum();
+                    if total < 3 {
+                        continue; // Too few relations to judge diversity
+                    }
+                    // Check if hypothesis predicate is already dominant
+                    let existing_count = pred_counts.get(&h.predicate).copied().unwrap_or(0);
+                    let dominance = existing_count as f64 / total as f64;
+
+                    if dominance > 0.6 {
+                        // Adding more of the same predicate → penalize
+                        h.confidence *= 0.85;
+                        h.evidence_against.push(format!(
+                            "Predicate '{}' already dominates ({:.0}%) for {}",
+                            h.predicate,
+                            dominance * 100.0,
+                            h.subject
+                        ));
+                    } else if existing_count == 0 {
+                        // New predicate type → boost
+                        h.confidence = (h.confidence * 1.10).min(0.95);
+                        h.evidence_for.push(format!(
+                            "New predicate '{}' would increase diversity for {}",
+                            h.predicate, h.subject
+                        ));
+                        boosted += 1;
+                    }
+                }
+            }
+        }
+        Ok(boosted)
+    }
+
+    /// Reclassify island entities by inferring type from their name tokens
+    /// against the most common type for those tokens in the connected graph.
+    pub fn reclassify_islands_by_token_type(&self) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+
+        // Build token → type distribution from connected entities
+        let mut token_types: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        for e in &entities {
+            if !connected.contains(&e.id) || is_noise_type(&e.entity_type) || is_noise_name(&e.name)
+            {
+                continue;
+            }
+            for word in e.name.to_lowercase().split_whitespace() {
+                let w = word.trim_matches(|c: char| !c.is_alphanumeric());
+                if w.len() >= 4 {
+                    *token_types
+                        .entry(w.to_string())
+                        .or_default()
+                        .entry(e.entity_type.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut reclassified = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) || is_noise_type(&e.entity_type) || is_noise_name(&e.name)
+            {
+                continue;
+            }
+            // Only reclassify "concept" entities (most likely misclassified)
+            if e.entity_type != "concept" {
+                continue;
+            }
+            // Count type votes from name tokens
+            let mut type_votes: HashMap<String, usize> = HashMap::new();
+            let mut total_votes = 0usize;
+            for word in e.name.to_lowercase().split_whitespace() {
+                let w = word.trim_matches(|c: char| !c.is_alphanumeric());
+                if let Some(types) = token_types.get(w) {
+                    for (t, count) in types {
+                        if t != "concept" {
+                            // Don't vote for concept (that's what we're trying to fix)
+                            *type_votes.entry(t.clone()).or_insert(0) += count;
+                            total_votes += count;
+                        }
+                    }
+                }
+            }
+            if total_votes < 3 {
+                continue;
+            }
+            // Require strong consensus (>60% agreement)
+            if let Some((best_type, best_count)) = type_votes.iter().max_by_key(|(_, v)| *v) {
+                if *best_count as f64 / total_votes as f64 > 0.6 && best_type != "concept" {
+                    let _ = self.brain.with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE entities SET entity_type = ?1 WHERE id = ?2",
+                            params![best_type, e.id],
+                        )?;
+                        Ok(())
+                    });
+                    reclassified += 1;
+                }
+            }
+        }
+
+        if reclassified > 0 {
+            eprintln!(
+                "  [token-type-reclassify] reclassified {} island concepts by token voting",
+                reclassified
+            );
+        }
+        Ok(reclassified)
     }
 }
 
