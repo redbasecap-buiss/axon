@@ -2497,6 +2497,40 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "pacifism",
     "anarchism",
     "syndicalism",
+    // Added 2026-02-24: more generic words from DB cleanup
+    "honour",
+    "genius",
+    "sterile",
+    "dispute",
+    "cuisine",
+    "quest",
+    "oxygen",
+    "décor",
+    "revolutionary",
+    "recurrence",
+    "experience",
+    "poetry",
+    "overhead",
+    "likewise",
+    "buggy",
+    "undergraduate",
+    "survey",
+    "doctrine",
+    "troops",
+    "factory",
+    "decline",
+    "oblique",
+    "semiconductors",
+    "decrees",
+    "enrich",
+    "camels",
+    "argent",
+    "patriarch",
+    "sovereign",
+    "prolog",
+    "rivalry",
+    "decree",
+    "thermae",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -3315,7 +3349,28 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             "foundation",
             "laboratory",
             "observatory",
+            // Country/region names — "X China", "Y Rome" etc. are not people
+            "empire",
+            "republic",
+            "dynasty",
+            "kingdom",
+            "initiative",
+            "commonwealth",
+            "international",
+            "program ",
+            "programs",
         ];
+        // Also reject person entities ending with a country/region name
+        const PERSON_COUNTRY_BLACKLIST: &[&str] = &[
+            "china", "japan", "india", "russia", "france", "germany", "italy", "spain", "turkey",
+            "iran", "iraq", "egypt", "rome", "greece", "persia", "arabia", "mongolia", "tibet",
+            "burma", "siam", "brazil", "mexico",
+        ];
+        if let Some(last) = lower.split_whitespace().last() {
+            if lower.contains(' ') && PERSON_COUNTRY_BLACKLIST.contains(&last) {
+                return false;
+            }
+        }
         if person_blacklist_words.iter().any(|w| lower.contains(w)) {
             return false;
         }

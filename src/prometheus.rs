@@ -2180,6 +2180,31 @@ impl<'a> Prometheus<'a> {
         // Note: community and k-core boosting is done in batch via
         // boost_hypotheses_with_graph_structure() to avoid recomputing per-hypothesis.
 
+        // Predicate diversity bonus: hypotheses introducing rare predicates
+        // get a boost to counteract graph homogeneity (e.g., contemporary_of dominance).
+        let pred_count: i64 = self.brain.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM relations WHERE predicate = ?1",
+                params![hypothesis.predicate],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })?;
+        let total_rels: i64 = self.brain.with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM relations", [], |row| row.get(0))
+                .map_err(Into::into)
+        })?;
+        if total_rels > 0 {
+            let pred_freq = pred_count as f64 / total_rels as f64;
+            // Predicates appearing in <5% of relations get a small bonus
+            if pred_freq < 0.05 {
+                score += 0.05;
+            } else if pred_freq > 0.25 {
+                // Dominant predicates get a slight penalty to promote diversity
+                score -= 0.03;
+            }
+        }
+
         // Apply pattern weight
         let weight = self.get_pattern_weight(&hypothesis.pattern_source)?;
         score *= weight;
@@ -3296,6 +3321,45 @@ impl<'a> Prometheus<'a> {
                 .hypothesis_exists(&h.subject, &h.predicate, &h.object)
                 .unwrap_or(true)
         });
+
+        // Strategy diversity balancer: cap per-strategy contributions to ensure
+        // underrepresented strategies get room. Max 40% from any single strategy.
+        let total_before_diversity = all_hypotheses.len();
+        if total_before_diversity > 50 {
+            let max_per_strategy = (total_before_diversity * 2 / 5).max(20); // 40% cap, min 20
+            let mut strategy_counts: HashMap<String, usize> = HashMap::new();
+            let mut overflow: Vec<Hypothesis> = Vec::new();
+            let mut balanced: Vec<Hypothesis> = Vec::new();
+            for h in all_hypotheses.drain(..) {
+                let count = strategy_counts.entry(h.pattern_source.clone()).or_insert(0);
+                if *count < max_per_strategy {
+                    *count += 1;
+                    balanced.push(h);
+                } else {
+                    overflow.push(h);
+                }
+            }
+            // Backfill from overflow if we have room (prioritize rare strategies)
+            overflow.sort_by(|a, b| {
+                let a_count = strategy_counts.get(&a.pattern_source).copied().unwrap_or(0);
+                let b_count = strategy_counts.get(&b.pattern_source).copied().unwrap_or(0);
+                a_count.cmp(&b_count).then(
+                    b.confidence
+                        .partial_cmp(&a.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+            });
+            balanced.extend(overflow.into_iter().take(50)); // allow some overflow
+            let diversity_trimmed = total_before_diversity.saturating_sub(balanced.len());
+            if diversity_trimmed > 0 {
+                eprintln!(
+                    "[PROMETHEUS] Strategy diversity balancer: trimmed {} hypotheses (cap {})",
+                    diversity_trimmed, max_per_strategy
+                );
+            }
+            all_hypotheses = balanced;
+        }
+
         for h in all_hypotheses.iter_mut().take(200) {
             self.score_hypothesis(h)?;
             self.validate_hypothesis(h)?;
