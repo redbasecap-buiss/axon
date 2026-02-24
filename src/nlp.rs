@@ -4444,6 +4444,20 @@ fn classify_entity_type(name: &str) -> &'static str {
         return "concept";
     }
 
+    // Single-word place detection by geographic suffix
+    if words.len() == 1 {
+        const GEO_SUFFIXES: &[&str] = &[
+            "burg", "burgh", "bury", "stadt", "town", "ville", "polis", "grad", "abad", "port",
+            "haven", "ford", "mouth", "minster", "chester", "cester", "bridge", "wick", "stead",
+            "heim", "dorf", "berg",
+        ];
+        for suffix in GEO_SUFFIXES {
+            if lower.len() > suffix.len() + 2 && lower.ends_with(suffix) {
+                return "place";
+            }
+        }
+    }
+
     // Two or three capitalized words with no indicators → likely person name
     // But only if words look like actual names (no long compound words)
     if words.len() >= 2
@@ -6083,5 +6097,19 @@ mod tests {
             "entities: {:?}",
             e.entities
         );
+    }
+
+    #[test]
+    fn test_geo_suffix_classification() {
+        assert_eq!(classify_entity_type("Middletown"), "place");
+        assert_eq!(classify_entity_type("Stuttgart"), "place");
+        assert_eq!(classify_entity_type("Hagerstown"), "place");
+        assert_eq!(classify_entity_type("Amphipolis"), "place");
+        assert_eq!(classify_entity_type("Freetown"), "place");
+        assert_eq!(classify_entity_type("Heidelberg"), "place");
+        assert_eq!(classify_entity_type("Düsseldorf"), "place");
+        // Surnames ending in -ford should still be short enough to match,
+        // but person classification takes priority for multi-word
+        assert_eq!(classify_entity_type("Newport"), "place");
     }
 }

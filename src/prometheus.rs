@@ -2034,12 +2034,38 @@ impl<'a> Prometheus<'a> {
             "is",
             "has",
             "was",
+            "includes",
+            "contains",
+            "involves",
+            "features",
+            "describes",
         ]
         .into_iter()
         .collect();
+
+        // Specific predicates that imply a meaningful peer relationship
+        let peer_predicates: HashMap<&str, &str> = [
+            ("born_in", "share_birthplace"),
+            ("located_in", "co_located_in"),
+            ("member_of", "co_member_of"),
+            ("founded", "co_founded"),
+            ("studied_at", "co_studied_at"),
+            ("works_at", "co_employed_at"),
+            ("developed", "co_developed"),
+            ("invented", "co_invented"),
+            ("discovered", "co_discovered"),
+            ("published_in", "co_published_in"),
+            ("headquartered_in", "co_headquartered_in"),
+        ]
+        .into_iter()
+        .collect();
+
         let mut groups: HashMap<(String, i64), Vec<i64>> = HashMap::new();
         for r in &relations {
-            if meaningful.contains(&r.subject_id) && !skip_preds.contains(r.predicate.as_str()) {
+            if meaningful.contains(&r.subject_id)
+                && !skip_preds.contains(r.predicate.as_str())
+                && r.confidence >= 0.5
+            {
                 groups
                     .entry((r.predicate.clone(), r.object_id))
                     .or_default()
@@ -2048,21 +2074,52 @@ impl<'a> Prometheus<'a> {
         }
         let mut hypotheses = Vec::new();
         for ((pred, obj_id), subjects) in &groups {
-            if subjects.len() < 2 || subjects.len() > 10 {
+            // Require 2-5 subjects sharing the same object (>5 is too generic)
+            if subjects.len() < 2 || subjects.len() > 5 {
                 continue;
             }
             let obj_name = self.entity_name(*obj_id)?;
+
+            // Derive a meaningful predicate from the shared relationship
+            let inferred_pred = peer_predicates
+                .get(pred.as_str())
+                .copied()
+                .unwrap_or_else(|| {
+                    // For non-mapped predicates, use the original predicate context
+                    // but only if it's specific enough
+                    if pred.contains('_') && pred.len() > 5 {
+                        "shares_context_with"
+                    } else {
+                        return "related_to"; // too vague, will get lower confidence
+                    }
+                });
+
+            // Confidence depends on predicate specificity
+            let base_conf = if peer_predicates.contains_key(pred.as_str()) {
+                0.60 // known peer relationship
+            } else if inferred_pred == "shares_context_with" {
+                0.50 // reasonable inference
+            } else {
+                0.35 // generic, likely noise
+            };
+
             // For each pair of subjects, propose a relationship
-            for i in 0..subjects.len().min(5) {
-                for j in (i + 1)..subjects.len().min(5) {
+            for i in 0..subjects.len().min(4) {
+                for j in (i + 1)..subjects.len().min(4) {
                     let a = self.entity_name(subjects[i])?;
                     let b = self.entity_name(subjects[j])?;
+
+                    // Skip if inferred predicate is too vague and confidence too low
+                    if inferred_pred == "related_to" {
+                        continue;
+                    }
+
                     hypotheses.push(Hypothesis {
                         id: 0,
                         subject: a.clone(),
-                        predicate: "related_to".to_string(),
+                        predicate: inferred_pred.to_string(),
                         object: b.clone(),
-                        confidence: 0.45,
+                        confidence: base_conf,
                         evidence_for: vec![format!(
                             "Both {} and {} share '{}' relationship to '{}'",
                             a, b, pred, obj_name
@@ -2071,7 +2128,10 @@ impl<'a> Prometheus<'a> {
                         reasoning_chain: vec![
                             format!("{} {} {}", a, pred, obj_name),
                             format!("{} {} {}", b, pred, obj_name),
-                            format!("Shared object suggests {} and {} may be related", a, b),
+                            format!(
+                                "Shared '{}' to '{}' implies {} relationship",
+                                pred, obj_name, inferred_pred
+                            ),
                         ],
                         status: HypothesisStatus::Proposed,
                         discovered_at: now_str(),
@@ -2488,6 +2548,23 @@ impl<'a> Prometheus<'a> {
                     h.evidence_for
                         .push(format!("Co-occur in {} source URL(s)", shared_sources));
                     h.confidence = (h.confidence + 0.03 * shared_sources as f64).min(1.0);
+                }
+
+                // Temporal proximity: entities first seen within 24h of each other
+                // are likely related (extracted from the same crawl session / topic)
+                {
+                    let delta = (s_ent.first_seen - o_ent.first_seen)
+                        .num_hours()
+                        .unsigned_abs();
+                    if delta <= 1 {
+                        h.evidence_for
+                            .push("Entities discovered within 1 hour of each other".to_string());
+                        h.confidence = (h.confidence + 0.08).min(1.0);
+                    } else if delta <= 24 {
+                        h.evidence_for
+                            .push("Entities discovered within 24 hours of each other".to_string());
+                        h.confidence = (h.confidence + 0.03).min(1.0);
+                    }
                 }
             }
         }
@@ -4762,16 +4839,72 @@ impl<'a> Prometheus<'a> {
                 // Check if entities even exist with relations
                 let subj = self.brain.get_entity_by_name(&h.subject)?;
                 let obj = self.brain.get_entity_by_name(&h.object)?;
-                match (subj, obj) {
+                match (&subj, &obj) {
                     (None, _) | (_, None) => {
                         // Entity deleted or never existed — reject
                         self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
                         self.record_outcome(&h.pattern_source, false)?;
                         rejected += 1;
                     }
-                    _ => {
-                        // Check for contradictions
-                        if self.check_contradiction(h)? {
+                    (Some(s_ent), Some(o_ent)) => {
+                        // Multi-signal evidence accumulation before final decision
+                        let mut evidence_score: f64 = h.confidence;
+
+                        // Signal 1: Shared source URLs
+                        let s_sources: HashSet<String> = self
+                            .brain
+                            .get_source_urls_for(s_ent.id)?
+                            .into_iter()
+                            .collect();
+                        let o_sources: HashSet<String> = self
+                            .brain
+                            .get_source_urls_for(o_ent.id)?
+                            .into_iter()
+                            .collect();
+                        let shared_sources = s_sources.intersection(&o_sources).count();
+                        if shared_sources >= 2 {
+                            evidence_score += 0.05 * shared_sources as f64;
+                        }
+
+                        // Signal 2: Shared fact keys with matching values
+                        let s_facts = self.brain.get_facts_for(s_ent.id)?;
+                        let o_facts = self.brain.get_facts_for(o_ent.id)?;
+                        let s_kv: HashSet<(String, String)> = s_facts
+                            .iter()
+                            .map(|f| (f.key.clone(), f.value.clone()))
+                            .collect();
+                        let o_kv: HashSet<(String, String)> = o_facts
+                            .iter()
+                            .map(|f| (f.key.clone(), f.value.clone()))
+                            .collect();
+                        let shared_facts = s_kv.intersection(&o_kv).count();
+                        if shared_facts >= 1 {
+                            evidence_score += 0.10 * shared_facts as f64;
+                        }
+
+                        // Signal 3: Same entity type + high degree (well-established entities)
+                        if s_ent.entity_type == o_ent.entity_type {
+                            let s_rels = self.brain.get_relations_for(s_ent.id)?;
+                            let o_rels = self.brain.get_relations_for(o_ent.id)?;
+                            if s_rels.len() >= 3 && o_rels.len() >= 3 {
+                                evidence_score += 0.05;
+                            }
+                        }
+
+                        // Confirm if accumulated evidence is strong enough
+                        if evidence_score >= CONFIRMATION_THRESHOLD {
+                            self.update_hypothesis_status(h.id, HypothesisStatus::Confirmed)?;
+                            self.record_outcome(&h.pattern_source, true)?;
+                            let evidence = vec![
+                                format!(
+                                    "Multi-signal confirmation: score {:.2} (sources={}, facts={})",
+                                    evidence_score, shared_sources, shared_facts
+                                ),
+                                format!("Pattern source: {}", h.pattern_source),
+                            ];
+                            let _ = self.save_discovery(h.id, &evidence);
+                            confirmed += 1;
+                        } else if self.check_contradiction(h)? {
                             self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
                             self.record_outcome(&h.pattern_source, false)?;
                             rejected += 1;
