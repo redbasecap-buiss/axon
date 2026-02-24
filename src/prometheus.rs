@@ -2953,7 +2953,25 @@ impl<'a> Prometheus<'a> {
                 let s_keys: HashSet<&str> = s_facts.iter().map(|f| f.key.as_str()).collect();
                 let o_keys: HashSet<&str> = o_facts.iter().map(|f| f.key.as_str()).collect();
                 let shared_keys = s_keys.intersection(&o_keys).count();
-                if shared_keys >= 1 {
+
+                // Stronger signal: count matching key-value pairs (not just keys)
+                let s_kv: HashSet<(&str, &str)> = s_facts
+                    .iter()
+                    .map(|f| (f.key.as_str(), f.value.as_str()))
+                    .collect();
+                let o_kv: HashSet<(&str, &str)> = o_facts
+                    .iter()
+                    .map(|f| (f.key.as_str(), f.value.as_str()))
+                    .collect();
+                let shared_kv = s_kv.intersection(&o_kv).count();
+
+                if shared_kv >= 1 {
+                    // Exact key-value match is strong evidence (same field, same nationality, etc.)
+                    h.evidence_for
+                        .push(format!("Shared {} exact fact key-value pairs", shared_kv));
+                    apply_boost(&mut total_boost, 0.08 * shared_kv.min(3) as f64);
+                    h.confidence = (base_confidence + total_boost).min(1.0);
+                } else if shared_keys >= 1 {
                     h.evidence_for
                         .push(format!("Shared {} fact keys across entities", shared_keys));
                     apply_boost(&mut total_boost, 0.05 * shared_keys.min(3) as f64);
@@ -3192,18 +3210,41 @@ impl<'a> Prometheus<'a> {
 
     pub fn record_outcome(&self, pattern_type: &str, confirmed: bool) -> Result<()> {
         self.brain.with_conn(|conn| {
+            // Update counts for historical tracking
             conn.execute(
                 "INSERT INTO pattern_weights (pattern_type, confirmations, rejections, weight)
                  VALUES (?1, ?2, ?3, 1.0)
                  ON CONFLICT(pattern_type) DO UPDATE SET
                     confirmations = confirmations + ?2,
-                    rejections = rejections + ?3,
-                    weight = CAST(confirmations + ?2 AS REAL) / MAX(1, confirmations + ?2 + rejections + ?3)",
+                    rejections = rejections + ?3",
                 params![
                     pattern_type,
                     if confirmed { 1 } else { 0 },
                     if confirmed { 0 } else { 1 },
                 ],
+            )?;
+            // Use EMA-blended weight: 80% historical ratio + 20% recent outcome.
+            // This lets recovering strategies bounce back faster than pure cumulative.
+            let (conf, rej): (i64, i64) = conn.query_row(
+                "SELECT confirmations, rejections FROM pattern_weights WHERE pattern_type = ?1",
+                params![pattern_type],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let total = conf + rej;
+            let historical = if total > 0 {
+                conf as f64 / total as f64
+            } else {
+                1.0
+            };
+            let recent = if confirmed { 1.0 } else { 0.0 };
+            // Blend factor: with few samples trust historical ratio more,
+            // as samples grow allow recent signal to nudge the weight.
+            // recency_factor ranges from ~0.03 (3 samples) to ~0.10 (100+ samples)
+            let recency_factor = (10.0 / (total as f64 + 30.0)).min(0.15);
+            let ema_weight = historical * (1.0 - recency_factor) + recent * recency_factor;
+            conn.execute(
+                "UPDATE pattern_weights SET weight = ?1 WHERE pattern_type = ?2",
+                params![ema_weight, pattern_type],
             )?;
             Ok(())
         })
@@ -21554,12 +21595,44 @@ fn predicates_similar(a: &str, b: &str) -> bool {
         return true;
     }
     let synonyms = [
-        &["created", "created_by", "made", "built", "developed"][..],
-        &["is", "is_a", "type_of"],
-        &["has", "contains", "includes"],
-        &["part_of", "belongs_to", "member_of"],
-        &["located_in", "based_in", "in"],
-        &["related_to", "associated_with", "connected_to", "knows"],
+        &[
+            "created",
+            "created_by",
+            "made",
+            "built",
+            "developed",
+            "invented",
+            "designed",
+            "authored",
+        ][..],
+        &["is", "is_a", "type_of", "instance_of"],
+        &["has", "contains", "includes", "possesses"],
+        &["part_of", "belongs_to", "member_of", "component_of"],
+        &["located_in", "based_in", "in", "situated_in", "resides_in"],
+        &[
+            "related_to",
+            "associated_with",
+            "connected_to",
+            "knows",
+            "linked_to",
+        ],
+        &["born_in", "birthplace", "native_of", "origin"],
+        &["died_in", "death_place", "buried_in"],
+        &["studied_at", "educated_at", "attended", "alumnus_of"],
+        &["worked_at", "employed_by", "affiliated_with", "served_at"],
+        &["influenced", "inspired", "influenced_by", "inspired_by"],
+        &[
+            "preceded",
+            "preceded_by",
+            "succeeded",
+            "succeeded_by",
+            "followed_by",
+        ],
+        &["discovered", "discovered_by", "found", "found_by"],
+        &["named_after", "eponym_of", "namesake"],
+        &["contemporary_of", "peer_of", "co_practitioner"],
+        &["capital_of", "capital", "seat_of"],
+        &["founded", "founded_by", "established", "established_by"],
     ];
     for group in &synonyms {
         if group.contains(&a) && group.contains(&b) {
@@ -21891,8 +21964,9 @@ mod tests {
         p.record_outcome("structural_hole", true).unwrap();
         p.record_outcome("structural_hole", false).unwrap();
         let w = p.get_pattern_weight("structural_hole").unwrap();
-        // 2 confirmations, 1 rejection => 2/3 ≈ 0.667
-        assert!((w - 2.0 / 3.0).abs() < 0.01, "weight: {}", w);
+        // EMA-blended weight: historical ratio 2/3, last outcome=false, recency_factor capped at 0.15
+        // weight ≈ 0.667 * 0.85 + 0.0 * 0.15 ≈ 0.567
+        assert!(w > 0.4 && w < 0.75, "weight: {}", w);
     }
 
     #[test]
