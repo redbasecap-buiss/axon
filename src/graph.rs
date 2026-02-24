@@ -5495,6 +5495,82 @@ pub fn k_shell_decomposition(brain: &Brain) -> Result<HashMap<i64, usize>, rusql
 
 /// Summary statistics for k-shell decomposition.
 /// Returns (max_coreness, core_size_at_max, distribution: Vec<(k, count)>).
+/// Temporal PageRank: standard PageRank with a recency bias.
+/// Entities seen more recently get a higher teleportation weight,
+/// making the ranking favor fresh/active knowledge over stale nodes.
+/// `half_life_days` controls the exponential decay: an entity last seen
+/// `half_life_days` ago gets half the teleportation weight of one seen today.
+pub fn temporal_pagerank(
+    brain: &Brain,
+    damping: f64,
+    iterations: usize,
+    half_life_days: f64,
+) -> Result<HashMap<i64, f64>, rusqlite::Error> {
+    let entities = brain.all_entities()?;
+    let relations = brain.all_relations()?;
+    let n = entities.len();
+    if n == 0 {
+        return Ok(HashMap::new());
+    }
+
+    let now = chrono::Utc::now().naive_utc();
+    let decay_rate = (0.5_f64).ln() / half_life_days;
+
+    // Compute recency weight per entity
+    let mut recency: HashMap<i64, f64> = HashMap::with_capacity(n);
+    let mut total_recency = 0.0_f64;
+    for e in &entities {
+        let age_days = (now - e.last_seen).num_seconds().max(0) as f64 / 86400.0;
+        let w = (decay_rate * age_days).exp(); // 1.0 for now, 0.5 at half_life
+        recency.insert(e.id, w);
+        total_recency += w;
+    }
+    // Normalize to distribution
+    if total_recency > 0.0 {
+        for v in recency.values_mut() {
+            *v /= total_recency;
+        }
+    }
+
+    let ids: Vec<i64> = entities.iter().map(|e| e.id).collect();
+    let id_set: HashSet<i64> = ids.iter().copied().collect();
+    let mut out_links: HashMap<i64, Vec<i64>> = HashMap::new();
+    for r in &relations {
+        if id_set.contains(&r.subject_id) && id_set.contains(&r.object_id) {
+            out_links.entry(r.subject_id).or_default().push(r.object_id);
+        }
+    }
+
+    let mut scores: HashMap<i64, f64> = ids.iter().map(|&id| (id, 1.0 / n as f64)).collect();
+    for _ in 0..iterations {
+        let mut dangling_sum = 0.0_f64;
+        let mut new_scores: HashMap<i64, f64> = ids
+            .iter()
+            .map(|&id| {
+                let teleport = recency.get(&id).copied().unwrap_or(1.0 / n as f64);
+                (id, (1.0 - damping) * teleport)
+            })
+            .collect();
+        for &id in &ids {
+            if let Some(out) = out_links.get(&id) {
+                let share = scores[&id] / out.len() as f64;
+                for &target in out {
+                    *new_scores.entry(target).or_insert(0.0) += damping * share;
+                }
+            } else {
+                dangling_sum += scores[&id];
+            }
+        }
+        // Distribute dangling mass proportional to recency
+        for &id in &ids {
+            let teleport = recency.get(&id).copied().unwrap_or(1.0 / n as f64);
+            *new_scores.entry(id).or_insert(0.0) += damping * dangling_sum * teleport;
+        }
+        scores = new_scores;
+    }
+    Ok(scores)
+}
+
 pub fn k_shell_summary(
     brain: &Brain,
 ) -> Result<(usize, usize, Vec<(usize, usize)>), rusqlite::Error> {

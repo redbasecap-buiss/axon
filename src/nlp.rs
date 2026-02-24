@@ -3838,6 +3838,26 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject citation-style "In Author" patterns (e.g. "Byzantium In Stewart Parnell")
+    // Capitalized "In" mid-entity is almost always a bibliography reference, not a real entity.
+    {
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        for (idx, w) in words.iter().enumerate() {
+            if idx > 0 && idx < words.len() - 1 && *w == "In" {
+                return false;
+            }
+        }
+        // Also reject "Something After Something" patterns (cross-section title merges)
+        for (idx, w) in words.iter().enumerate() {
+            if idx > 0
+                && idx < words.len() - 1
+                && matches!(*w, "After" | "Before" | "During" | "Between" | "Throughout")
+            {
+                return false;
+            }
+        }
+    }
+
     // Reject slash-separated compound entities (e.g. "Karatsuba/Voronin", "Ocean/sea")
     // but allow known patterns like "AdS/CFT", "TCP/IP"
     if trimmed.contains('/') {

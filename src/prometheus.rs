@@ -4920,6 +4920,9 @@ impl<'a> Prometheus<'a> {
         // Broader minute-level temporal cohort reconnection
         let minute_cohort_reconnected = self.reconnect_islands_by_minute_cohort().unwrap_or(0);
 
+        // Large cohort type-partitioned reconnection (handles cohorts >50 that minute-cohort skips)
+        let large_cohort_reconnected = self.reconnect_large_cohorts_by_type().unwrap_or(0);
+
         // Domain-keyword island reconnection (high-value entities with shared name tokens)
         let domain_reconnected = self.reconnect_islands_by_domain().unwrap_or(0);
 
@@ -5100,7 +5103,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} geo-person-reclassified, {} place-region-reclassified, {} compound-concept-reclassified, {} endash-reclassified, {} ancient-islands-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} minute-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} hv-cohort-reconnected, {} surname-reconnected, {} source-url-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} geo-person-reclassified, {} place-region-reclassified, {} compound-concept-reclassified, {} endash-reclassified, {} ancient-islands-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} minute-cohort reconnected, {} large-cohort-type reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} hv-cohort-reconnected, {} surname-reconnected, {} source-url-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -5195,6 +5198,7 @@ impl<'a> Prometheus<'a> {
             tfidf_reconnected,
             source_reconnected,
             minute_cohort_reconnected,
+            large_cohort_reconnected,
             domain_reconnected,
             fact_value_bridged,
             pred_obj_reconnected,
@@ -21282,6 +21286,140 @@ impl<'a> Prometheus<'a> {
         if reconnected > 0 {
             eprintln!(
                 "  [minute-cohort-reconnect] reconnected {} islands via minute-level temporal cohort",
+                reconnected
+            );
+        }
+        Ok(reconnected)
+    }
+
+    /// Handle large temporal cohorts (>50 entities) that minute-cohort skips.
+    /// Sub-partitions by entity_type, then connects each type-sub-group to the
+    /// highest-degree connected entity of that type (or any type) within the cohort.
+    /// This catches bulk-import batches where hundreds of entities arrive together.
+    pub fn reconnect_large_cohorts_by_type(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut connected: HashSet<i64> = HashSet::new();
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        let id_to_entity: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+
+        // Group by first_seen minute
+        let mut minute_cohorts: HashMap<String, Vec<i64>> = HashMap::new();
+        for e in &entities {
+            if is_noise_type(&e.entity_type) || is_noise_name(&e.name) {
+                continue;
+            }
+            if e.confidence < 0.7 {
+                continue;
+            }
+            let ts_key = e.first_seen.format("%Y-%m-%dT%H:%M").to_string();
+            minute_cohorts.entry(ts_key).or_default().push(e.id);
+        }
+
+        let mut reconnected = 0usize;
+        for (_ts, cohort) in &minute_cohorts {
+            // Only handle large cohorts (the ones minute-cohort skips)
+            if cohort.len() <= 50 {
+                continue;
+            }
+
+            // Sub-partition by entity_type
+            let mut type_groups: HashMap<&str, Vec<i64>> = HashMap::new();
+            for &eid in cohort {
+                if let Some(e) = id_to_entity.get(&eid) {
+                    if HIGH_VALUE_TYPES.contains(&e.entity_type.as_str()) {
+                        type_groups.entry(&e.entity_type).or_default().push(eid);
+                    }
+                }
+            }
+
+            for (_etype, group) in &type_groups {
+                if group.len() < 2 {
+                    continue;
+                }
+                // Find highest-degree connected entity as hub (from whole cohort)
+                let hub_id = match cohort
+                    .iter()
+                    .filter(|id| connected.contains(id))
+                    .max_by_key(|&&id| degree.get(&id).copied().unwrap_or(0))
+                {
+                    Some(&id) => id,
+                    None => {
+                        // No connected hub: pick highest-confidence entity as anchor
+                        let anchor = group.iter().max_by(|&&a, &&b| {
+                            let ca = id_to_entity.get(&a).map(|e| e.confidence).unwrap_or(0.0);
+                            let cb = id_to_entity.get(&b).map(|e| e.confidence).unwrap_or(0.0);
+                            ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        match anchor {
+                            Some(&id) => id,
+                            None => continue,
+                        }
+                    }
+                };
+                let hub = match id_to_entity.get(&hub_id) {
+                    Some(e) => e,
+                    None => continue,
+                };
+
+                // Connect up to 30 isolated entities from this type-group to hub
+                let mut group_count = 0usize;
+                for &eid in group {
+                    if connected.contains(&eid) || eid == hub_id {
+                        continue;
+                    }
+                    let island = match id_to_entity.get(&eid) {
+                        Some(e) => e,
+                        None => continue,
+                    };
+                    let pred = match (island.entity_type.as_str(), hub.entity_type.as_str()) {
+                        ("person", "person") => "contemporary_of",
+                        ("person", "place") | ("place", "person") => "active_in",
+                        ("person", "organization") | ("organization", "person") => {
+                            "affiliated_with"
+                        }
+                        ("person", "concept") => "contributed_to",
+                        ("concept", "person") => "pioneered_by",
+                        ("concept", "concept") => "related_concept",
+                        ("organization", "organization") => "partner_of",
+                        ("place", "place") => "located_near",
+                        _ => "co_extracted_with",
+                    };
+                    self.brain.with_conn(|conn| {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO relations (subject_id, predicate, object_id, confidence, source_url, learned_at)
+                             VALUES (?1, ?2, ?3, 0.30, 'large_cohort_type', ?4)",
+                            params![eid, pred, hub_id, Utc::now().to_rfc3339()],
+                        )?;
+                        Ok(())
+                    })?;
+                    connected.insert(eid);
+                    reconnected += 1;
+                    group_count += 1;
+                    if group_count >= 30 {
+                        break;
+                    }
+                }
+                if reconnected >= 1500 {
+                    break;
+                }
+            }
+            if reconnected >= 1500 {
+                break;
+            }
+        }
+        if reconnected > 0 {
+            eprintln!(
+                "  [large-cohort-type-reconnect] reconnected {} islands from large temporal cohorts",
                 reconnected
             );
         }
