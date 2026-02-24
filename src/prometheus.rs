@@ -4869,6 +4869,19 @@ impl<'a> Prometheus<'a> {
         // Promote mature testing hypotheses (>7 days, confidence >= 0.75)
         let promoted = self.promote_mature_hypotheses(7, 0.75).unwrap_or(0);
 
+        // Strategy-aware accelerated promotion: for strategies with >85% historical
+        // confirmation rate, promote testing hypotheses at a lower threshold (0.60)
+        // after just 3 days. High-ROI strategies have earned this trust.
+        let accelerated_promoted = self
+            .promote_high_roi_mature_hypotheses(3, 0.60, 0.85)
+            .unwrap_or(0);
+        if accelerated_promoted > 0 {
+            eprintln!(
+                "[PROMETHEUS] Accelerated promotion: {} hypotheses from high-ROI strategies",
+                accelerated_promoted
+            );
+        }
+
         // Decay stale hypotheses (>14 days testing, 5% decay per cycle, reject below 0.15)
         let (h_decayed, h_auto_rej) = self
             .decay_stale_hypotheses(14, 0.95, 0.15)
@@ -4948,7 +4961,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} hypotheses promoted ({} accelerated), \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -5048,6 +5061,7 @@ impl<'a> Prometheus<'a> {
             active_in_refined,
             weak_contemporary_demoted,
             promoted,
+            accelerated_promoted,
             fragment_cleaned,
             concat_hyp_rejected,
             excl_promoted + excl_rejected,
@@ -6019,6 +6033,24 @@ impl<'a> Prometheus<'a> {
                 self.record_outcome(&h.pattern_source, false)?;
                 rejected += 1;
                 continue;
+            }
+
+            // Aggressive open-ended rejection: hypotheses with object="?" from
+            // strategies with < 30% confirmation rate are speculative noise.
+            // Reject them after 24h if confidence is below 0.70.
+            if h.object == "?" && source_weight < 0.50 {
+                if let Ok(discovered) =
+                    chrono::NaiveDateTime::parse_from_str(&h.discovered_at, "%Y-%m-%d %H:%M:%S")
+                {
+                    let now = chrono::Utc::now().naive_utc();
+                    let age_hours = (now - discovered).num_hours();
+                    if age_hours >= 24 && h.confidence < 0.70 {
+                        self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                        self.record_outcome(&h.pattern_source, false)?;
+                        rejected += 1;
+                        continue;
+                    }
+                }
             }
 
             // Age-based stale rejection: hypotheses stuck in testing for >48 hours
@@ -14491,6 +14523,70 @@ impl<'a> Prometheus<'a> {
             let _ = self.record_outcome(source, true);
         }
         Ok(count)
+    }
+
+    /// Accelerated promotion for high-ROI strategies: strategies with a historical
+    /// confirmation rate >= `min_strategy_rate` get their testing hypotheses promoted
+    /// at a lower confidence threshold (`min_conf`) after fewer days (`min_days`).
+    /// This rewards reliable strategies with faster hypothesis resolution.
+    pub fn promote_high_roi_mature_hypotheses(
+        &self,
+        min_days: i64,
+        min_conf: f64,
+        min_strategy_rate: f64,
+    ) -> Result<usize> {
+        // Find strategies with sufficient track record and high confirmation rate
+        let rates = self.strategy_confirmation_rates(30)?;
+        let elite_strategies: HashSet<String> = rates
+            .into_iter()
+            .filter(|(_, (total, _, rate))| *total >= 30 && *rate >= min_strategy_rate)
+            .map(|(s, _)| s)
+            .collect();
+
+        if elite_strategies.is_empty() {
+            return Ok(0);
+        }
+
+        let cutoff = (Utc::now() - chrono::Duration::days(min_days))
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        // Collect eligible hypotheses
+        let candidates: Vec<(i64, String)> = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, pattern_source FROM hypotheses \
+                 WHERE status = 'testing' AND confidence >= ?1 AND discovered_at < ?2",
+            )?;
+            let rows = stmt.query_map(params![min_conf, cutoff], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>>>()
+        })?;
+
+        let mut promoted = 0usize;
+        for (id, source) in &candidates {
+            if !elite_strategies.contains(source) {
+                continue;
+            }
+            self.brain.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE hypotheses SET status = 'confirmed' WHERE id = ?1",
+                    params![id],
+                )?;
+                Ok(())
+            })?;
+            let _ = self.save_discovery(
+                *id,
+                &[format!(
+                    "Accelerated promotion: high-ROI strategy '{}' (rate>={:.0}%, >{}d, conf>={:.2})",
+                    source, min_strategy_rate * 100.0, min_days, min_conf
+                )],
+            );
+            let _ = self.record_outcome(source, true);
+            promoted += 1;
+        }
+        Ok(promoted)
     }
 
     /// Decay confidence of stale testing hypotheses that haven't been confirmed.
