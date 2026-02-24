@@ -9180,14 +9180,22 @@ impl<'a> Prometheus<'a> {
         let mut seen: HashSet<(i64, String)> = HashSet::new();
 
         for group in type_groups.values() {
-            // Only compare within manageable groups
-            let group = if group.len() > 200 {
-                &group[..200]
+            // Shuffle for diversity when group is large, then sample
+            let group: Vec<i64> = if group.len() > 300 {
+                // Deterministic but varied sampling: pick every Nth entity
+                let step = group.len() / 300;
+                group
+                    .iter()
+                    .step_by(step.max(1))
+                    .copied()
+                    .take(300)
+                    .collect()
             } else {
-                &group[..]
+                group.clone()
             };
+            let group = &group[..];
             for i in 0..group.len() {
-                if hypotheses.len() >= 30 {
+                if hypotheses.len() >= 50 {
                     break;
                 }
                 let a = group[i];
@@ -9209,7 +9217,7 @@ impl<'a> Prometheus<'a> {
                     }
                     let jaccard = shared as f64 / total as f64;
                     // Need high overlap (>=0.5) and at least 2 shared predicates
-                    if jaccard < 0.5 || shared < 2 {
+                    if jaccard < 0.4 || shared < 2 {
                         continue;
                     }
 
@@ -9257,7 +9265,7 @@ impl<'a> Prometheus<'a> {
                             discovered_at: now_str(),
                             pattern_source: "predicate_transfer".to_string(),
                         });
-                        if hypotheses.len() >= 30 {
+                        if hypotheses.len() >= 50 {
                             break;
                         }
                     }
@@ -9304,7 +9312,7 @@ impl<'a> Prometheus<'a> {
                             discovered_at: now_str(),
                             pattern_source: "predicate_transfer".to_string(),
                         });
-                        if hypotheses.len() >= 30 {
+                        if hypotheses.len() >= 50 {
                             break;
                         }
                     }
