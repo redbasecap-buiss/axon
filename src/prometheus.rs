@@ -3971,6 +3971,17 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(pp_hyps);
         }
 
+        // 2v. Predicate covariance gaps (entities missing expected correlated predicates)
+        let pcov_weight = self.get_pattern_weight("predicate_covariance")?;
+        if pcov_weight >= 0.05 {
+            let pcov_hyps = self.generate_hypotheses_from_predicate_covariance()?;
+            eprintln!(
+                "[PROMETHEUS] predicate_covariance: {} hypotheses",
+                pcov_hyps.len()
+            );
+            all_hypotheses.extend(pcov_hyps);
+        }
+
         // 2t. Shared predicate-object inverse inference
         let spo_weight = self.get_pattern_weight("shared_predicate_object")?;
         if spo_weight >= 0.05 {
@@ -11536,6 +11547,58 @@ impl<'a> Prometheus<'a> {
         }
 
         hypotheses.truncate(40);
+        Ok(hypotheses)
+    }
+
+    /// Predicate covariance gaps: if predicates A and B co-occur frequently
+    /// (high Jaccard) and an entity has A but not B, hypothesize B should exist.
+    /// Leverages graph::predicate_gap_entities for efficient detection.
+    pub fn generate_hypotheses_from_predicate_covariance(&self) -> Result<Vec<Hypothesis>> {
+        let gaps = crate::graph::predicate_gap_entities(self.brain, 0.3, 200)?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let mut hypotheses = Vec::new();
+
+        for (eid, ename, missing_pred, has_pred, jaccard) in &gaps {
+            if !meaningful.contains(eid) {
+                continue;
+            }
+            if is_noise_name(ename) || is_generic_predicate(missing_pred) {
+                continue;
+            }
+            let base_conf = (0.30 + jaccard * 0.4).min(0.70);
+            let confidence = self
+                .calibrated_confidence("predicate_covariance", base_conf)
+                .unwrap_or(base_conf);
+
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: ename.clone(),
+                predicate: missing_pred.clone(),
+                object: "?".to_string(),
+                confidence,
+                evidence_for: vec![format!(
+                    "Has '{}' but missing '{}' (predicate covariance Jaccard={:.2})",
+                    has_pred, missing_pred, jaccard
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!(
+                        "Predicates '{}' and '{}' co-occur with J={:.2}",
+                        has_pred, missing_pred, jaccard
+                    ),
+                    format!(
+                        "{} has '{}' → expect '{}' too",
+                        ename, has_pred, missing_pred
+                    ),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "predicate_covariance".to_string(),
+            });
+            if hypotheses.len() >= 30 {
+                break;
+            }
+        }
         Ok(hypotheses)
     }
 

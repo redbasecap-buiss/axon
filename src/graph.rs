@@ -5012,3 +5012,134 @@ pub fn spectral_gap_estimate(
 
     Ok((lambda, iter_used))
 }
+
+/// Top-k closeness centrality via sampled BFS.
+/// Closeness = 1 / avg_shortest_path_distance. Nodes with high closeness
+/// are globally well-connected (info reaches them fast).
+/// Uses sampling for large graphs — picks `sample_size` random BFS sources.
+pub fn closeness_centrality_top_k(
+    brain: &Brain,
+    top_k: usize,
+    sample_size: usize,
+) -> Result<Vec<(i64, String, f64)>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let n = adj.len();
+    if n < 3 {
+        return Ok(vec![]);
+    }
+
+    let ids: Vec<i64> = adj.keys().copied().collect();
+
+    // Pick sample sources (evenly spaced for determinism)
+    let step = (n / sample_size.min(n)).max(1);
+    let sources: Vec<i64> = ids
+        .iter()
+        .step_by(step)
+        .take(sample_size)
+        .copied()
+        .collect();
+
+    // Accumulate distance sums for each node
+    let mut dist_sum: HashMap<i64, f64> = HashMap::new();
+    let mut reach_count: HashMap<i64, usize> = HashMap::new();
+
+    for &src in &sources {
+        // BFS from src
+        let mut visited: HashMap<i64, usize> = HashMap::new();
+        let mut queue = std::collections::VecDeque::new();
+        visited.insert(src, 0);
+        queue.push_back(src);
+
+        while let Some(cur) = queue.pop_front() {
+            let d = visited[&cur];
+            if let Some(neighbors) = adj.get(&cur) {
+                for &nbr in neighbors {
+                    if !visited.contains_key(&nbr) {
+                        visited.insert(nbr, d + 1);
+                        queue.push_back(nbr);
+                    }
+                }
+            }
+        }
+
+        for (&node, &d) in &visited {
+            if d > 0 {
+                *dist_sum.entry(node).or_insert(0.0) += d as f64;
+                *reach_count.entry(node).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Compute closeness = reachable_count / sum_of_distances
+    let mut scores: Vec<(i64, f64)> = dist_sum
+        .iter()
+        .filter_map(|(&id, &sum)| {
+            let count = reach_count.get(&id).copied().unwrap_or(0);
+            if count > 0 && sum > 0.0 {
+                Some((id, count as f64 / sum))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scores.truncate(top_k);
+
+    let entities = brain.all_entities()?;
+    let id_to_name: HashMap<i64, String> = entities.into_iter().map(|e| (e.id, e.name)).collect();
+
+    Ok(scores
+        .into_iter()
+        .map(|(id, score)| {
+            let name = id_to_name.get(&id).cloned().unwrap_or_default();
+            (id, name, score)
+        })
+        .collect())
+}
+
+/// Identify entities whose predicate sets violate expected predicate
+/// covariance patterns (entities with predicate A but missing correlated B).
+/// Returns (entity_id, entity_name, missing_predicate, correlated_with, jaccard).
+pub fn predicate_gap_entities(
+    brain: &Brain,
+    min_jaccard: f64,
+    max_results: usize,
+) -> Result<Vec<(i64, String, String, String, f64)>, rusqlite::Error> {
+    let covariances = predicate_covariance(brain, min_jaccard)?;
+    let relations = brain.all_relations()?;
+
+    // Build entity → set of predicates
+    let mut entity_preds: HashMap<i64, HashSet<String>> = HashMap::new();
+    for r in &relations {
+        entity_preds
+            .entry(r.subject_id)
+            .or_default()
+            .insert(r.predicate.clone());
+    }
+
+    let entities = brain.all_entities()?;
+    let id_to_name: HashMap<i64, String> = entities.into_iter().map(|e| (e.id, e.name)).collect();
+
+    let mut results = Vec::new();
+    for (pred_a, pred_b, jaccard) in &covariances {
+        for (&eid, preds) in &entity_preds {
+            let has_a = preds.contains(pred_a.as_str());
+            let has_b = preds.contains(pred_b.as_str());
+            if has_a && !has_b {
+                let name = id_to_name.get(&eid).cloned().unwrap_or_default();
+                results.push((eid, name, pred_b.clone(), pred_a.clone(), *jaccard));
+            } else if has_b && !has_a {
+                let name = id_to_name.get(&eid).cloned().unwrap_or_default();
+                results.push((eid, name, pred_a.clone(), pred_b.clone(), *jaccard));
+            }
+        }
+        if results.len() > max_results * 2 {
+            break; // early exit for efficiency
+        }
+    }
+    // Sort by jaccard descending (strongest covariances first)
+    results.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(max_results);
+    Ok(results)
+}
