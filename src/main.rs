@@ -1,3 +1,4 @@
+mod chat;
 mod config;
 mod crawler;
 mod db;
@@ -45,6 +46,8 @@ enum Commands {
     Watch { url: String },
     /// Ask a question
     Ask { question: String },
+    /// Interactive chat REPL — ask questions conversationally
+    Chat,
     /// Show everything known about an entity
     About { entity: String },
     /// Show related entities
@@ -188,15 +191,13 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Commands::Ask { question } => {
-            let results = query::ask(&brain, &question)?;
-            if results.is_empty() {
-                println!("🤷 I don't know anything about that yet. Try feeding me some URLs!");
-            } else {
-                println!("💡 Here's what I know:\n");
-                for r in results {
-                    println!("  {r}");
-                }
+            match chat::answer_question(&brain, &question)? {
+                Some(answer) => print!("{}", chat::format_answer(&answer)),
+                None => println!("🤷 I don't know anything about that yet. Try feeding me some URLs!"),
             }
+        }
+        Commands::Chat => {
+            chat::run_chat(&brain).map_err(|e| anyhow::anyhow!("{}", e))?;
         }
         Commands::About { entity } => {
             let info = query::about(&brain, &entity)?;
