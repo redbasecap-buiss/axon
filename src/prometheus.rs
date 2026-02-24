@@ -4147,6 +4147,17 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(cf_hyps);
         }
 
+        // 2aa. Structural similarity (typed neighborhood overlap — not directly connected)
+        let ss_weight = self.get_pattern_weight("structural_similarity")?;
+        if ss_weight >= 0.05 {
+            let ss_hyps = self.generate_hypotheses_from_structural_similarity()?;
+            eprintln!(
+                "[PROMETHEUS] structural_similarity: {} hypotheses",
+                ss_hyps.len()
+            );
+            all_hypotheses.extend(ss_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -4339,6 +4350,15 @@ impl<'a> Prometheus<'a> {
 
         // Prune stale low-confidence hypotheses (>14 days old)
         let pruned = self.prune_stale_hypotheses(14).unwrap_or(0);
+
+        // Recycle previously rejected hypotheses from high-ROI strategies
+        let (recycled, recycle_promoted) = self.recycle_rejected_hypotheses().unwrap_or((0, 0));
+        if recycled > 0 {
+            eprintln!(
+                "[PROMETHEUS] Hypothesis recycling: {} re-evaluated, {} promoted",
+                recycled, recycle_promoted
+            );
+        }
 
         // Auto-resolve existing testing hypotheses
         let (auto_confirmed, auto_rejected) = self.auto_resolve_hypotheses().unwrap_or((0, 0));
@@ -12168,6 +12188,174 @@ impl<'a> Prometheus<'a> {
         }
         hypotheses.truncate(50);
         Ok(hypotheses)
+    }
+
+    /// Strategy: Structural similarity link prediction.
+    /// Finds entity pairs with highly overlapping typed neighborhoods (same predicates
+    /// pointing to same neighbors) that are NOT directly connected.
+    /// Uses cosine similarity on predicate-typed neighbor vectors from graph.rs.
+    pub fn generate_hypotheses_from_structural_similarity(&self) -> Result<Vec<Hypothesis>> {
+        let pairs = crate::graph::structural_similarity_pairs(self.brain, 3, 0.25, 200)?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let entities = self.brain.all_entities()?;
+        let name_to_type: HashMap<String, String> = entities
+            .iter()
+            .map(|e| (e.name.clone(), e.entity_type.clone()))
+            .collect();
+
+        let mut hypotheses = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+
+        for (id_a, name_a, id_b, name_b, sim) in &pairs {
+            if !meaningful.contains(id_a) || !meaningful.contains(id_b) {
+                continue;
+            }
+            if is_noise_name(name_a) || is_noise_name(name_b) {
+                continue;
+            }
+            let key = if name_a < name_b {
+                (name_a.clone(), name_b.clone())
+            } else {
+                (name_b.clone(), name_a.clone())
+            };
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+
+            let a_type = name_to_type.get(name_a).map(|s| s.as_str()).unwrap_or("?");
+            let b_type = name_to_type.get(name_b).map(|s| s.as_str()).unwrap_or("?");
+            if !types_compatible(a_type, b_type) {
+                continue;
+            }
+
+            let predicate = infer_predicate(a_type, b_type, None);
+            let base_conf = 0.35 + (sim - 0.25) * 0.4; // 0.35 at min sim, up to 0.65
+            let confidence = self
+                .calibrated_confidence("structural_similarity", base_conf)
+                .unwrap_or(base_conf);
+
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: name_a.clone(),
+                predicate: predicate.to_string(),
+                object: name_b.clone(),
+                confidence,
+                evidence_for: vec![format!(
+                    "Structural similarity {:.3}: share typed neighborhood patterns",
+                    sim
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![format!(
+                    "{} and {} have overlapping predicate-neighbor profiles (cosine+jaccard={:.3})",
+                    name_a, name_b, sim
+                )],
+                status: HypothesisStatus::Testing,
+                discovered_at: now_str(),
+                pattern_source: "structural_similarity".to_string(),
+            });
+        }
+
+        hypotheses.truncate(50);
+        Ok(hypotheses)
+    }
+
+    /// Strategy: Hypothesis recycling — re-evaluate previously rejected hypotheses
+    /// from high-performing strategies. The graph may have grown since rejection,
+    /// providing new evidence that could flip the verdict.
+    pub fn recycle_rejected_hypotheses(&self) -> Result<(usize, usize)> {
+        // Only recycle from strategies with > 70% confirmation rate
+        let weights: Vec<(String, f64)> = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT pattern_type, weight FROM pattern_weights WHERE confirmations > 20 AND weight > 0.7"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+        })?;
+
+        if weights.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let strategy_names: HashSet<String> = weights.iter().map(|(n, _)| n.clone()).collect();
+
+        // Find rejected hypotheses from these strategies, rejected > 3 days ago
+        let cutoff = (Utc::now() - chrono::Duration::days(3))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let candidates: Vec<(i64, String, String, String, f64, String)> =
+            self.brain.with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, subject, predicate, object, confidence, pattern_source \
+                 FROM hypotheses WHERE status = 'rejected' AND discovered_at < ?1 \
+                 ORDER BY confidence DESC LIMIT 100",
+                )?;
+                let rows = stmt.query_map(params![cutoff], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, f64>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })?;
+                Ok(rows
+                    .filter_map(|r| r.ok())
+                    .filter(|(_, _, _, _, _, src)| strategy_names.contains(src))
+                    .collect::<Vec<_>>())
+            })?;
+
+        let mut recycled = 0usize;
+        let mut promoted = 0usize;
+
+        for (id, subject, predicate, object, old_conf, source) in &candidates {
+            // Re-validate: check if new evidence exists
+            let mut h = Hypothesis {
+                id: *id,
+                subject: subject.clone(),
+                predicate: predicate.clone(),
+                object: object.clone(),
+                confidence: 0.30, // reset to base — must earn its way back
+                evidence_for: vec![format!("Recycled from {} (was {:.2})", source, old_conf)],
+                evidence_against: vec![],
+                reasoning_chain: vec![],
+                status: HypothesisStatus::Testing,
+                discovered_at: now_str(),
+                pattern_source: source.clone(),
+            };
+
+            self.validate_hypothesis(&mut h)?;
+
+            if h.confidence >= CONFIRMATION_THRESHOLD {
+                // New evidence confirms — promote!
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE hypotheses SET status = 'confirmed', confidence = ?1 WHERE id = ?2",
+                        params![h.confidence, id],
+                    )?;
+                    Ok(())
+                })?;
+                self.record_outcome(source, true)?;
+                promoted += 1;
+                recycled += 1;
+            } else if h.confidence >= 0.45 {
+                // Promising but not confirmed — put back to testing
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE hypotheses SET status = 'testing', confidence = ?1 WHERE id = ?2",
+                        params![h.confidence, id],
+                    )?;
+                    Ok(())
+                })?;
+                recycled += 1;
+            }
+            // Otherwise leave as rejected
+        }
+
+        Ok((recycled, promoted))
     }
 
     /// Compute surprise/novelty score for a hypothesis.

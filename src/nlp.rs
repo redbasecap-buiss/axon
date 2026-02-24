@@ -801,6 +801,10 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "wärmestrahlung",
     "augustinians",
     "philistines",
+    // Added 2026-02-24 (brain cleaner round 2)
+    "carryout",
+    "vorschläge",
+    "perusine",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -4810,6 +4814,14 @@ fn classify_entity_type(name: &str) -> &'static str {
         "mignone",
         "moorhead",
         "wilmslow",
+        // Added 2026-02-24 (brain cleaner round 2)
+        "rumelia",
+        "arabia",
+        "martigny",
+        "marengo",
+        "cerrado",
+        "gondwana",
+        "talgar",
     ];
     if !lower.contains(' ') && KNOWN_PLACES.contains(&lower.as_str()) {
         return "place";
@@ -5057,6 +5069,13 @@ fn classify_entity_type(name: &str) -> &'static str {
         "sieczkowska",
         "bemmelen",
         "zauzmer",
+        // Added 2026-02-24 (brain cleaner)
+        "riemann",
+        "brahmagupta",
+        "duchenne",
+        "curtius",
+        "dummett",
+        "mackinnon",
     ];
     if !lower.contains(' ') && KNOWN_PERSONS.contains(&lower.as_str()) {
         return "person";

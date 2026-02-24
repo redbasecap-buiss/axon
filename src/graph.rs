@@ -5196,3 +5196,143 @@ pub fn degree_anomalies(
     results.truncate(limit);
     Ok(results)
 }
+
+/// Structural similarity: find entity pairs with highly overlapping neighborhoods
+/// that are NOT directly connected. These are strong link-prediction candidates.
+/// Uses cosine similarity on predicate-typed neighbor vectors.
+/// Returns: Vec<(id_a, name_a, id_b, name_b, similarity)> sorted by similarity desc.
+pub fn structural_similarity_pairs(
+    brain: &Brain,
+    min_degree: usize,
+    min_sim: f64,
+    limit: usize,
+) -> Result<Vec<(i64, String, i64, String, f64)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let entities = brain.all_entities()?;
+    let id_to_name: HashMap<i64, String> =
+        entities.iter().map(|e| (e.id, e.name.clone())).collect();
+
+    // Build predicate-typed neighbor sets: entity -> {(predicate, neighbor_id)}
+    let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+    let mut typed_neighbors: HashMap<i64, HashMap<String, HashSet<i64>>> = HashMap::new();
+    for r in &relations {
+        adj.entry(r.subject_id).or_default().insert(r.object_id);
+        adj.entry(r.object_id).or_default().insert(r.subject_id);
+        typed_neighbors
+            .entry(r.subject_id)
+            .or_default()
+            .entry(r.predicate.clone())
+            .or_default()
+            .insert(r.object_id);
+        typed_neighbors
+            .entry(r.object_id)
+            .or_default()
+            .entry(r.predicate.clone())
+            .or_default()
+            .insert(r.subject_id);
+    }
+
+    // Filter to entities with enough connections
+    let candidates: Vec<i64> = adj
+        .iter()
+        .filter(|(_, n)| n.len() >= min_degree)
+        .map(|(&id, _)| id)
+        .collect();
+
+    let mut results = Vec::new();
+
+    // Compare all candidate pairs (O(n²) but filtered by min_degree)
+    for i in 0..candidates.len() {
+        let a = candidates[i];
+        let a_neighbors = match adj.get(&a) {
+            Some(n) => n,
+            None => continue,
+        };
+        let a_typed = match typed_neighbors.get(&a) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        for j in (i + 1)..candidates.len() {
+            let b = candidates[j];
+            // Skip if already directly connected
+            if a_neighbors.contains(&b) {
+                continue;
+            }
+            let b_neighbors = match adj.get(&b) {
+                Some(n) => n,
+                None => continue,
+            };
+            let b_typed = match typed_neighbors.get(&b) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            // Cosine similarity on predicate-neighbor vectors
+            // Each dimension = (predicate, neighbor_id)
+            let a_set: HashSet<(String, i64)> = a_typed
+                .iter()
+                .flat_map(|(p, ns)| ns.iter().map(move |&n| (p.clone(), n)))
+                .collect();
+            let b_set: HashSet<(String, i64)> = b_typed
+                .iter()
+                .flat_map(|(p, ns)| ns.iter().map(move |&n| (p.clone(), n)))
+                .collect();
+
+            let intersection = a_set.intersection(&b_set).count() as f64;
+            let denom = (a_set.len() as f64).sqrt() * (b_set.len() as f64).sqrt();
+            if denom == 0.0 {
+                continue;
+            }
+            let sim = intersection / denom;
+
+            // Also weight by plain neighbor overlap (Jaccard)
+            let plain_shared = a_neighbors.intersection(b_neighbors).count() as f64;
+            let plain_union = a_neighbors.union(b_neighbors).count() as f64;
+            let jaccard = if plain_union > 0.0 {
+                plain_shared / plain_union
+            } else {
+                0.0
+            };
+
+            // Combined score: 60% typed cosine + 40% jaccard
+            let combined = 0.6 * sim + 0.4 * jaccard;
+
+            if combined >= min_sim {
+                let a_name = id_to_name.get(&a).cloned().unwrap_or_default();
+                let b_name = id_to_name.get(&b).cloned().unwrap_or_default();
+                results.push((a, a_name, b, b_name, combined));
+            }
+        }
+    }
+
+    results.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    Ok(results)
+}
+
+/// Graph evolution rate: compare recent snapshots to measure growth velocity.
+/// Returns (entity_growth_rate, relation_growth_rate, density_trend) per day.
+/// Snapshot tuple: (taken_at, entities, relations, components, largest_pct, avg_degree, isolated, density, frag, modularity)
+pub fn graph_evolution_rate(brain: &Brain) -> Result<(f64, f64, f64), rusqlite::Error> {
+    let snapshots = get_graph_snapshots(brain, 10)?;
+    if snapshots.len() < 2 {
+        return Ok((0.0, 0.0, 0.0));
+    }
+    let newest = &snapshots[0];
+    let oldest = &snapshots[snapshots.len() - 1];
+
+    // Parse timestamps to compute time span (field .0 = taken_at)
+    let t_new =
+        chrono::NaiveDateTime::parse_from_str(&newest.0, "%Y-%m-%d %H:%M:%S").unwrap_or_default();
+    let t_old =
+        chrono::NaiveDateTime::parse_from_str(&oldest.0, "%Y-%m-%d %H:%M:%S").unwrap_or_default();
+    let days = (t_new - t_old).num_hours().max(1) as f64 / 24.0;
+
+    // .1 = entities, .2 = relations, .7 = density
+    let ent_rate = (newest.1 as f64 - oldest.1 as f64) / days;
+    let rel_rate = (newest.2 as f64 - oldest.2 as f64) / days;
+    let density_trend = (newest.7 - oldest.7) / days;
+
+    Ok((ent_rate, rel_rate, density_trend))
+}
