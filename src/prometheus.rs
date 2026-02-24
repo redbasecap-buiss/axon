@@ -4663,6 +4663,9 @@ impl<'a> Prometheus<'a> {
         // Downgrade isolated contemporary_of relations (weak evidence)
         let contemporary_downgraded = self.downgrade_isolated_contemporary().unwrap_or(0);
 
+        // Prune stranger contemporary_of (no shared non-contemporary neighbors)
+        let stranger_contemporary_pruned = self.prune_stranger_contemporary().unwrap_or(0);
+
         // Predicate normalization (reduce "is" overuse)
         let normalized = self.normalize_predicates().unwrap_or(0);
 
@@ -5123,9 +5126,23 @@ impl<'a> Prometheus<'a> {
         } else {
             String::new()
         };
+        let stranger_line = if stranger_contemporary_pruned > 0 {
+            format!(
+                ", {} stranger contemporary_of pruned",
+                stranger_contemporary_pruned
+            )
+        } else {
+            String::new()
+        };
         let summary = format!(
-            "{}{}{}{}{}{}",
-            summary, health_line, diversity_line, quality_line, plateau_line, frontier_line
+            "{}{}{}{}{}{}{}",
+            summary,
+            health_line,
+            diversity_line,
+            quality_line,
+            plateau_line,
+            frontier_line,
+            stranger_line
         );
 
         Ok(DiscoveryReport {
@@ -5310,6 +5327,46 @@ impl<'a> Prometheus<'a> {
             }
         }
         Ok(downgraded)
+    }
+
+    /// Prune `contemporary_of` relations between entities that share zero
+    /// mutual neighbors via non-contemporary predicates and have confidence ≤ 0.3.
+    /// These are the weakest temporal co-existence signals — entities that merely
+    /// existed in the same era but have no topical overlap. Removing them improves
+    /// predicate entropy and reduces noise in community detection.
+    pub fn prune_stranger_contemporary(&self) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+
+        // Build adjacency from non-contemporary predicates only
+        let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+        for r in &relations {
+            if r.predicate == "contemporary_of" {
+                continue;
+            }
+            adj.entry(r.subject_id).or_default().insert(r.object_id);
+            adj.entry(r.object_id).or_default().insert(r.subject_id);
+        }
+
+        let contemporary_rels: Vec<_> = relations
+            .iter()
+            .filter(|r| r.predicate == "contemporary_of" && r.confidence <= 0.35)
+            .collect();
+
+        let mut pruned = 0usize;
+        for r in &contemporary_rels {
+            let s_neighbors = adj.get(&r.subject_id).cloned().unwrap_or_default();
+            let o_neighbors = adj.get(&r.object_id).cloned().unwrap_or_default();
+            let mutual = s_neighbors.intersection(&o_neighbors).count();
+            if mutual == 0 {
+                // No shared neighbors via meaningful predicates — pure temporal noise
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                    Ok(())
+                })?;
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
     }
 
     /// Decay confidence of old unconfirmed hypotheses (meta-learning cleanup).
