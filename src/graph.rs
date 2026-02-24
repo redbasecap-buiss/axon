@@ -518,7 +518,7 @@ pub fn connected_components(brain: &Brain) -> Result<Vec<Vec<i64>>, rusqlite::Er
         }
         components.push(component);
     }
-    components.sort_by(|a, b| b.len().cmp(&a.len()));
+    components.sort_by_key(|b| std::cmp::Reverse(b.len()));
     Ok(components)
 }
 
@@ -1310,6 +1310,7 @@ pub fn save_graph_snapshot(brain: &Brain) -> Result<i64, rusqlite::Error> {
 
 /// Get recent graph snapshots for trend analysis.
 /// Returns Vec of (taken_at, entities, relations, components, largest_pct, avg_degree, isolated, density, fragmentation, modularity).
+#[allow(clippy::type_complexity)]
 pub fn get_graph_snapshots(
     brain: &Brain,
     limit: usize,
@@ -1506,17 +1507,13 @@ pub fn adamic_adar_predict(
 
     // Sort candidates by degree descending for better coverage of high-value nodes
     let mut sorted_candidates = candidates.clone();
-    sorted_candidates.sort_by(|a, b| {
-        degree
-            .get(b)
-            .unwrap_or(&0)
-            .cmp(&degree.get(a).unwrap_or(&0))
-    });
-    for i in 0..sorted_candidates.len().min(500) {
+    sorted_candidates.sort_by(|a, b| degree.get(b).unwrap_or(&0).cmp(degree.get(a).unwrap_or(&0)));
+    let limit = sorted_candidates.len().min(500);
+    for i in 0..limit {
         let a = sorted_candidates[i];
         let na = &nb_sets[&a];
-        for j in (i + 1)..sorted_candidates.len().min(500) {
-            let b = sorted_candidates[j];
+        for b in &sorted_candidates[(i + 1)..limit] {
+            let b = *b;
             let key = if a < b { (a, b) } else { (b, a) };
             if connected.contains(&key) {
                 continue;
@@ -1583,11 +1580,12 @@ pub fn resource_allocation_predict(
         .collect();
 
     let mut scores: Vec<(i64, i64, f64)> = Vec::new();
-    for i in 0..candidates.len().min(500) {
+    let limit = candidates.len().min(500);
+    for i in 0..limit {
         let a = candidates[i];
         let na = &nb_sets[&a];
-        for j in (i + 1)..candidates.len().min(500) {
-            let b = candidates[j];
+        for b in &candidates[(i + 1)..limit] {
+            let b = *b;
             let key = if a < b { (a, b) } else { (b, a) };
             if connected.contains(&key) {
                 continue;
@@ -1659,12 +1657,13 @@ pub fn type_aware_link_predict(
         .collect();
 
     let mut scores: Vec<(i64, i64, f64)> = Vec::new();
-    for i in 0..candidates.len().min(500) {
+    let limit = candidates.len().min(500);
+    for i in 0..limit {
         let a = candidates[i];
         let na = &nb_sets[&a];
         let type_a = id_to_type.get(&a).cloned().unwrap_or_default();
-        for j in (i + 1)..candidates.len().min(500) {
-            let b = candidates[j];
+        for b in &candidates[(i + 1)..limit] {
+            let b = *b;
             let key = if a < b { (a, b) } else { (b, a) };
             if connected.contains(&key) {
                 continue;
@@ -1819,6 +1818,7 @@ pub fn fragmentation_score(brain: &Brain) -> Result<f64, rusqlite::Error> {
 /// Authorities = entities pointed to by many good hubs.
 /// Hubs = entities pointing to many good authorities.
 /// Returns (hub_scores, authority_scores).
+#[allow(clippy::type_complexity)]
 pub fn hits(
     brain: &Brain,
     iterations: usize,
@@ -2755,15 +2755,13 @@ pub fn analyze_discovery_trend(
                 "Discovery rate is steady. Continue current approach.".into(),
             )
         }
+    } else if avg_delta < 5.0 {
+        (
+            "slow".into(),
+            "Low discovery rate — need more diverse source material.".into(),
+        )
     } else {
-        if avg_delta < 5.0 {
-            (
-                "slow".into(),
-                "Low discovery rate — need more diverse source material.".into(),
-            )
-        } else {
-            ("steady".into(), "Discovery rate looks healthy.".into())
-        }
+        ("steady".into(), "Discovery rate looks healthy.".into())
     };
 
     // Fragmentation trend
@@ -2828,7 +2826,7 @@ pub fn jaccard_link_prediction(
     // Only consider entities with at least 2 neighbors (otherwise no meaningful overlap)
     let candidates: Vec<i64> = entities
         .iter()
-        .filter(|e| adj.get(&e.id).map_or(false, |n| n.len() >= 2))
+        .filter(|e| adj.get(&e.id).is_some_and(|n| n.len() >= 2))
         .map(|e| e.id)
         .collect();
 
@@ -3008,11 +3006,9 @@ pub fn cosine_similarity_predict(
         .collect();
 
     let mut results: Vec<(i64, i64, f64)> = Vec::new();
-    for i in 0..candidates.len() {
-        let (a, da) = candidates[i];
+    for (i, &(a, da)) in candidates.iter().enumerate() {
         let na = &nb_sets[&a];
-        for j in (i + 1)..candidates.len() {
-            let (b, db) = candidates[j];
+        for &(b, db) in &candidates[(i + 1)..] {
             let key = if a < b { (a, b) } else { (b, a) };
             if connected.contains(&key) {
                 continue;
@@ -3112,6 +3108,7 @@ pub fn fragmentation_index(brain: &Brain) -> Result<f64, rusqlite::Error> {
 
 /// Identify the most central entity per community (Louvain + PageRank).
 /// Returns (community_id, leader_entity_id, leader_name, community_size, leader_pagerank).
+#[allow(clippy::type_complexity)]
 pub fn community_leaders(
     brain: &Brain,
     limit: usize,
@@ -3191,12 +3188,7 @@ pub fn jaccard_predict(
         .collect();
 
     let mut sorted_candidates = candidates.clone();
-    sorted_candidates.sort_by(|a, b| {
-        degree
-            .get(b)
-            .unwrap_or(&0)
-            .cmp(&degree.get(a).unwrap_or(&0))
-    });
+    sorted_candidates.sort_by(|a, b| degree.get(b).unwrap_or(&0).cmp(degree.get(a).unwrap_or(&0)));
 
     let mut scores: Vec<(i64, i64, f64)> = Vec::new();
     let top: Vec<i64> = sorted_candidates.into_iter().take(500).collect();
@@ -3621,8 +3613,8 @@ pub fn motif_census(brain: &Brain) -> Result<HashMap<String, usize>, rusqlite::E
                 if sampled >= max_samples {
                     break 'outer;
                 }
-                let a_to_c = out.get(&a).map_or(false, |t| t.contains(&c));
-                let c_to_a = out.get(&c).map_or(false, |t| t.contains(&a));
+                let a_to_c = out.get(&a).is_some_and(|t| t.contains(&c));
+                let c_to_a = out.get(&c).is_some_and(|t| t.contains(&a));
                 if a_to_c && c_to_a {
                     triangles += 1;
                 } else if a_to_c {

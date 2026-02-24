@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, clippy::type_complexity)]
 //! PROMETHEUS — Automated Scientific Discovery Engine
 //!
 //! Pattern discovery, gap detection, hypothesis generation, validation,
@@ -2188,11 +2188,9 @@ impl<'a> Prometheus<'a> {
                 params![hypothesis.predicate],
                 |row| row.get(0),
             )
-            .map_err(Into::into)
         })?;
         let total_rels: i64 = self.brain.with_conn(|conn| {
             conn.query_row("SELECT COUNT(*) FROM relations", [], |row| row.get(0))
-                .map_err(Into::into)
         })?;
         if total_rels > 0 {
             let pred_freq = pred_count as f64 / total_rels as f64;
@@ -5499,7 +5497,6 @@ impl<'a> Prometheus<'a> {
                         params![syn],
                         |row| row.get(0),
                     )
-                    .map_err(Into::into)
                 })?;
                 if count > 0 {
                     self.brain.with_conn(|conn| {
@@ -8925,7 +8922,7 @@ impl<'a> Prometheus<'a> {
             }
             let preds = out_preds.get(&e.id);
             // Only consider entities with at least 2 predicates
-            if preds.map_or(true, |p| p.len() < 2) {
+            if preds.is_none_or(|p| p.len() < 2) {
                 continue;
             }
             type_groups
@@ -8937,7 +8934,7 @@ impl<'a> Prometheus<'a> {
         let mut hypotheses = Vec::new();
         let mut seen: HashSet<(i64, String)> = HashSet::new();
 
-        for (_etype, group) in &type_groups {
+        for group in type_groups.values() {
             // Only compare within manageable groups
             let group = if group.len() > 200 {
                 &group[..200]
@@ -11300,7 +11297,7 @@ impl<'a> Prometheus<'a> {
         }
 
         let mut merged = 0usize;
-        for (_name, group) in &name_groups {
+        for group in name_groups.values() {
             if group.len() < 2 {
                 continue;
             }
