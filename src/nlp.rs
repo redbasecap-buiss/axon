@@ -438,6 +438,10 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "modifier",
     "outils",
     "portail",
+    "military history",
+    "civil order",
+    "human pressure",
+    "personnel colours",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -1998,6 +2002,13 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "members",
     "origin",
     "pirate",
+    "mirror",
+    "making",
+    "others",
+    "binder",
+    "action",
+    "adding",
+    "agile",
     "reader",
     "reason",
     "romanesque",
@@ -3103,6 +3114,7 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         "teubner",
         "race point publishing",
         "packt publishing",
+        "iop publishing",
     ];
     for pub_name in PUBLISHER_NAMES {
         if lower == *pub_name
@@ -3111,6 +3123,16 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         {
             return false;
         }
+    }
+
+    // Reject "X Press" publisher patterns (e.g. "Toronto Press", "Finsbury Press")
+    if lower.ends_with(" press") && !lower.contains("associated") && !lower.contains("freedom") {
+        return false;
+    }
+
+    // Reject "X Publishing" / "X Education" patterns (publisher names)
+    if lower.ends_with(" publishing") || lower.ends_with(" education") {
+        return false;
     }
 
     // Reject entities containing Big-O / Theta notation fragments

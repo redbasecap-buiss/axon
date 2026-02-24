@@ -9748,6 +9748,98 @@ impl<'a> Prometheus<'a> {
                 updated += 1;
             }
         }
+        // Second pass: refine based on shared predicate-object pairs
+        // If A contemporary_of B and both A→pioneered→X and B→pioneered→X, refine to co_pioneers
+        let remaining_contemporary: Vec<_> = self
+            .brain
+            .all_relations()?
+            .into_iter()
+            .filter(|r| r.predicate == "contemporary_of")
+            .collect();
+
+        // Build entity→[(predicate, object_id)] index (excluding contemporary_of)
+        let all_rels2 = self.brain.all_relations()?;
+        let mut pred_obj_map: HashMap<i64, Vec<(&str, i64)>> = HashMap::new();
+        // Need to store predicates from all_rels2 which lives long enough
+        for r in &all_rels2 {
+            if r.predicate == "contemporary_of" {
+                continue;
+            }
+            pred_obj_map
+                .entry(r.subject_id)
+                .or_default()
+                .push((&r.predicate, r.object_id));
+        }
+
+        for r in &remaining_contemporary {
+            let s_type = id_to_type.get(&r.subject_id).copied().unwrap_or("unknown");
+            let o_type = id_to_type.get(&r.object_id).copied().unwrap_or("unknown");
+            if s_type != "person" || o_type != "person" {
+                continue;
+            }
+
+            let s_po = match pred_obj_map.get(&r.subject_id) {
+                Some(v) => v,
+                None => continue,
+            };
+            let o_po = match pred_obj_map.get(&r.object_id) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            // Find shared (predicate, object) pairs
+            let s_set: HashSet<(&str, i64)> = s_po.iter().copied().collect();
+            let shared_po: Vec<(&str, i64)> = o_po
+                .iter()
+                .filter(|po| s_set.contains(po))
+                .copied()
+                .collect();
+
+            if shared_po.is_empty() {
+                continue;
+            }
+
+            // Count shared predicates
+            let mut shared_preds: HashMap<&str, usize> = HashMap::new();
+            for (pred, _) in &shared_po {
+                *shared_preds.entry(pred).or_insert(0) += 1;
+            }
+
+            let new_pred = if shared_preds.get("pioneered").copied().unwrap_or(0) > 0 {
+                "co_pioneers"
+            } else if shared_preds.get("contributed_to").copied().unwrap_or(0) > 0 {
+                "co_contributors"
+            } else if shared_preds.get("works_on").copied().unwrap_or(0) > 0 {
+                "co_researchers"
+            } else if shared_preds.get("affiliated_with").copied().unwrap_or(0) > 0 {
+                "colleagues_at"
+            } else if shared_preds.get("active_in").copied().unwrap_or(0) > 0 {
+                "co_practitioners"
+            } else {
+                continue;
+            };
+
+            let ok = self.brain.with_conn(|conn| {
+                let res = conn.execute(
+                    "UPDATE relations SET predicate = ?1 WHERE id = ?2",
+                    params![new_pred, r.id],
+                );
+                match res {
+                    Ok(_) => Ok(true),
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                }
+            })?;
+            if ok {
+                updated += 1;
+            }
+        }
+
         Ok(updated)
     }
 
