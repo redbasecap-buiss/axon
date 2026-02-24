@@ -1076,6 +1076,17 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "american history",
     "panoramic view",
     "collected writings",
+    // Added 2026-02-25 (brain cleaner): more generic/noise terms
+    "reconstruction",
+    "noteworthy",
+    "resource",
+    "vessel",
+    "onboard",
+    "latinized",
+    "wireless",
+    "lecture",
+    "worldnews",
+    "aridization",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -3752,6 +3763,8 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             "aceae", "idae", "inae", "ales", "oidea", "iformes", "opsida",
             // Extinct animal genus suffixes
             "therium", "saurus", "pithecus", "cetus", "odon",
+            // Genus/species suffixes
+            "coccus", "bacillus", "phaga", "anthus", "setum", "phyta", "mycota", "monas",
         ];
         if suffixes.iter().any(|s| lower.ends_with(s)) && trimmed.len() > 6 {
             return false;
