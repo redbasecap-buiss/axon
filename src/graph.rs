@@ -5677,3 +5677,86 @@ pub fn eigenvector_centrality_top_k(
     sorted.truncate(k);
     Ok(sorted)
 }
+
+/// Community predicate entropy: measures how diverse the predicates are within
+/// each community. Low entropy = community is connected by repetitive predicates,
+/// high entropy = rich semantic connections. Returns (avg_entropy, min_entropy, max_entropy).
+pub fn community_predicate_entropy(brain: &Brain) -> Result<(f64, f64, f64), rusqlite::Error> {
+    let communities = louvain_communities(brain)?;
+    let relations = brain.all_relations()?;
+
+    // Group relations by community
+    let mut community_predicates: HashMap<usize, HashMap<String, usize>> = HashMap::new();
+    for r in &relations {
+        let cs = communities.get(&r.subject_id).copied();
+        let co = communities.get(&r.object_id).copied();
+        // Only count intra-community relations
+        if let (Some(a), Some(b)) = (cs, co) {
+            if a == b {
+                *community_predicates
+                    .entry(a)
+                    .or_default()
+                    .entry(r.predicate.clone())
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+
+    if community_predicates.is_empty() {
+        return Ok((0.0, 0.0, 0.0));
+    }
+
+    let mut entropies = Vec::new();
+    for (_comm_id, pred_counts) in &community_predicates {
+        let total: usize = pred_counts.values().sum();
+        if total < 2 {
+            continue;
+        }
+        let total_f = total as f64;
+        let entropy: f64 = pred_counts
+            .values()
+            .map(|&c| {
+                let p = c as f64 / total_f;
+                if p > 0.0 {
+                    -p * p.log2()
+                } else {
+                    0.0
+                }
+            })
+            .sum();
+        entropies.push(entropy);
+    }
+
+    if entropies.is_empty() {
+        return Ok((0.0, 0.0, 0.0));
+    }
+
+    let avg = entropies.iter().sum::<f64>() / entropies.len() as f64;
+    let min = entropies.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = entropies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+    Ok((avg, min, max))
+}
+
+/// Identify predicate bottlenecks: predicates that, if removed, would most
+/// increase graph fragmentation. Returns sorted vec of (predicate, bridge_count)
+/// where bridge_count is the number of inter-component edges using that predicate.
+pub fn predicate_bridge_analysis(brain: &Brain) -> Result<Vec<(String, usize)>, rusqlite::Error> {
+    let communities = louvain_communities(brain)?;
+    let relations = brain.all_relations()?;
+
+    let mut predicate_bridges: HashMap<String, usize> = HashMap::new();
+    for r in &relations {
+        let cs = communities.get(&r.subject_id).copied();
+        let co = communities.get(&r.object_id).copied();
+        if let (Some(a), Some(b)) = (cs, co) {
+            if a != b {
+                *predicate_bridges.entry(r.predicate.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut sorted: Vec<(String, usize)> = predicate_bridges.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    Ok(sorted)
+}

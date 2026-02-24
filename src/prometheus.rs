@@ -5003,6 +5003,15 @@ impl<'a> Prometheus<'a> {
         // Runs AFTER reconnection strategies to catch noise that was re-connected
         let participle_purged = self.purge_participle_concept_entities().unwrap_or(0);
 
+        // Purge person islands with trailing noise words (NLP fragments)
+        let trailing_fragment_purged = self.purge_trailing_fragment_person_islands().unwrap_or(0);
+
+        // Purge Latin phrase person islands
+        let latin_phrase_purged = self.purge_latin_phrase_person_islands().unwrap_or(0);
+
+        // Reconnect isolated places via geographic context tokens
+        let geographic_reconnected = self.reconnect_places_by_geographic_context().unwrap_or(0);
+
         // Boost confidence of well-known entities
         let known_boosted = self.boost_known_entity_confidence().unwrap_or(0);
 
@@ -5327,15 +5336,25 @@ impl<'a> Prometheus<'a> {
             } else {
                 String::new()
             };
+        let new_cleanup_line =
+            if trailing_fragment_purged + latin_phrase_purged + geographic_reconnected > 0 {
+                format!(
+                ", {} trailing-fragment-purged, {} latin-phrase-purged, {} geographic-reconnected",
+                trailing_fragment_purged, latin_phrase_purged, geographic_reconnected
+            )
+            } else {
+                String::new()
+            };
         let summary = format!(
-            "{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
             summary,
             health_line,
             diversity_line,
             quality_line,
             plateau_line,
             frontier_line,
-            stranger_line
+            stranger_line,
+            new_cleanup_line
         );
 
         Ok(DiscoveryReport {
@@ -19208,6 +19227,402 @@ impl<'a> Prometheus<'a> {
             );
         }
         Ok(purged)
+    }
+
+    /// Purge isolated person entities whose names end with pronouns, adverbs,
+    /// determiners, or other trailing NLP fragment words. These are extraction
+    /// errors like "Joseph Crespino It", "Match Twice", "Discussion It".
+    pub fn purge_trailing_fragment_person_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        let trailing_noise: HashSet<&str> = [
+            "it",
+            "him",
+            "her",
+            "them",
+            "us",
+            "me",
+            "its",
+            "his",
+            "this",
+            "that",
+            "these",
+            "those",
+            "which",
+            "what",
+            "who",
+            "twice",
+            "once",
+            "often",
+            "never",
+            "always",
+            "sometimes",
+            "here",
+            "there",
+            "where",
+            "when",
+            "then",
+            "now",
+            "not",
+            "nor",
+            "yet",
+            "but",
+            "and",
+            "for",
+            "the",
+            "any",
+            "very",
+            "much",
+            "more",
+            "most",
+            "less",
+            "also",
+            "too",
+            "been",
+            "being",
+            "having",
+            "doing",
+            "going",
+            "etc",
+            "eg",
+            "ie",
+            "so",
+            "just",
+            "only",
+            "even",
+            "still",
+            "each",
+            "every",
+            "some",
+            "all",
+            "both",
+            "few",
+            "many",
+            "own",
+            "such",
+            "no",
+            "rather",
+            "quite",
+            "merely",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let mut purged = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) || e.entity_type != "person" {
+                continue;
+            }
+            if e.confidence > 0.7 {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 {
+                continue;
+            }
+            let last = words.last().unwrap().to_lowercase();
+            if !trailing_noise.contains(last.as_str()) {
+                continue;
+            }
+            self.brain.with_conn(|conn| {
+                conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                Ok(())
+            })?;
+            purged += 1;
+        }
+        if purged > 0 {
+            eprintln!(
+                "  [trailing-fragment-purge] removed {} person islands with trailing noise words",
+                purged
+            );
+        }
+        Ok(purged)
+    }
+
+    /// Purge isolated person entities that look like Latin/foreign phrases rather
+    /// than actual person names. Detects patterns like multi-word names where
+    /// most words match common Latin vocabulary.
+    pub fn purge_latin_phrase_person_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        let latin_words: HashSet<&str> = [
+            "ab",
+            "ad",
+            "ante",
+            "ars",
+            "bellum",
+            "bona",
+            "causa",
+            "cum",
+            "de",
+            "dei",
+            "deo",
+            "deus",
+            "domus",
+            "duo",
+            "ego",
+            "ergo",
+            "est",
+            "et",
+            "ex",
+            "fide",
+            "gratia",
+            "homo",
+            "idem",
+            "ille",
+            "in",
+            "inter",
+            "iure",
+            "ius",
+            "lege",
+            "lex",
+            "loco",
+            "lux",
+            "mala",
+            "mens",
+            "modus",
+            "mors",
+            "naevo",
+            "nihil",
+            "nisi",
+            "non",
+            "nos",
+            "nulla",
+            "omni",
+            "opus",
+            "pax",
+            "per",
+            "post",
+            "prima",
+            "pro",
+            "quod",
+            "rea",
+            "res",
+            "rex",
+            "se",
+            "sed",
+            "sic",
+            "sine",
+            "sol",
+            "sub",
+            "sui",
+            "suo",
+            "terra",
+            "tot",
+            "tua",
+            "una",
+            "unum",
+            "via",
+            "vir",
+            "vita",
+            "vox",
+            "zelo",
+            "vindicatus",
+            "operandi",
+            "vivendi",
+            "juris",
+            "facto",
+            "jure",
+            "ipso",
+            "corpus",
+            "habeas",
+            "magna",
+            "carta",
+            "cogito",
+            "sum",
+            "veritas",
+            "amor",
+            "finis",
+            "orbis",
+            "mundus",
+            "sanctus",
+            "sancta",
+            "mare",
+            "mons",
+            "caput",
+            "urbs",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let mut purged = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) || e.entity_type != "person" {
+                continue;
+            }
+            if e.confidence > 0.6 {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 || words.len() > 5 {
+                continue;
+            }
+            let latin_count = words
+                .iter()
+                .filter(|w| latin_words.contains(w.to_lowercase().as_str()))
+                .count();
+            // All words must be Latin for it to be a phrase
+            if latin_count < words.len() {
+                continue;
+            }
+            self.brain.with_conn(|conn| {
+                conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                Ok(())
+            })?;
+            purged += 1;
+        }
+        if purged > 0 {
+            eprintln!(
+                "  [latin-phrase-purge] removed {} person islands that are Latin phrases",
+                purged
+            );
+        }
+        Ok(purged)
+    }
+
+    /// Reconnect isolated place entities to the graph by matching geographic
+    /// name tokens with connected place/organization entities.
+    pub fn reconnect_places_by_geographic_context(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        let geographic_suffixes: HashSet<&str> = [
+            "river",
+            "lake",
+            "mountain",
+            "sea",
+            "ocean",
+            "bay",
+            "gulf",
+            "strait",
+            "canal",
+            "valley",
+            "desert",
+            "island",
+            "islands",
+            "peninsula",
+            "cape",
+            "plateau",
+            "basin",
+            "delta",
+            "gorge",
+            "empire",
+            "kingdom",
+            "republic",
+            "province",
+            "prefecture",
+            "county",
+            "district",
+            "territory",
+            "region",
+            "city",
+            "town",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        // Build token → connected place entity index
+        let mut token_to_connected: HashMap<String, Vec<i64>> = HashMap::new();
+        for e in &entities {
+            if !connected.contains(&e.id) {
+                continue;
+            }
+            if e.entity_type != "place" && e.entity_type != "organization" {
+                continue;
+            }
+            for word in e.name.split_whitespace() {
+                let lower = word.to_lowercase();
+                if lower.len() < 4 || geographic_suffixes.contains(lower.as_str()) {
+                    continue;
+                }
+                token_to_connected.entry(lower).or_default().push(e.id);
+            }
+        }
+
+        let mut reconnected = 0usize;
+        let mut seen_pairs: HashSet<(i64, i64)> = HashSet::new();
+        for e in &entities {
+            if connected.contains(&e.id) || e.entity_type != "place" {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 {
+                continue;
+            }
+            let mut best_target: Option<i64> = None;
+            let mut best_score = 0usize;
+            for word in &words {
+                let lower = word.to_lowercase();
+                if lower.len() < 4 || geographic_suffixes.contains(lower.as_str()) {
+                    continue;
+                }
+                if let Some(targets) = token_to_connected.get(&lower) {
+                    for &tid in targets {
+                        if tid == e.id || seen_pairs.contains(&(e.id, tid)) {
+                            continue;
+                        }
+                        if let Some(te) = entities.iter().find(|x| x.id == tid) {
+                            let shared = words
+                                .iter()
+                                .filter(|w| {
+                                    let l = w.to_lowercase();
+                                    l.len() >= 4
+                                        && !geographic_suffixes.contains(l.as_str())
+                                        && te.name.to_lowercase().contains(&l)
+                                })
+                                .count();
+                            if shared > best_score {
+                                best_score = shared;
+                                best_target = Some(tid);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(tid) = best_target {
+                if best_score >= 1 {
+                    seen_pairs.insert((e.id, tid));
+                    self.brain
+                        .upsert_relation(e.id, "geographically_related_to", tid, "")?;
+                    reconnected += 1;
+                    if reconnected >= 100 {
+                        break;
+                    }
+                }
+            }
+        }
+        if reconnected > 0 {
+            eprintln!(
+                "  [geographic-context-reconnect] connected {} isolated places via shared geographic tokens",
+                reconnected
+            );
+        }
+        Ok(reconnected)
     }
 
     /// Reconnect high-value isolated entities to the knowledge graph using
