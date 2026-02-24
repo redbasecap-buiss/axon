@@ -3947,6 +3947,15 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         if adj_suffixes.iter().any(|s| lower.ends_with(s)) {
             return false;
         }
+        // Reject generic English nouns by suffix (e.g. "Stability", "Property", "Telescope")
+        let noun_suffixes = [
+            "ility", "ment", "ness", "ence", "ance", "ting", "ings", "ures", "isms", "ists",
+            "ents", "ates", "ives", "ries", "ties", "ples", "sion", "cope", "ally", "enly", "edly",
+            "erly", "ibly", "ably",
+        ];
+        if noun_suffixes.iter().any(|s| lower.ends_with(s)) {
+            return false;
+        }
     }
 
     // Reject entities ending with trailing junk words

@@ -4889,6 +4889,9 @@ impl<'a> Prometheus<'a> {
         // Reclassify two-word compound concept persons (e.g., "Aneutronic Fusion")
         let compound_reclassified = self.reclassify_compound_concept_persons().unwrap_or(0);
 
+        // Reclassify en-dash compound names (e.g., "Calabi–Yau" → concept)
+        let endash_reclassified = self.reclassify_endash_compound_islands().unwrap_or(0);
+
         // Purge ancient low-confidence islands (>30 days old, conf ≤0.5, no facts/relations)
         let ancient_purged = self.purge_ancient_low_confidence_islands(30).unwrap_or(0);
 
@@ -4913,6 +4916,9 @@ impl<'a> Prometheus<'a> {
 
         // Source-cohort island reconnection (temporal co-extraction)
         let source_reconnected = self.reconnect_islands_by_source().unwrap_or(0);
+
+        // Broader minute-level temporal cohort reconnection
+        let minute_cohort_reconnected = self.reconnect_islands_by_minute_cohort().unwrap_or(0);
 
         // Domain-keyword island reconnection (high-value entities with shared name tokens)
         let domain_reconnected = self.reconnect_islands_by_domain().unwrap_or(0);
@@ -5091,7 +5097,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} geo-person-reclassified, {} place-region-reclassified, {} compound-concept-reclassified, {} ancient-islands-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} source-url-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} geo-person-reclassified, {} place-region-reclassified, {} compound-concept-reclassified, {} endash-reclassified, {} ancient-islands-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} minute-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} source-url-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -5175,6 +5181,7 @@ impl<'a> Prometheus<'a> {
             geo_reclassified,
             place_region_reclassified,
             compound_reclassified,
+            endash_reclassified,
             ancient_purged,
             abbreviation_merged,
             concat_noise_purged,
@@ -5184,6 +5191,7 @@ impl<'a> Prometheus<'a> {
             cross_component_merged,
             tfidf_reconnected,
             source_reconnected,
+            minute_cohort_reconnected,
             domain_reconnected,
             fact_value_bridged,
             pred_obj_reconnected,
@@ -18283,10 +18291,10 @@ impl<'a> Prometheus<'a> {
             if is_noise_type(&e.entity_type) || is_noise_name(&e.name) {
                 continue;
             }
-            // Truncate to nearest 2 seconds for fuzzy matching
+            // Truncate to nearest 10 seconds for fuzzy matching
             let ts_str = e.first_seen.format("%Y-%m-%dT%H:%M:%S").to_string();
             let secs = e.first_seen.second();
-            let ts_key = format!("{}{}", &ts_str[..17], secs / 2 * 2);
+            let ts_key = format!("{}{}", &ts_str[..17], secs / 10 * 10);
             time_cohorts.entry(ts_key).or_default().push(e.id);
         }
 
@@ -21108,6 +21116,167 @@ impl<'a> Prometheus<'a> {
             );
         }
         Ok(count)
+    }
+
+    /// Reclassify isolated entities with en-dash compound names (e.g., "Calabi–Yau",
+    /// "Bose–Einstein") from place/person to concept. These are mathematical/physical
+    /// theories named after their creators, not geographic locations or people.
+    pub fn reclassify_endash_compound_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        let mut reclassified = 0usize;
+        for e in &entities {
+            if connected.contains(&e.id) || e.entity_type == "concept" {
+                continue;
+            }
+            // Must contain en-dash (–) or em-dash (—) separating two capitalized words
+            let has_dash = e.name.contains('–') || e.name.contains('—');
+            if !has_dash {
+                continue;
+            }
+            // Split on dash and check both parts look like surnames
+            let parts: Vec<&str> = e
+                .name
+                .split(|c| c == '–' || c == '—')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            // Both parts should start with uppercase (surname-like)
+            let both_capitalized = parts
+                .iter()
+                .all(|p| p.chars().next().map(|c| c.is_uppercase()).unwrap_or(false));
+            if !both_capitalized {
+                continue;
+            }
+            // Reclassify to concept
+            self.brain.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE entities SET entity_type = 'concept' WHERE id = ?1",
+                    params![e.id],
+                )?;
+                Ok(())
+            })?;
+            reclassified += 1;
+        }
+        if reclassified > 0 {
+            eprintln!(
+                "  [endash-reclassify] reclassified {} en-dash compound islands to concept",
+                reclassified
+            );
+        }
+        Ok(reclassified)
+    }
+
+    /// Broader minute-level temporal reconnection: connect isolated high-confidence
+    /// entities to the nearest hub entity that was first_seen in the same minute.
+    /// This is wider than the 10-second cohort in `reconnect_islands_by_source` and
+    /// catches entities from the same crawl page that were extracted seconds apart.
+    pub fn reconnect_islands_by_minute_cohort(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+
+        let mut connected: HashSet<i64> = HashSet::new();
+        let mut degree: HashMap<i64, usize> = HashMap::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+            *degree.entry(r.subject_id).or_insert(0) += 1;
+            *degree.entry(r.object_id).or_insert(0) += 1;
+        }
+
+        let id_to_entity: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+
+        // Group entities by first_seen minute
+        let mut minute_cohorts: HashMap<String, Vec<i64>> = HashMap::new();
+        for e in &entities {
+            if is_noise_type(&e.entity_type) || is_noise_name(&e.name) {
+                continue;
+            }
+            if e.confidence < 0.7 {
+                continue;
+            }
+            let ts_key = e.first_seen.format("%Y-%m-%dT%H:%M").to_string();
+            minute_cohorts.entry(ts_key).or_default().push(e.id);
+        }
+
+        let mut reconnected = 0usize;
+        for (_ts, cohort) in &minute_cohorts {
+            if cohort.len() < 3 || cohort.len() > 50 {
+                continue;
+            }
+            // Find the highest-degree connected entity as hub
+            let hub_id = match cohort
+                .iter()
+                .filter(|id| connected.contains(id))
+                .max_by_key(|&&id| degree.get(&id).copied().unwrap_or(0))
+            {
+                Some(&id) => id,
+                None => continue,
+            };
+            let hub = match id_to_entity.get(&hub_id) {
+                Some(e) => e,
+                None => continue,
+            };
+            // Only use hubs with degree >= 3 (real anchor nodes)
+            if degree.get(&hub_id).copied().unwrap_or(0) < 3 {
+                continue;
+            }
+
+            for &eid in cohort {
+                if connected.contains(&eid) || eid == hub_id {
+                    continue;
+                }
+                let island = match id_to_entity.get(&eid) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                // Must be high-value type
+                if !HIGH_VALUE_TYPES.contains(&island.entity_type.as_str()) {
+                    continue;
+                }
+                let pred = match (island.entity_type.as_str(), hub.entity_type.as_str()) {
+                    ("person", "person") => "contemporary_of",
+                    ("person", "place") | ("place", "person") => "active_in",
+                    ("person", "organization") | ("organization", "person") => "affiliated_with",
+                    ("person", "concept") => "contributed_to",
+                    ("concept", "person") => "pioneered_by",
+                    ("concept", "concept") => "related_concept",
+                    ("organization", "concept") | ("concept", "organization") => "works_on",
+                    ("organization", "organization") => "partner_of",
+                    ("place", "place") => "located_near",
+                    _ => "co_extracted_with",
+                };
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO relations (subject_id, predicate, object_id, confidence, source_url, learned_at)
+                         VALUES (?1, ?2, ?3, 0.35, 'minute_cohort', ?4)",
+                        params![eid, pred, hub_id, Utc::now().to_rfc3339()],
+                    )?;
+                    Ok(())
+                })?;
+                connected.insert(eid);
+                reconnected += 1;
+                if reconnected >= 800 {
+                    return Ok(reconnected);
+                }
+            }
+        }
+        if reconnected > 0 {
+            eprintln!(
+                "  [minute-cohort-reconnect] reconnected {} islands via minute-level temporal cohort",
+                reconnected
+            );
+        }
+        Ok(reconnected)
     }
 
     /// Detect and reclassify person entities whose names are actually well-known
