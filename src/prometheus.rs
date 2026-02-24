@@ -4158,6 +4158,14 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(ss_hyps);
         }
 
+        // 2bb. Fact-gap strategy: entities rich in facts but relation-poor
+        let fg_weight = self.get_pattern_weight("fact_gap")?;
+        if fg_weight >= 0.05 {
+            let fg_hyps = self.generate_hypotheses_from_fact_gaps()?;
+            eprintln!("[PROMETHEUS] fact_gap: {} hypotheses", fg_hyps.len());
+            all_hypotheses.extend(fg_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -5923,6 +5931,61 @@ impl<'a> Prometheus<'a> {
                                 {
                                     evidence_score += 0.10;
                                 }
+                            }
+                        }
+
+                        // Signal 6: Name-token overlap — entities sharing significant
+                        // name tokens (beyond common words) suggest topical relatedness.
+                        // Particularly useful for temporal_co_discovery and concept_enrichment.
+                        {
+                            let stop_words: HashSet<&str> = [
+                                "the", "of", "and", "in", "for", "to", "a", "an", "is", "at", "on",
+                                "by", "with", "from", "or", "as", "it",
+                            ]
+                            .into_iter()
+                            .collect();
+                            let s_tokens: HashSet<String> = h
+                                .subject
+                                .to_lowercase()
+                                .split_whitespace()
+                                .filter(|w| w.len() > 2 && !stop_words.contains(w))
+                                .map(|s| s.to_string())
+                                .collect();
+                            let o_tokens: HashSet<String> = h
+                                .object
+                                .to_lowercase()
+                                .split_whitespace()
+                                .filter(|w| w.len() > 2 && !stop_words.contains(w))
+                                .map(|s| s.to_string())
+                                .collect();
+                            let shared_tokens = s_tokens.intersection(&o_tokens).count();
+                            if shared_tokens >= 1 && !s_tokens.is_empty() && !o_tokens.is_empty() {
+                                let overlap_ratio = shared_tokens as f64
+                                    / s_tokens.len().min(o_tokens.len()) as f64;
+                                evidence_score += 0.08 * overlap_ratio;
+                            }
+                        }
+
+                        // Signal 7: Entity type affinity — concept_enrichment and
+                        // predicate_transfer hypotheses linking a concept to a
+                        // person/org/technology are high-value knowledge connections.
+                        if h.pattern_source == "concept_enrichment"
+                            || h.pattern_source == "predicate_transfer"
+                        {
+                            let types = [&s_ent.entity_type, &o_ent.entity_type];
+                            let has_concept = types.iter().any(|t| t.as_str() == "concept");
+                            let has_specific = types.iter().any(|t| {
+                                matches!(
+                                    t.as_str(),
+                                    "person"
+                                        | "organization"
+                                        | "technology"
+                                        | "company"
+                                        | "product"
+                                )
+                            });
+                            if has_concept && has_specific {
+                                evidence_score += 0.08;
                             }
                         }
 
@@ -12257,6 +12320,170 @@ impl<'a> Prometheus<'a> {
         }
 
         hypotheses.truncate(50);
+        Ok(hypotheses)
+    }
+
+    /// Strategy: Fact-gap — find entities with many facts but few relations.
+    /// These are knowledge-rich nodes that the graph hasn't connected yet.
+    /// Pair them with entities sharing fact key-value pairs to surface hidden links.
+    pub fn generate_hypotheses_from_fact_gaps(&self) -> Result<Vec<Hypothesis>> {
+        let meaningful = meaningful_ids(self.brain)?;
+        let entities = self.brain.all_entities()?;
+        let name_map: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let type_map: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Find entities with ≥2 facts but ≤1 relation (fact-rich, relation-poor)
+        let fact_rich: Vec<(i64, Vec<(String, String)>)> = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT f.entity_id, f.key, f.value FROM facts f
+                 JOIN entities e ON e.id = f.entity_id
+                 WHERE f.entity_id IN (
+                     SELECT entity_id FROM facts GROUP BY entity_id HAVING COUNT(*) >= 2
+                 )
+                 AND (SELECT COUNT(*) FROM relations WHERE subject_id = f.entity_id OR object_id = f.entity_id) <= 1
+                 ORDER BY f.entity_id"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?;
+            let mut grouped: HashMap<i64, Vec<(String, String)>> = HashMap::new();
+            for r in rows.filter_map(|r| r.ok()) {
+                grouped.entry(r.0).or_default().push((r.1, r.2));
+            }
+            Ok(grouped.into_iter().collect::<Vec<_>>())
+        })?;
+
+        if fact_rich.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build inverted index: (key, value) → entity ids
+        let mut kv_index: HashMap<(String, String), Vec<i64>> = HashMap::new();
+        for (eid, facts) in &fact_rich {
+            for (k, v) in facts {
+                kv_index
+                    .entry((k.clone(), v.clone()))
+                    .or_default()
+                    .push(*eid);
+            }
+        }
+        // Also add well-connected entities' facts to the index
+        let connected_facts: Vec<(i64, String, String)> = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT f.entity_id, f.key, f.value FROM facts f
+                 WHERE f.entity_id IN (
+                     SELECT entity_id FROM facts GROUP BY entity_id HAVING COUNT(*) >= 2
+                 )
+                 AND (SELECT COUNT(*) FROM relations WHERE subject_id = f.entity_id OR object_id = f.entity_id) >= 3"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+        })?;
+        for (eid, k, v) in &connected_facts {
+            kv_index
+                .entry((k.clone(), v.clone()))
+                .or_default()
+                .push(*eid);
+        }
+
+        let mut hypotheses = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+
+        for (eid, facts) in &fact_rich {
+            if !meaningful.contains(eid) {
+                continue;
+            }
+            let name = match name_map.get(eid) {
+                Some(n) => *n,
+                None => continue,
+            };
+            if is_noise_name(name) {
+                continue;
+            }
+            let etype = type_map.get(eid).copied().unwrap_or("?");
+
+            // Find entities sharing fact key-value pairs
+            let mut candidates: HashMap<i64, usize> = HashMap::new();
+            for (k, v) in facts {
+                if let Some(others) = kv_index.get(&(k.clone(), v.clone())) {
+                    for &other_id in others {
+                        if other_id != *eid {
+                            *candidates.entry(other_id).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+
+            // Pick top candidate by shared facts
+            let mut sorted: Vec<_> = candidates.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+            for (other_id, shared_count) in sorted.into_iter().take(2) {
+                if shared_count < 1 {
+                    continue;
+                }
+                let other_name = match name_map.get(&other_id) {
+                    Some(n) => *n,
+                    None => continue,
+                };
+                if is_noise_name(other_name) {
+                    continue;
+                }
+                let other_type = type_map.get(&other_id).copied().unwrap_or("?");
+                if !types_compatible(etype, other_type) {
+                    continue;
+                }
+                let key = if name < other_name {
+                    (name.to_string(), other_name.to_string())
+                } else {
+                    (other_name.to_string(), name.to_string())
+                };
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.insert(key);
+
+                let predicate = infer_predicate(etype, other_type, None);
+                let base_conf = 0.40 + 0.10 * (shared_count as f64).min(3.0);
+                let confidence = self
+                    .calibrated_confidence("fact_gap", base_conf)
+                    .unwrap_or(base_conf);
+
+                hypotheses.push(Hypothesis {
+                    id: 0,
+                    subject: name.to_string(),
+                    predicate: predicate.to_string(),
+                    object: other_name.to_string(),
+                    confidence,
+                    evidence_for: vec![format!(
+                        "Share {} fact key-value pairs; {} is fact-rich but relation-poor",
+                        shared_count, name
+                    )],
+                    evidence_against: vec![],
+                    reasoning_chain: vec![format!(
+                        "Fact-gap: {} has {} facts but ≤1 relation; shares facts with {}",
+                        name,
+                        facts.len(),
+                        other_name
+                    )],
+                    status: HypothesisStatus::Testing,
+                    discovered_at: now_str(),
+                    pattern_source: "fact_gap".to_string(),
+                });
+            }
+
+            if hypotheses.len() >= 60 {
+                break;
+            }
+        }
+
+        hypotheses.truncate(60);
         Ok(hypotheses)
     }
 

@@ -805,6 +805,13 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "carryout",
     "vorschläge",
     "perusine",
+    // Added 2026-02-24 (brain cleaner round 3)
+    "refugee",
+    "neurosurgeons",
+    "intervalles",
+    "atomkerne",
+    "filmportrait",
+    "stadion",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -4120,6 +4127,9 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             "untersuchung",
             "zusammenfassung",
             "erklärung",
+            "ungen",
+            "schaft",
+            "ierung",
         ];
         if german_generic_suffixes.iter().any(|s| lower.ends_with(s)) {
             return false;
@@ -4221,6 +4231,14 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             "international",
             "program ",
             "programs",
+            "bibliotheca",
+            "doctoral",
+            "patreon",
+            "communications",
+            "mongol",
+            "storm",
+            "dark",
+            "state",
         ];
         // Also reject person entities ending with a country/region name
         const PERSON_COUNTRY_BLACKLIST: &[&str] = &[
