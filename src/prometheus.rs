@@ -9196,11 +9196,20 @@ impl<'a> Prometheus<'a> {
             if is_noise_name(a_name) || is_noise_name(b_name) {
                 continue;
             }
+            // Require at least 1 shared neighbor to reduce false positives
+            let a_nbrs: HashSet<i64> = adj.get(a).map(|v| v.iter().copied().collect()).unwrap_or_default();
+            let b_nbrs: HashSet<i64> = adj.get(b).map(|v| v.iter().copied().collect()).unwrap_or_default();
+            let shared_neighbors = a_nbrs.intersection(&b_nbrs).count();
+            if shared_neighbors == 0 {
+                continue;
+            }
             let a_type = id_type.get(a).copied().unwrap_or("unknown");
             let b_type = id_type.get(b).copied().unwrap_or("unknown");
             let predicate = infer_predicate(a_type, b_type, None);
 
-            let base_conf = (0.35 + (sim.ln().max(-5.0) + 5.0) * 0.08).min(0.75);
+            // Boost confidence by shared neighbor count
+            let neighbor_boost = (shared_neighbors as f64 * 0.03).min(0.15);
+            let base_conf = (0.35 + (sim.ln().max(-5.0) + 5.0) * 0.08 + neighbor_boost).min(0.75);
             let confidence = self
                 .calibrated_confidence("katz_similarity", base_conf)
                 .unwrap_or(base_conf);
@@ -12342,6 +12351,29 @@ impl<'a> Prometheus<'a> {
                 .is_some_and(|w| place_prefixes.contains(&w.to_lowercase().as_str()))
                 && words.len() >= 2;
 
+            // 8. Non-name suffixes: "Weather Forecast", "Birth Rate", "Time Zone", etc.
+            let nonname_suffixes: HashSet<&str> = [
+                "forecast", "report", "rate", "zone", "index", "ratio",
+                "average", "estimate", "survey", "census", "registry",
+                "catalogue", "catalog", "inventory", "listing", "schedule",
+                "brief", "briefe", "bericht", "berichte", "verzeichnis",
+                "übersicht", "tabelle", "protokoll",
+            ].into_iter().collect();
+            let ends_nonname_suffix = words.last()
+                .is_some_and(|w| nonname_suffixes.contains(w.to_lowercase().as_str()));
+
+            // 9. Latin/German document title patterns (multi-word, all capitalized, non-name)
+            let latin_doc_words: HashSet<&str> = [
+                "liber", "libri", "opus", "opera", "acta", "annales", "historia",
+                "rerum", "naturalis", "gestarum", "bellum", "civile",
+                "de", "re", "ad", "cum", "pro", "contra", "per", "sub",
+                "commentarii", "epistulae", "fragmenta", "collectanea",
+                "unbekannte", "gesammelte", "sämtliche", "ausgewählte",
+            ].into_iter().collect();
+            let is_latin_doc = words.len() >= 2
+                && e.confidence < 0.7
+                && lower_words.iter().filter(|w| latin_doc_words.contains(w.as_str())).count() >= 2;
+
             if has_concept_word
                 || has_place_word
                 || (has_non_english_phrase && e.confidence < 0.8)
@@ -12353,6 +12385,8 @@ impl<'a> Prometheus<'a> {
                 || looks_non_name_phrase
                 || ends_org_suffix
                 || starts_place_prefix
+                || ends_nonname_suffix
+                || is_latin_doc
             {
                 eprintln!(
                     "  [mistyped-person-purge] deleting island '{}' (id={})",
@@ -12442,6 +12476,25 @@ impl<'a> Prometheus<'a> {
             .map(|e| e.name.to_lowercase())
             .collect();
 
+        // Geographic suffixes common in European place names (German, Swiss, Nordic, etc.)
+        let geo_suffixes: &[&str] = &[
+            "brunnen", "berg", "burg", "burg", "stein", "wald", "feld", "dorf",
+            "bach", "bruck", "brücke", "hausen", "heim", "hofen", "kirchen",
+            "stadt", "stetten", "weil", "weiler", "wil", "ikon", "iken",
+            "ikon", "ach", "au", "ow", "in", "itz", "witz",
+            "grad", "gorod", "abad", "pur", "pura", "garh",
+            "fjord", "vik", "ness", "holm", "by", "lund",
+            "polis", "chester", "cester", "minster", "bury", "mouth",
+            "haven", "ford", "bridge", "land", "dale", "vale",
+            "ville", "bourg", "mont",
+        ];
+
+        // Common standalone place-like single words (historical regions, geographic features)
+        let standalone_places: HashSet<&str> = [
+            "placentia", "dertosa", "temeswar", "khwarezmia", "santillana",
+            "lauterbrunnen", "uetliberg",
+        ].into_iter().collect();
+
         let mut reclassified = 0usize;
         for e in &entities {
             if connected.contains(&e.id) {
@@ -12451,7 +12504,23 @@ impl<'a> Prometheus<'a> {
                 continue;
             }
             let lower = e.name.to_lowercase();
-            if place_names.contains(&lower) {
+
+            // Match 1: exact name match with connected place
+            let is_known_place = place_names.contains(&lower);
+
+            // Match 2: geographic suffix detection (single-word, starts uppercase, ≥6 chars)
+            let has_geo_suffix = !lower.contains(' ')
+                && lower.len() >= 6
+                && e.name.chars().next().is_some_and(|c| c.is_uppercase())
+                && geo_suffixes.iter().any(|suf| {
+                    // Require suffix to be at most half the word to avoid false positives
+                    suf.len() <= lower.len() / 2 && lower.ends_with(suf)
+                });
+
+            // Match 3: known standalone place names
+            let is_standalone = standalone_places.contains(lower.as_str());
+
+            if is_known_place || has_geo_suffix || is_standalone {
                 self.brain.with_conn(|conn| {
                     conn.execute(
                         "UPDATE entities SET entity_type = 'place' WHERE id = ?1",
@@ -12464,7 +12533,7 @@ impl<'a> Prometheus<'a> {
         }
         if reclassified > 0 {
             eprintln!(
-                "  [concept→place] reclassified {} concept islands matching known places",
+                "  [concept→place] reclassified {} concept islands (name match + geo suffix)",
                 reclassified
             );
         }
