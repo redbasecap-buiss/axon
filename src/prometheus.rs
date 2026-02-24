@@ -3279,6 +3279,17 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(ppt_hyps);
         }
 
+        // 2p. Preferential attachment (high-degree hubs not yet connected)
+        let pa_weight = self.get_pattern_weight("preferential_attachment")?;
+        if pa_weight >= 0.05 {
+            let pa_hyps = self.generate_hypotheses_from_preferential_attachment()?;
+            eprintln!(
+                "[PROMETHEUS] preferential_attachment: {} hypotheses",
+                pa_hyps.len()
+            );
+            all_hypotheses.extend(pa_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -8900,6 +8911,77 @@ impl<'a> Prometheus<'a> {
             }
         }
         hypotheses.truncate(30);
+        Ok(hypotheses)
+    }
+
+    /// Preferential attachment: high-degree nodes that aren't yet connected are
+    /// likely to form connections (rich-get-richer effect in knowledge graphs).
+    /// Uses the graph-level predictor and infers predicates from entity types.
+    pub fn generate_hypotheses_from_preferential_attachment(&self) -> Result<Vec<Hypothesis>> {
+        let predictions = crate::graph::preferential_attachment_predict(self.brain, 60)?;
+        if predictions.is_empty() {
+            return Ok(vec![]);
+        }
+        let meaningful = meaningful_ids(self.brain)?;
+        let entities = self.brain.all_entities()?;
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        let mut hypotheses = Vec::new();
+        for (a, b, score) in &predictions {
+            if !meaningful.contains(a) || !meaningful.contains(b) {
+                continue;
+            }
+            let a_name = match id_name.get(a) {
+                Some(n) => *n,
+                None => continue,
+            };
+            let b_name = match id_name.get(b) {
+                Some(n) => *n,
+                None => continue,
+            };
+            if is_noise_name(a_name) || is_noise_name(b_name) {
+                continue;
+            }
+            let a_type = id_type.get(a).copied().unwrap_or("unknown");
+            let b_type = id_type.get(b).copied().unwrap_or("unknown");
+            let predicate = infer_predicate(a_type, b_type, None);
+
+            // Normalize score: PA scores can be very large (degree_a * degree_b)
+            let norm_score = (*score as f64).ln().max(1.0) / 15.0; // ln(e^15) ≈ max
+            let base_conf = (0.3 + norm_score * 0.3).min(0.75);
+            let confidence = self
+                .calibrated_confidence("preferential_attachment", base_conf)
+                .unwrap_or(base_conf);
+
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.to_string(),
+                predicate: predicate.to_string(),
+                object: b_name.to_string(),
+                confidence,
+                evidence_for: vec![format!(
+                    "Preferential attachment score: {:.0} (high-degree nodes not yet connected)",
+                    score
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!(
+                        "{} ({}) and {} ({}) are both high-degree hubs",
+                        a_name, a_type, b_name, b_type
+                    ),
+                    "Preferential attachment principle: high-degree nodes tend to form new connections".to_string(),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "preferential_attachment".to_string(),
+            });
+        }
+        hypotheses.truncate(40);
         Ok(hypotheses)
     }
 
