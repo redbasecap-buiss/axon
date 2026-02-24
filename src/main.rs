@@ -1,5 +1,6 @@
 mod chat;
 mod config;
+pub mod criticality;
 mod crawler;
 mod db;
 #[allow(dead_code)]
@@ -116,6 +117,17 @@ enum Commands {
         /// Hypothesis ID
         hypothesis_id: i64,
     },
+    /// Run Self-Organized Criticality analysis — full brain health report
+    Criticality,
+    /// Meta-cognitive self-assessment — domain balance, staleness, velocity
+    Introspect,
+    /// Abductive reasoning — explain an observation
+    Abduce {
+        /// Observation to explain (e.g. "Newton and Leibniz both connected to Calculus")
+        observation: String,
+    },
+    /// Predict which entities are most likely to gain new connections
+    Predict,
     /// Generate default config at ~/.axon/config.toml
     Init,
     /// Launch HTTP API server
@@ -529,6 +541,64 @@ async fn main() -> anyhow::Result<()> {
             match p.explain(hypothesis_id)? {
                 Some(explanation) => println!("{}", explanation),
                 None => println!("🤷 Hypothesis #{} not found.", hypothesis_id),
+            }
+        }
+        Commands::Criticality => {
+            println!("⚡ Running Self-Organized Criticality analysis...\n");
+            let report = criticality::criticality_report(&brain)?;
+            println!("{}", criticality::format_criticality_report(&report));
+        }
+        Commands::Introspect => {
+            println!("🧠 Running meta-cognitive self-assessment...\n");
+            let mc = criticality::introspect(&brain)?;
+            println!("{}", criticality::format_introspection(&mc));
+        }
+        Commands::Abduce { observation } => {
+            println!("🔍 Abductive reasoning: \"{}\"\n", observation);
+            let hypothesis = criticality::abduce(&brain, &observation)?;
+            println!("Observation: {}", hypothesis.observation);
+            println!("Confidence: {:.2}", hypothesis.confidence);
+            println!(
+                "Candidate explanations: {}\n",
+                hypothesis.candidate_explanations.len()
+            );
+            if let Some(best) = &hypothesis.best_explanation {
+                println!("Best explanation:");
+                println!("  {}", best.summary);
+                println!(
+                    "  Parsimony: {:.2} | Coverage: {:.2} | Consistency: {:.2}",
+                    best.parsimony_score, best.coverage_score, best.consistency_score
+                );
+            }
+            for (i, expl) in hypothesis.candidate_explanations.iter().enumerate().skip(1) {
+                if i > 5 {
+                    break;
+                }
+                println!("\nAlternative {}:", i);
+                println!("  {}", expl.summary);
+                println!("  Score: {:.3}", expl.combined_score);
+            }
+        }
+        Commands::Predict => {
+            println!("🔮 Predicting next discoveries...\n");
+            let predictions = criticality::predict_next_discovery(&brain)?;
+            if predictions.is_empty() {
+                println!("🤷 Not enough data to make predictions.");
+            } else {
+                println!(
+                    "Top {} entities likely to gain new connections:\n",
+                    predictions.len()
+                );
+                for (i, p) in predictions.iter().enumerate() {
+                    println!(
+                        "  {}. {} [{}] — score: {:.3}",
+                        i + 1,
+                        p.entity_name,
+                        p.entity_type,
+                        p.predicted_score
+                    );
+                    println!("     {}", p.reason);
+                }
             }
         }
         Commands::Init => unreachable!(),
