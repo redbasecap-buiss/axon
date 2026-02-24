@@ -4866,6 +4866,15 @@ impl<'a> Prometheus<'a> {
         // Demote weak contemporary_of relations lacking shared-neighbor evidence
         let weak_contemporary_demoted = self.demote_weak_contemporary().unwrap_or(0);
 
+        // Prune redundant contemporary_of (already-connected pairs + non-person + domain-refined)
+        let redundant_contemporary_pruned = self.prune_redundant_contemporary().unwrap_or(0);
+        if redundant_contemporary_pruned > 0 {
+            eprintln!(
+                "[PROMETHEUS] Pruned/refined {} redundant contemporary_of relations",
+                redundant_contemporary_pruned
+            );
+        }
+
         // Promote mature testing hypotheses (>7 days, confidence >= 0.75)
         let promoted = self.promote_mature_hypotheses(7, 0.75).unwrap_or(0);
 
@@ -4961,7 +4970,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} hypotheses promoted ({} accelerated), \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -5060,6 +5069,7 @@ impl<'a> Prometheus<'a> {
             pioneered_refined,
             active_in_refined,
             weak_contemporary_demoted,
+            redundant_contemporary_pruned,
             promoted,
             accelerated_promoted,
             fragment_cleaned,
@@ -14483,6 +14493,131 @@ impl<'a> Prometheus<'a> {
             );
         }
         Ok(demoted + pruned)
+    }
+
+    /// Remove redundant `contemporary_of` relations where a more specific predicate
+    /// already connects the same entity pair. Also delete `contemporary_of` between
+    /// non-person entities (places/concepts can't be "contemporaries"), and refine
+    /// person-person `contemporary_of` by inferring predicates from shared domain
+    /// context (e.g., both pioneered same concept → "co_researchers").
+    pub fn prune_redundant_contemporary(&self) -> Result<usize> {
+        let mut total = 0usize;
+
+        // 1. Delete contemporary_of where a better predicate already exists for the same pair
+        total += self.brain.with_conn(|conn| {
+            let count = conn.execute(
+                "DELETE FROM relations WHERE predicate = 'contemporary_of'
+                 AND EXISTS (
+                     SELECT 1 FROM relations r2
+                     WHERE r2.predicate != 'contemporary_of'
+                     AND ((r2.subject_id = relations.subject_id AND r2.object_id = relations.object_id)
+                       OR (r2.subject_id = relations.object_id AND r2.object_id = relations.subject_id))
+                 )",
+                [],
+            )?;
+            Ok(count)
+        })?;
+
+        // 2. Delete contemporary_of between non-person entities
+        total += self.brain.with_conn(|conn| {
+            let count = conn.execute(
+                "DELETE FROM relations WHERE predicate = 'contemporary_of'
+                 AND (subject_id NOT IN (SELECT id FROM entities WHERE entity_type = 'person')
+                   OR object_id NOT IN (SELECT id FROM entities WHERE entity_type = 'person'))",
+                [],
+            )?;
+            Ok(count)
+        })?;
+
+        // 3. Refine remaining contemporary_of using shared predicate-object patterns:
+        //    if both persons share the same (predicate, object) pair via other relations,
+        //    infer a more meaningful relationship.
+        let relations = self.brain.all_relations()?;
+        let entities = self.brain.all_entities()?;
+        let id_to_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Build predicate-object sets per entity (excluding contemporary_of itself)
+        let mut pred_obj: HashMap<i64, Vec<(&str, i64)>> = HashMap::new();
+        for r in &relations {
+            if r.predicate == "contemporary_of" {
+                continue;
+            }
+            pred_obj
+                .entry(r.subject_id)
+                .or_default()
+                .push((&r.predicate, r.object_id));
+        }
+
+        let contemporary_rels: Vec<_> = relations
+            .iter()
+            .filter(|r| r.predicate == "contemporary_of")
+            .collect();
+
+        for r in &contemporary_rels {
+            let s_type = id_to_type.get(&r.subject_id).copied().unwrap_or("unknown");
+            let o_type = id_to_type.get(&r.object_id).copied().unwrap_or("unknown");
+            if s_type != "person" || o_type != "person" {
+                continue;
+            }
+
+            let s_po = pred_obj.get(&r.subject_id);
+            let o_po = pred_obj.get(&r.object_id);
+            let (s_po, o_po) = match (s_po, o_po) {
+                (Some(a), Some(b)) => (a, b),
+                _ => continue,
+            };
+
+            // Find shared (predicate, object) pairs
+            let s_set: HashSet<(&str, i64)> = s_po.iter().copied().collect();
+            let shared: Vec<(&str, i64)> = o_po
+                .iter()
+                .filter(|po| s_set.contains(po))
+                .copied()
+                .collect();
+            if shared.is_empty() {
+                continue;
+            }
+
+            // Determine best predicate from shared context
+            let shared_preds: HashSet<&str> = shared.iter().map(|(p, _)| *p).collect();
+            let new_pred = if shared_preds.contains("pioneered")
+                || shared_preds.contains("works_on")
+                || shared_preds.contains("contributed_to")
+            {
+                "co_researchers"
+            } else if shared_preds.contains("affiliated_with") {
+                "colleagues_at"
+            } else if shared_preds.contains("active_in") || shared_preds.contains("based_in") {
+                "co_located_in"
+            } else {
+                continue;
+            };
+
+            let ok = self.brain.with_conn(|conn| {
+                let res = conn.execute(
+                    "UPDATE relations SET predicate = ?1 WHERE id = ?2",
+                    params![new_pred, r.id],
+                );
+                match res {
+                    Ok(_) => Ok(true),
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                }
+            })?;
+            if ok {
+                total += 1;
+            }
+        }
+
+        Ok(total)
     }
 
     /// Promote high-confidence testing hypotheses to confirmed if they've been
