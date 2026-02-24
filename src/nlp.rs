@@ -2638,6 +2638,19 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "wednesday",
     "thursday",
     "friday",
+    // Added 2026-02-24 round 2: more noise from DB cleanup
+    "econocide",
+    "panamax",
+    "incense",
+    "correspondents",
+    "lighthouse",
+    "conversion",
+    "sarcophagus",
+    "landgraviate",
+    "devshirme",
+    "reconnaissance",
+    "existence",
+    "residence",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).
@@ -2856,6 +2869,8 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     if !lower.contains(' ') {
         let suffixes = [
             "aceae", "idae", "inae", "ales", "oidea", "iformes", "opsida",
+            // Extinct animal genus suffixes
+            "therium", "saurus", "pithecus", "cetus", "odon",
         ];
         if suffixes.iter().any(|s| lower.ends_with(s)) && trimmed.len() > 6 {
             return false;
@@ -3465,6 +3480,34 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         }
     }
 
+    // Reject German compound nouns that are generic terms (not proper nouns)
+    if !lower.contains(' ') && trimmed.len() > 12 && etype == "concept" {
+        let german_generic_suffixes = [
+            "verteilung",
+            "geschichte",
+            "bereichen",
+            "festspiele",
+            "wissenschaft",
+            "forschung",
+            "entwicklung",
+            "verwaltung",
+            "gesellschaft",
+            "morphologie",
+            "verhältnis",
+            "beziehung",
+            "darstellung",
+            "beschreibung",
+            "behandlung",
+            "berechnung",
+            "untersuchung",
+            "zusammenfassung",
+            "erklärung",
+        ];
+        if german_generic_suffixes.iter().any(|s| lower.ends_with(s)) {
+            return false;
+        }
+    }
+
     // Reject single-word entities classified as "person" — real people have at least two words
     if etype == "person" && !lower.contains(' ') {
         return false;
@@ -3985,6 +4028,27 @@ fn classify_entity_type(name: &str) -> &'static str {
         "sinope",
         "fezzan",
         "abyssinia",
+        // Added 2026-02-24: more places
+        "kaliningrad",
+        "nagasaki",
+        "mannheim",
+        "fukuoka",
+        "oswaldtwistle",
+        "leskovac",
+        "ouargla",
+        "bratsk",
+        "wolfeboro",
+        "shanhaiguan",
+        "hondschoote",
+        "montmédy",
+        "seaburn",
+        "kinross",
+        "bosworth",
+        "littlefield",
+        "arcadia",
+        "assyria",
+        "pithekoussai",
+        "tondidarou",
     ];
     if !lower.contains(' ') && KNOWN_PLACES.contains(&lower.as_str()) {
         return "place";
@@ -4047,6 +4111,13 @@ fn classify_entity_type(name: &str) -> &'static str {
         "kepler",
         "galileo",
         "brahe",
+        // Added 2026-02-24: more historical persons
+        "beethoven",
+        "tokugawa",
+        "newcomen",
+        "wedgwood",
+        "ptolemy",
+        "marcellus",
     ];
     if !lower.contains(' ') && KNOWN_PERSONS.contains(&lower.as_str()) {
         return "person";
@@ -5495,10 +5566,12 @@ mod tests {
             extract_entities(
                 &["Die Softwareentwicklung ist in der Bundesrepublik wichtig.".into()],
             );
+        // Softwareentwicklung is filtered as generic German compound noun (ends in -entwicklung)
+        // Bundesrepublik should be extracted as a concept
         assert!(
             entities
                 .iter()
-                .any(|(n, t)| t == "concept" && n.contains("Softwareentwicklung")),
+                .any(|(n, t)| t == "concept" && n.contains("Bundesrepublik")),
             "entities: {:?}",
             entities
         );
