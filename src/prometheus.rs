@@ -3100,6 +3100,32 @@ impl<'a> Prometheus<'a> {
             }
         }
 
+        // Entity importance signal: highly accessed entities with rich facts
+        // represent well-established knowledge; boost hypotheses involving them.
+        if h.object != "?" {
+            if let (Some(s_ent), Some(o_ent)) = (
+                self.brain.get_entity_by_name(&h.subject)?,
+                self.brain.get_entity_by_name(&h.object)?,
+            ) {
+                let combined_access = s_ent.access_count + o_ent.access_count;
+                let s_facts = self.brain.get_facts_for(s_ent.id)?.len();
+                let o_facts = self.brain.get_facts_for(o_ent.id)?.len();
+                let fact_richness = s_facts + o_facts;
+                // Only boost if entities are genuinely important (not random noise)
+                if combined_access >= 8 && fact_richness >= 4 {
+                    h.evidence_for.push(format!(
+                        "High-importance entities: {} accesses, {} facts",
+                        combined_access, fact_richness
+                    ));
+                    apply_boost(&mut total_boost, 0.07);
+                    h.confidence = (base_confidence + total_boost).min(1.0);
+                } else if combined_access >= 4 && fact_richness >= 2 {
+                    apply_boost(&mut total_boost, 0.03);
+                    h.confidence = (base_confidence + total_boost).min(1.0);
+                }
+            }
+        }
+
         // Update status based on confidence (use defined thresholds)
         let was_confirmed = h.status == HypothesisStatus::Confirmed;
         if h.confidence >= CONFIRMATION_THRESHOLD {
@@ -4597,6 +4623,9 @@ impl<'a> Prometheus<'a> {
         // Domain-keyword island reconnection (high-value entities with shared name tokens)
         let domain_reconnected = self.reconnect_islands_by_domain().unwrap_or(0);
 
+        // Fact-value bridge: connect isolated entities to entities mentioned in their fact values
+        let fact_value_bridged = self.reconnect_via_fact_values().unwrap_or(0);
+
         // Predicate-object token island reconnection (match island names to relation objects)
         let pred_obj_reconnected = self
             .reconnect_islands_by_predicate_object_tokens()
@@ -4715,7 +4744,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} hypotheses promoted, \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -4796,6 +4825,7 @@ impl<'a> Prometheus<'a> {
             tfidf_reconnected,
             source_reconnected,
             domain_reconnected,
+            fact_value_bridged,
             pred_obj_reconnected,
             token_type_reclassified,
             foreign_purged,
@@ -6032,6 +6062,37 @@ impl<'a> Prometheus<'a> {
                             });
                             if has_concept && has_specific {
                                 evidence_score += 0.08;
+                            }
+                        }
+
+                        // Signal 8: Entity importance — highly accessed entities
+                        // are more likely to be well-established knowledge nodes.
+                        // Boost hypotheses where both entities have been accessed
+                        // multiple times (indicates user/crawl interest).
+                        {
+                            let combined_access =
+                                s_ent.access_count as f64 + o_ent.access_count as f64;
+                            if combined_access >= 10.0 {
+                                evidence_score += 0.06;
+                            } else if combined_access >= 4.0 {
+                                evidence_score += 0.03;
+                            }
+                            // Fact richness: entities with more facts are better established
+                            let total_facts = s_facts.len() + o_facts.len();
+                            if total_facts >= 6 {
+                                evidence_score += 0.06;
+                            } else if total_facts >= 3 {
+                                evidence_score += 0.03;
+                            }
+                        }
+
+                        // Signal 9: Strategy ROI boost — hypotheses from high-ROI
+                        // strategies deserve more trust when other signals are marginal.
+                        {
+                            let strat_weight =
+                                weight_map.get(&h.pattern_source).copied().unwrap_or(0.5);
+                            if strat_weight >= 0.95 && evidence_score >= 0.6 {
+                                evidence_score += 0.05;
                             }
                         }
 
@@ -17629,6 +17690,166 @@ impl<'a> Prometheus<'a> {
         if reconnected > 0 {
             eprintln!(
                 "  [domain-keyword-reconnect] connected {} island entities to graph",
+                reconnected
+            );
+        }
+        Ok(reconnected)
+    }
+
+    /// Connect isolated entities to the graph by matching entity names against
+    /// fact values of other entities. E.g., if entity "Quantum Computing" is isolated
+    /// and entity "Richard Feynman" has a fact {key: "field", value: "quantum computing"},
+    /// create a relation "Richard Feynman" → associated_with → "Quantum Computing".
+    pub fn reconnect_via_fact_values(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<i64> = HashSet::new();
+        for r in &relations {
+            connected.insert(r.subject_id);
+            connected.insert(r.object_id);
+        }
+        let id_to_entity: HashMap<i64, &crate::db::Entity> =
+            entities.iter().map(|e| (e.id, e)).collect();
+
+        // Build a map: lowercase entity name → entity id (for isolated entities only)
+        let mut island_name_to_id: HashMap<String, i64> = HashMap::new();
+        for e in &entities {
+            if connected.contains(&e.id) {
+                continue;
+            }
+            if is_noise_name(&e.name) || is_noise_type(&e.entity_type) {
+                continue;
+            }
+            if e.name.len() < 4 || e.confidence < 0.5 {
+                continue;
+            }
+            // Only multi-word or high-value types
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() < 2 && !HIGH_VALUE_TYPES.contains(&e.entity_type.as_str()) {
+                continue;
+            }
+            island_name_to_id.insert(e.name.to_lowercase(), e.id);
+        }
+
+        if island_name_to_id.is_empty() {
+            return Ok(0);
+        }
+
+        let mut reconnected = 0usize;
+        let now = Utc::now().to_rfc3339();
+
+        // Build keyword sets per connected entity from their facts
+        // Then match: if an isolated entity's name tokens overlap significantly
+        // with a connected entity's keyword set, bridge them.
+        let stopwords: HashSet<&str> = [
+            "the",
+            "and",
+            "for",
+            "from",
+            "with",
+            "that",
+            "this",
+            "have",
+            "been",
+            "were",
+            "they",
+            "their",
+            "which",
+            "about",
+            "into",
+            "over",
+            "also",
+            "keyword",
+            "retrieved",
+            "text",
+            "source",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        // For each connected entity, collect its fact-value keywords
+        let mut entity_keywords: HashMap<i64, HashSet<String>> = HashMap::new();
+        for e in &entities {
+            if !connected.contains(&e.id) {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if facts.is_empty() {
+                continue;
+            }
+            let kws: HashSet<String> = facts
+                .iter()
+                .map(|f| f.value.to_lowercase())
+                .filter(|v| v.len() >= 4 && !stopwords.contains(v.as_str()))
+                .collect();
+            if !kws.is_empty() {
+                entity_keywords.insert(e.id, kws);
+            }
+        }
+
+        // For each isolated entity, tokenize its name and find connected entities
+        // sharing ≥2 keyword tokens (or ≥1 for rare/distinctive tokens)
+        let mut already_bridged: HashSet<i64> = HashSet::new();
+        for (iname, &iid) in &island_name_to_id {
+            if already_bridged.contains(&iid) {
+                continue;
+            }
+            let tokens: HashSet<String> = iname
+                .split_whitespace()
+                .map(|w| w.to_lowercase())
+                .filter(|w| w.len() >= 4 && !stopwords.contains(w.as_str()))
+                .collect();
+            if tokens.is_empty() {
+                continue;
+            }
+
+            // Score candidates by keyword overlap
+            let mut best_cid: Option<i64> = None;
+            let mut best_overlap = 0usize;
+            for (&cid, kws) in &entity_keywords {
+                if cid == iid {
+                    continue;
+                }
+                let overlap = tokens.intersection(kws).count();
+                if overlap >= 2 && overlap > best_overlap {
+                    // Avoid self-reference or substring matches
+                    if let Some(ce) = id_to_entity.get(&cid) {
+                        let sl = iname.to_lowercase();
+                        let cl = ce.name.to_lowercase();
+                        if sl.contains(&cl) || cl.contains(&sl) {
+                            continue;
+                        }
+                    }
+                    best_overlap = overlap;
+                    best_cid = Some(cid);
+                }
+            }
+
+            if let Some(cid) = best_cid {
+                if let (Some(island_ent), Some(ce)) =
+                    (id_to_entity.get(&iid), id_to_entity.get(&cid))
+                {
+                    let pred = infer_predicate(&ce.entity_type, &island_ent.entity_type, None);
+                    self.brain.with_conn(|conn| {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO relations (subject_id, predicate, object_id, confidence, source_url, learned_at)
+                             VALUES (?1, ?2, ?3, 0.45, 'fact_value_bridge', ?4)",
+                            params![cid, pred, iid, now],
+                        )?;
+                        Ok(())
+                    })?;
+                    already_bridged.insert(iid);
+                    reconnected += 1;
+                    if reconnected >= 200 {
+                        break;
+                    }
+                }
+            }
+        }
+        if reconnected > 0 {
+            eprintln!(
+                "  [fact-value-bridge] connected {} island entities via fact values",
                 reconnected
             );
         }
