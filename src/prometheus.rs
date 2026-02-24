@@ -13927,6 +13927,106 @@ impl<'a> Prometheus<'a> {
             }
         }
 
+        // Third pass: refine based on shared facts (field, nationality, era)
+        let remaining3: Vec<_> = self
+            .brain
+            .all_relations()?
+            .into_iter()
+            .filter(|r| r.predicate == "contemporary_of")
+            .collect();
+
+        // Build entity→facts index
+        let mut entity_facts: HashMap<i64, Vec<(String, String)>> = HashMap::new();
+        for r in &remaining3 {
+            for eid in [r.subject_id, r.object_id] {
+                if !entity_facts.contains_key(&eid) {
+                    if let Ok(facts) = self.brain.get_facts_for(eid) {
+                        entity_facts.insert(
+                            eid,
+                            facts
+                                .into_iter()
+                                .map(|f| (f.key, f.value.to_lowercase()))
+                                .collect(),
+                        );
+                    }
+                }
+            }
+        }
+
+        for r in &remaining3 {
+            let s_type = id_to_type.get(&r.subject_id).copied().unwrap_or("unknown");
+            let o_type = id_to_type.get(&r.object_id).copied().unwrap_or("unknown");
+            if s_type != "person" || o_type != "person" {
+                continue;
+            }
+            let s_facts = match entity_facts.get(&r.subject_id) {
+                Some(f) => f,
+                None => continue,
+            };
+            let o_facts = match entity_facts.get(&r.object_id) {
+                Some(f) => f,
+                None => continue,
+            };
+
+            // Check for shared field/discipline facts
+            let s_fields: HashSet<&str> = s_facts
+                .iter()
+                .filter(|(k, _)| {
+                    k == "field" || k == "discipline" || k == "domain" || k == "known_for"
+                })
+                .map(|(_, v)| v.as_str())
+                .collect();
+            let o_fields: HashSet<&str> = o_facts
+                .iter()
+                .filter(|(k, _)| {
+                    k == "field" || k == "discipline" || k == "domain" || k == "known_for"
+                })
+                .map(|(_, v)| v.as_str())
+                .collect();
+            let shared_fields: Vec<&&str> = s_fields.intersection(&o_fields).collect();
+
+            let new_pred = if !shared_fields.is_empty() {
+                "co_practitioners"
+            } else {
+                // Check for shared nationality/origin
+                let s_nat: HashSet<&str> = s_facts
+                    .iter()
+                    .filter(|(k, _)| k == "nationality" || k == "country" || k == "origin")
+                    .map(|(_, v)| v.as_str())
+                    .collect();
+                let o_nat: HashSet<&str> = o_facts
+                    .iter()
+                    .filter(|(k, _)| k == "nationality" || k == "country" || k == "origin")
+                    .map(|(_, v)| v.as_str())
+                    .collect();
+                if s_nat.intersection(&o_nat).next().is_some() {
+                    "compatriots"
+                } else {
+                    continue;
+                }
+            };
+
+            let ok = self.brain.with_conn(|conn| {
+                let res = conn.execute(
+                    "UPDATE relations SET predicate = ?1 WHERE id = ?2",
+                    params![new_pred, r.id],
+                );
+                match res {
+                    Ok(_) => Ok(true),
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        conn.execute("DELETE FROM relations WHERE id = ?1", params![r.id])?;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                }
+            })?;
+            if ok {
+                updated += 1;
+            }
+        }
+
         Ok(updated)
     }
 
@@ -20325,6 +20425,25 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         "east timor",
         "west bank",
         "gaza strip",
+        "middle kingdom",
+        "mongol empire",
+        "inca empire",
+        "aztec empire",
+        "holy land",
+        "fertile crescent",
+        "silk road",
+        "great wall",
+        "great barrier reef",
+        "dead sea",
+        "black sea",
+        "red sea",
+        "caspian sea",
+        "aral sea",
+        "baltic sea",
+        "adriatic sea",
+        "coral sea",
+        "north sea",
+        "irish sea",
     ];
     if current_type == "person" && known_places.contains(&lower) {
         return Some("place");
@@ -20372,11 +20491,46 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
             "seamount",
             "oceania",
             "atoll",
+            "canal",
+            "straits",
+            "dam",
+            "reservoir",
+            "lagoon",
+            "cove",
+            "glacier",
+            "volcano",
+            "crater",
+            "delta",
+            "marsh",
+            "swamp",
+            "oasis",
+            "savannah",
+            "prairie",
+            "tundra",
+            "wetlands",
+            "waterfall",
         ];
         if let Some(last) = words.last() {
             if geo_suffixes.contains(last) {
                 return Some("place");
             }
+        }
+        // Also catch geo features as ANY word (e.g., "Thai Canal Thailand")
+        let strong_geo_words = [
+            "canal",
+            "strait",
+            "straits",
+            "volcano",
+            "glacier",
+            "reservoir",
+            "archipelago",
+            "peninsula",
+            "fjord",
+            "atoll",
+            "lagoon",
+        ];
+        if words.iter().any(|w| strong_geo_words.contains(w)) {
+            return Some("place");
         }
     }
 
@@ -20427,6 +20581,39 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
             "imperial",
             "soviet",
             "royal",
+            "mongol",
+            "inca",
+            "aztec",
+            "mayan",
+            "maya",
+            "mughal",
+            "carolingian",
+            "merovingian",
+            "abbasid",
+            "umayyad",
+            "fatimid",
+            "seljuk",
+            "safavid",
+            "qing",
+            "ming",
+            "tang",
+            "song",
+            "han",
+            "tokugawa",
+            "joseon",
+            "khmer",
+            "chola",
+            "gupta",
+            "maurya",
+            "zulu",
+            "maori",
+            "viking",
+            "norman",
+            "saxon",
+            "frankish",
+            "visigoth",
+            "vandal",
+            "lombard",
         ];
         let geo_political_nouns = [
             "empire",
