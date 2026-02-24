@@ -547,6 +547,19 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "raumentwicklung",
     "memoria",
     "further",
+    // Added 2026-02-25: generic terms and hyphenated non-entities
+    "floating-point",
+    "divide-by-zero",
+    "inter-war period",
+    "town-centre",
+    "turing-complete",
+    "gram-interval",
+    "spectra",
+    "harmony",
+    "lighter",
+    "tangram",
+    "skylark",
+    "acquaintanceship",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -4290,6 +4303,11 @@ fn classify_entity_type(name: &str) -> &'static str {
         "alexandreia",
         "chaldiran",
         "yuanshi",
+        "acarnania",
+        "aetolia",
+        "aegospotamos",
+        "ahobamba",
+        "ailana",
     ];
     if !lower.contains(' ') && KNOWN_PLACES.contains(&lower.as_str()) {
         return "place";
@@ -4442,6 +4460,23 @@ fn classify_entity_type(name: &str) -> &'static str {
         "horemheb",
         "mesha",
         "ezana",
+        "aaronson",
+        "aaserud",
+        "abdulla",
+        "abrikosov",
+        "aczel",
+        "adamthwaite",
+        "addington",
+        "ahenobarbus",
+        "akhenaten",
+        "kramers",
+        "kapitza",
+        "medawar",
+        "stuewer",
+        "michell",
+        "ackermann",
+        "agathoclea",
+        "akashdeep",
     ];
     if !lower.contains(' ') && KNOWN_PERSONS.contains(&lower.as_str()) {
         return "person";

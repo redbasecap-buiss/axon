@@ -3183,6 +3183,74 @@ impl<'a> Prometheus<'a> {
         Ok(removed)
     }
 
+    /// Cross-strategy reinforcement: when multiple independent strategies have generated
+    /// hypotheses about the same entity pair (subject, object), boost the highest-confidence
+    /// one proportionally to the number of independent corroborations.
+    /// This runs BEFORE pair deduplication so we can count distinct strategies.
+    pub fn cross_strategy_reinforcement(&self) -> Result<usize> {
+        let hyps = self.list_hypotheses(None)?;
+        // Group by normalized entity pair
+        let mut by_pair: HashMap<(String, String), Vec<(i64, f64, String, String)>> =
+            HashMap::new();
+        for h in &hyps {
+            if h.object == "?" {
+                continue;
+            }
+            let pair = if h.subject <= h.object {
+                (h.subject.clone(), h.object.clone())
+            } else {
+                (h.object.clone(), h.subject.clone())
+            };
+            by_pair.entry(pair).or_default().push((
+                h.id,
+                h.confidence,
+                h.pattern_source.clone(),
+                h.status.as_str().to_string(),
+            ));
+        }
+
+        let mut boosted = 0usize;
+        for (_pair, entries) in &by_pair {
+            // Count distinct strategies
+            let strategies: HashSet<&str> = entries.iter().map(|e| e.2.as_str()).collect();
+            if strategies.len() < 2 {
+                continue;
+            }
+            // Find the best non-rejected entry
+            let best = entries
+                .iter()
+                .filter(|e| e.3 != "rejected")
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some((id, conf, _, status)) = best {
+                // Reinforcement: +0.08 per additional independent strategy (diminishing)
+                let extra_strategies = strategies.len() - 1;
+                let boost = 0.08 * (extra_strategies as f64).min(3.0);
+                let new_conf = (conf + boost).min(1.0);
+                if new_conf > *conf {
+                    self.brain.with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE hypotheses SET confidence = ?1 WHERE id = ?2",
+                            params![new_conf, id],
+                        )?;
+                        Ok(())
+                    })?;
+                    // If boosted above threshold and still testing, confirm it
+                    if new_conf >= CONFIRMATION_THRESHOLD && *status == "testing" {
+                        self.update_hypothesis_status(*id, HypothesisStatus::Confirmed)?;
+                        let evidence = vec![format!(
+                            "Cross-strategy reinforcement: {} independent strategies agree ({})",
+                            strategies.len(),
+                            strategies.into_iter().collect::<Vec<_>>().join(", ")
+                        )];
+                        let _ = self.save_discovery(*id, &evidence);
+                    }
+                    boosted += 1;
+                }
+            }
+        }
+        Ok(boosted)
+    }
+
     /// Track discovery velocity: count of new patterns, hypotheses, and confirmations
     /// per discovery run. Persists to a tracking table for trend analysis.
     pub fn track_discovery_velocity(
@@ -4265,6 +4333,9 @@ impl<'a> Prometheus<'a> {
         // Promote mature testing hypotheses (>7 days, confidence >= 0.75)
         let promoted = self.promote_mature_hypotheses(7, 0.75).unwrap_or(0);
 
+        // Cross-strategy reinforcement: boost hypotheses supported by multiple strategies
+        let cross_reinforced = self.cross_strategy_reinforcement().unwrap_or(0);
+
         // Hypothesis pair deduplication (prevent bloat from multiple runs)
         let pair_deduped = self.dedup_hypotheses_by_pair().unwrap_or(0);
 
@@ -4326,7 +4397,7 @@ impl<'a> Prometheus<'a> {
              {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} prefix-noise merged, {} reversed-names merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} contemporary_of refined, {} hypotheses promoted, \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
-             {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
+             {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
              motifs: {}△ {}ff {}ch {}↔{}",
             all_patterns.len(),
             all_hypotheses.len(),
@@ -4411,6 +4482,7 @@ impl<'a> Prometheus<'a> {
             excl_promoted + excl_rejected,
             excl_promoted,
             excl_rejected,
+            cross_reinforced,
             pair_deduped,
             hyp_capped,
             max_k,
@@ -6032,9 +6104,36 @@ impl<'a> Prometheus<'a> {
             String::new()
         };
 
+        // Graph connectivity evolution (meta-learning signal)
+        let evolution_note = match crate::graph::connectivity_evolution(self.brain, 10) {
+            Ok(evo) => {
+                let mut notes = Vec::new();
+                if let Some(&(slope, _)) = evo.get("fragmentation") {
+                    if slope > 0.001 {
+                        notes.push("fragmentation↑ (more island merging needed)");
+                    } else if slope < -0.005 {
+                        notes.push("fragmentation↓ (consolidation working)");
+                    }
+                }
+                if let Some(&(slope, _)) = evo.get("density") {
+                    if slope < -1e-6 {
+                        notes.push("density↓ (new entities outpacing connections)");
+                    } else if slope > 1e-6 {
+                        notes.push("density↑ (knowledge deepening)");
+                    }
+                }
+                if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Evolution: {}.", notes.join(", "))
+                }
+            }
+            Err(_) => String::new(),
+        };
+
         Ok(format!(
-            "Discovery trend: {} (avg Δrels: {:.1}). {}{}{}",
-            trend, avg_delta, recommendation, velocity_note, cluster_note
+            "Discovery trend: {} (avg Δrels: {:.1}). {}{}{}{}",
+            trend, avg_delta, recommendation, velocity_note, cluster_note, evolution_note
         ))
     }
 

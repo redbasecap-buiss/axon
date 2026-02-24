@@ -4226,3 +4226,60 @@ pub fn structural_holes(
     results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     Ok(results)
 }
+
+/// Compute graph connectivity evolution: rate of change in key metrics over
+/// the last N snapshots. Returns (metric_name → (slope, current_value)).
+/// Useful for meta-learning: if density is declining, shift strategies toward
+/// reconnection; if fragmentation plateaus, try cross-domain crawling.
+pub fn connectivity_evolution(
+    brain: &Brain,
+    window: usize,
+) -> Result<HashMap<String, (f64, f64)>, rusqlite::Error> {
+    let snapshots = get_graph_snapshots(brain, window.max(2))?;
+    let mut result: HashMap<String, (f64, f64)> = HashMap::new();
+
+    if snapshots.len() < 2 {
+        return Ok(result);
+    }
+
+    let n = snapshots.len() as f64;
+
+    // density (index 7), fragmentation (8), modularity (9)
+    let current_density = snapshots[0].7;
+    let oldest_density = snapshots[snapshots.len() - 1].7;
+    result.insert(
+        "density".to_string(),
+        ((current_density - oldest_density) / n, current_density),
+    );
+
+    let current_frag = snapshots[0].8;
+    let oldest_frag = snapshots[snapshots.len() - 1].8;
+    result.insert(
+        "fragmentation".to_string(),
+        ((current_frag - oldest_frag) / n, current_frag),
+    );
+
+    let current_mod = snapshots[0].9;
+    let oldest_mod = snapshots[snapshots.len() - 1].9;
+    result.insert(
+        "modularity".to_string(),
+        ((current_mod - oldest_mod) / n, current_mod),
+    );
+
+    // Entity/relation growth rate
+    let ent_current = snapshots[0].1 as f64;
+    let ent_oldest = snapshots[snapshots.len() - 1].1 as f64;
+    result.insert(
+        "entity_growth".to_string(),
+        ((ent_current - ent_oldest) / n, ent_current),
+    );
+
+    let rel_current = snapshots[0].2 as f64;
+    let rel_oldest = snapshots[snapshots.len() - 1].2 as f64;
+    result.insert(
+        "relation_growth".to_string(),
+        ((rel_current - rel_oldest) / n, rel_current),
+    );
+
+    Ok(result)
+}
