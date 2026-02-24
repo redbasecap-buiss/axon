@@ -5571,6 +5571,19 @@ pub fn temporal_pagerank(
     Ok(scores)
 }
 
+/// Component size distribution: returns (size, count) pairs sorted by size.
+/// Useful for understanding graph fragmentation beyond just counting components.
+pub fn component_size_distribution(brain: &Brain) -> Result<Vec<(usize, usize)>, rusqlite::Error> {
+    let components = connected_components(brain)?;
+    let mut dist: HashMap<usize, usize> = HashMap::new();
+    for comp in &components {
+        *dist.entry(comp.len()).or_insert(0) += 1;
+    }
+    let mut sorted: Vec<(usize, usize)> = dist.into_iter().collect();
+    sorted.sort_by_key(|&(size, _)| std::cmp::Reverse(size));
+    Ok(sorted)
+}
+
 pub fn k_shell_summary(
     brain: &Brain,
 ) -> Result<(usize, usize, Vec<(usize, usize)>), rusqlite::Error> {

@@ -3293,6 +3293,40 @@ impl<'a> Prometheus<'a> {
             }
         }
 
+        // Confirmation cascade: if confirmed hypotheses already exist for either
+        // entity, this is evidence that the entity is well-connected and new
+        // hypotheses involving it are more likely to be valid.
+        if h.object != "?" {
+            let cascade_count: i64 = self
+                .brain
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM hypotheses
+                         WHERE status = 'confirmed'
+                         AND ((subject = ?1 OR object = ?1) OR (subject = ?2 OR object = ?2))
+                         AND id != ?3",
+                        params![h.subject, h.object, h.id],
+                        |row| row.get(0),
+                    )
+                })
+                .unwrap_or(0);
+            if cascade_count >= 5 {
+                h.evidence_for.push(format!(
+                    "Confirmation cascade: {} confirmed hypotheses involve these entities",
+                    cascade_count
+                ));
+                apply_boost(&mut total_boost, 0.08);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            } else if cascade_count >= 2 {
+                h.evidence_for.push(format!(
+                    "Confirmation cascade: {} confirmed hypotheses involve these entities",
+                    cascade_count
+                ));
+                apply_boost(&mut total_boost, 0.04);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            }
+        }
+
         // Update status based on confidence (use defined thresholds)
         let was_confirmed = h.status == HypothesisStatus::Confirmed;
         if h.confidence >= CONFIRMATION_THRESHOLD {
@@ -11127,22 +11161,65 @@ impl<'a> Prometheus<'a> {
     }
 
     pub fn generate_hypotheses_from_near_misses(&self) -> Result<Vec<Hypothesis>> {
-        let near_misses = self.find_near_miss_connections(30)?;
+        let near_misses = self.find_near_miss_connections(50)?;
+        let entities = self.brain.all_entities()?;
+        let _id_type: HashMap<i64, String> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.clone()))
+            .collect();
+        let name_type: HashMap<String, String> = entities
+            .iter()
+            .map(|e| (e.name.to_lowercase(), e.entity_type.clone()))
+            .collect();
+
         let mut hypotheses = Vec::new();
         for (a, b, path_count, _path_len, pred) in &near_misses {
+            // Type compatibility check — skip incompatible pairs
+            let a_type = name_type
+                .get(&a.to_lowercase())
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            let b_type = name_type
+                .get(&b.to_lowercase())
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            if !types_compatible(a_type, b_type) {
+                continue;
+            }
+
+            // Require 3+ paths for cross-type pairs (higher bar for heterogeneous connections)
+            if a_type != b_type && *path_count < 3 {
+                continue;
+            }
+
+            // Use type-aware predicate inference when the suggested predicate is generic
+            let predicate = if pred == "related_to" {
+                infer_predicate(a_type, b_type, None).to_string()
+            } else {
+                pred.clone()
+            };
+
+            // Scale confidence with path count, with a type-match bonus
+            let type_bonus = if a_type == b_type { 0.05 } else { 0.0 };
+            let base_conf = 0.45 + (*path_count as f64 * 0.05).min(0.3) + type_bonus;
+            let confidence = self
+                .calibrated_confidence("near_miss", base_conf)
+                .unwrap_or(base_conf);
+
             hypotheses.push(Hypothesis {
                 id: 0,
                 subject: a.clone(),
-                predicate: pred.clone(),
+                predicate,
                 object: b.clone(),
-                confidence: 0.45 + (*path_count as f64 * 0.05).min(0.3),
+                confidence,
                 evidence_for: vec![format!(
-                    "{} and {} connected via {} distinct 2-hop paths",
-                    a, b, path_count
+                    "{} and {} connected via {} distinct 2-hop paths (types: {}↔{})",
+                    a, b, path_count, a_type, b_type
                 )],
                 evidence_against: vec![],
                 reasoning_chain: vec![
                     format!("{} indirect paths between {} and {}", path_count, a, b),
+                    format!("Type compatible: {} ↔ {}", a_type, b_type),
                     "Multiple indirect connections suggest a missing direct relation".to_string(),
                 ],
                 status: HypothesisStatus::Proposed,
@@ -11150,6 +11227,7 @@ impl<'a> Prometheus<'a> {
                 pattern_source: "near_miss".to_string(),
             });
         }
+        hypotheses.truncate(30);
         Ok(hypotheses)
     }
 
@@ -13488,7 +13566,8 @@ impl<'a> Prometheus<'a> {
             sorted.sort_by(|a, b| b.1.cmp(&a.1));
 
             for (other_id, shared_count) in sorted.into_iter().take(2) {
-                if shared_count < 1 {
+                // Require ≥2 shared facts to reduce noise (single-fact overlap is weak signal)
+                if shared_count < 2 {
                     continue;
                 }
                 let other_name = match name_map.get(&other_id) {
