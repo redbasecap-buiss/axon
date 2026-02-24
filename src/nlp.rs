@@ -780,6 +780,9 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "general-purpose",
     "generalprobe",
     "concurrency concurrent",
+    "sorry",
+    "dark",
+    "collected",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -5526,10 +5529,23 @@ fn classify_entity_type(name: &str) -> &'static str {
                 "enlightenment",
                 "renaissance",
                 "inquisition",
+                "continent",
+                "gradient",
+                "palette",
+                "instruments",
+                "writings",
+                "vorlesungen",
+                "maxivan",
+                "franca",
+                "allied",
+                "crusader",
+                "lit",
             ];
             // Also reject if any word is a common English word (not a name)
             let has_common_word = words.iter().any(|w| {
-                let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
+                let clean_raw = w.trim_matches(|c: char| !c.is_alphanumeric());
+                let clean = clean_raw.to_lowercase();
+                let clean = clean.as_str();
                 GENERIC_SINGLE_WORDS.contains(&clean)
                     || ENTITY_BLACKLIST.contains(&clean)
                     || TRAILING_JUNK.contains(&clean)
