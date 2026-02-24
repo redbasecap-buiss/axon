@@ -4851,6 +4851,10 @@ impl<'a> Prometheus<'a> {
         // Surname-only island reconnection (broader reach than high-value reconnect)
         let surname_reconnected = self.reconnect_islands_by_surname_match().unwrap_or(0);
 
+        // Purge single-word participle/adjective concepts (NLP noise like "Entangled", "Interacting")
+        // Runs AFTER reconnection strategies to catch noise that was re-connected
+        let participle_purged = self.purge_participle_concept_entities().unwrap_or(0);
+
         // Boost confidence of well-known entities
         let known_boosted = self.boost_known_entity_confidence().unwrap_or(0);
 
@@ -4989,7 +4993,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} surname-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -5059,6 +5063,7 @@ impl<'a> Prometheus<'a> {
             concept_islands_purged,
             mistyped_person_purged,
             low_conf_purged,
+            participle_purged,
             concepts_to_places,
             country_concat_fixed,
             topic_prefix_purged,
@@ -13801,7 +13806,7 @@ impl<'a> Prometheus<'a> {
             let new_pred = match (s_type, o_type) {
                 ("person", "place") | ("place", "person") => "active_in",
                 ("person", "organization") | ("organization", "person") => "affiliated_with",
-                ("person", "person") => "contemporary_of",
+                ("person", "person") => "collaborated_with",
                 ("person", "concept") => "contributed_to",
                 ("concept", "person") => "pioneered_by",
                 ("person", "event") | ("event", "person") => "participated_in",
@@ -17203,6 +17208,104 @@ impl<'a> Prometheus<'a> {
         }
         if purged > 0 {
             eprintln!("  [low-conf-concept-purge] removed {} low-confidence concept islands (threshold {:.2})", purged, max_confidence);
+        }
+        Ok(purged)
+    }
+
+    /// Purge single-word participle/adjective entities that are not real concepts.
+    /// These are NLP extraction noise like "Entangled", "Interacting", "Feathered"
+    /// that accumulate relations but contribute no real knowledge.
+    /// Deletes the entity and all its relations.
+    pub fn purge_participle_concept_entities(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let mut purged = 0usize;
+
+        // Known proper nouns that look like participles but aren't
+        let exceptions: HashSet<&str> = [
+            "turing",
+            "beijing",
+            "reading",
+            "stirling",
+            "darjeeling",
+            "nanjing",
+            "chongqing",
+            "washington",
+            "wellington",
+            "nottingham",
+            "birmingham",
+            "buckingham",
+            "manning",
+            "browning",
+            "kipling",
+            "lessing",
+            "göttingen",
+            "united",
+            "inspired",
+            "advanced",
+            "applied",
+            "distributed",
+            "embedded",
+            "integrated",
+            "connected",
+            "associated",
+            "collected",
+            "organized",
+            "combined",
+            "structured",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        for e in &entities {
+            if e.entity_type != "concept" && e.entity_type != "unknown" {
+                continue;
+            }
+            let name = e.name.trim();
+            let words: Vec<&str> = name.split_whitespace().collect();
+            if words.len() != 1 {
+                continue;
+            }
+            let lower = name.to_lowercase();
+            if exceptions.contains(lower.as_str()) {
+                continue;
+            }
+            // Must look like a participle or adjective (not a proper noun concept)
+            let is_participle = (lower.ends_with("ed") && lower.len() >= 6)
+                || (lower.ends_with("ing") && lower.len() >= 7)
+                || (lower.ends_with("ated") && lower.len() >= 7)
+                || (lower.ends_with("ized") && lower.len() >= 7)
+                || (lower.ends_with("ting") && lower.len() >= 7);
+            if !is_participle {
+                continue;
+            }
+            // Only purge low-confidence entities
+            if e.confidence > 0.7 {
+                continue;
+            }
+            // Check it has no valuable facts (keyword-only facts don't count)
+            let facts = self.brain.get_facts_for(e.id)?;
+            let has_real_facts = facts.iter().any(|f| f.key != "keyword");
+            if has_real_facts {
+                continue;
+            }
+            // Delete relations, facts, and entity
+            self.brain.with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM relations WHERE subject_id = ?1 OR object_id = ?1",
+                    params![e.id],
+                )?;
+                conn.execute("DELETE FROM facts WHERE entity_id = ?1", params![e.id])?;
+                conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                Ok(())
+            })?;
+            purged += 1;
+        }
+        if purged > 0 {
+            eprintln!(
+                "  [participle-purge] removed {} single-word participle/adjective concept entities",
+                purged
+            );
         }
         Ok(purged)
     }
@@ -21844,6 +21947,116 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         ];
         if concept_singles.contains(&lower) {
             return Some("concept");
+        }
+        // Civilization / ethnic group names misclassified as person
+        let civilization_names = [
+            "aztec",
+            "maya",
+            "mayan",
+            "inca",
+            "viking",
+            "norse",
+            "celtic",
+            "gaul",
+            "gaulish",
+            "visigoth",
+            "vandal",
+            "lombard",
+            "saxon",
+            "frankish",
+            "norman",
+            "berber",
+            "bedouin",
+            "phoenician",
+            "sumerian",
+            "akkadian",
+            "assyrian",
+            "babylonian",
+            "hittite",
+            "minoan",
+            "mycenaean",
+            "etruscan",
+            "thracian",
+            "scythian",
+            "sarmatian",
+            "hun",
+            "goth",
+            "ostrogoth",
+            "cossack",
+            "tatar",
+            "mongol",
+            "khmer",
+            "maori",
+            "zulu",
+            "bantu",
+            "igbo",
+            "yoruba",
+            "hausa",
+            "swahili",
+            "ashanti",
+            "fulani",
+            "tuareg",
+            "inuit",
+            "navajo",
+            "sioux",
+            "apache",
+            "comanche",
+            "iroquois",
+            "cherokee",
+            "pueblo",
+            "olmec",
+            "toltec",
+            "zapotec",
+            "mixtec",
+            "arawak",
+            "carib",
+            "guarani",
+            "quechua",
+            "aymara",
+            "aboriginal",
+            "polynesian",
+            "melanesian",
+            "micronesian",
+            "samurai",
+            "shogun",
+            "mughal",
+            "rajput",
+            "sikh",
+            "dravidian",
+            "aryan",
+            "vedic",
+            "hellenistic",
+            "carolingian",
+            "merovingian",
+            "abbasid",
+            "umayyad",
+            "fatimid",
+            "seljuk",
+            "safavid",
+            "ottoman",
+            "byzantine",
+            "spartan",
+            "athenian",
+            "roman",
+            "persian",
+            "parthian",
+            "sasanian",
+            "sassanid",
+        ];
+        if civilization_names.contains(&lower) {
+            return Some("concept");
+        }
+    }
+
+    // "Middle X" geographic regions misclassified as person (e.g. "Middle Niger", "Middle East")
+    if current_type == "person" && word_count >= 2 {
+        let geo_prefixes = [
+            "middle", "upper", "lower", "inner", "outer", "greater", "lesser",
+        ];
+        if let Some(first) = words.first() {
+            if geo_prefixes.contains(first) {
+                return Some("place");
+            }
         }
     }
 
