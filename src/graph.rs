@@ -5442,3 +5442,70 @@ pub fn predicate_concentration(
     results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
     Ok(results)
 }
+
+/// K-shell decomposition: assign each node its coreness value.
+/// The k-shell of a node is the largest k such that the node belongs to
+/// the k-core (subgraph where every node has degree >= k).
+pub fn k_shell_decomposition(brain: &Brain) -> Result<HashMap<i64, usize>, rusqlite::Error> {
+    let adj = build_adjacency(brain)?;
+    let mut degree: HashMap<i64, usize> = HashMap::new();
+    for (&node, neighbors) in &adj {
+        degree.insert(node, neighbors.len());
+    }
+
+    let mut shell: HashMap<i64, usize> = HashMap::new();
+    let mut removed: HashSet<i64> = HashSet::new();
+    let n = adj.len();
+
+    while removed.len() < n {
+        let min_deg = degree
+            .iter()
+            .filter(|(id, _)| !removed.contains(id))
+            .map(|(_, &d)| d)
+            .min()
+            .unwrap_or(0);
+
+        let to_remove: Vec<i64> = degree
+            .iter()
+            .filter(|(id, d)| !removed.contains(id) && **d <= min_deg)
+            .map(|(id, _)| *id)
+            .collect();
+
+        if to_remove.is_empty() {
+            break;
+        }
+
+        for &node in &to_remove {
+            shell.insert(node, min_deg);
+            removed.insert(node);
+            if let Some(neighbors) = adj.get(&node) {
+                for &nb in neighbors {
+                    if !removed.contains(&nb) {
+                        if let Some(d) = degree.get_mut(&nb) {
+                            *d = d.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(shell)
+}
+
+/// Summary statistics for k-shell decomposition.
+/// Returns (max_coreness, core_size_at_max, distribution: Vec<(k, count)>).
+pub fn k_shell_summary(
+    brain: &Brain,
+) -> Result<(usize, usize, Vec<(usize, usize)>), rusqlite::Error> {
+    let shells = k_shell_decomposition(brain)?;
+    let mut dist: HashMap<usize, usize> = HashMap::new();
+    for &k in shells.values() {
+        *dist.entry(k).or_insert(0) += 1;
+    }
+    let max_k = dist.keys().copied().max().unwrap_or(0);
+    let core_size = dist.get(&max_k).copied().unwrap_or(0);
+    let mut sorted: Vec<(usize, usize)> = dist.into_iter().collect();
+    sorted.sort_by_key(|&(k, _)| k);
+    Ok((max_k, core_size, sorted))
+}

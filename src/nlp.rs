@@ -4139,6 +4139,22 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             "klimabulletin",
             "bioingenieria",
             "denver",
+            // Leading nouns that produce garbage fragments (e.g. "Death Landau", "Guide John")
+            "death",
+            "example",
+            "guide",
+            "impact",
+            "influence",
+            "improved",
+            "mapping",
+            "map",
+            "divisions",
+            "decoding",
+            "definitions",
+            "hero",
+            "late",
+            "law",
+            "domestic",
         ];
         if lower.contains(' ') && leading_verbs.contains(&first_word) {
             return false;
@@ -4203,6 +4219,11 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             "homepage",
             "travelchinaguide",
             "encyclopædia britannica",
+            "symposion",
+            "geosystems",
+            "geophysics",
+            "semiconductor",
+            "commemorative coins",
         ];
         for kw in PUB_TITLE_WORDS {
             if lower.contains(kw) {
