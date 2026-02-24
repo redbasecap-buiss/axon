@@ -2503,19 +2503,8 @@ impl<'a> Prometheus<'a> {
                 self.brain.get_entity_by_name(&h.subject)?,
                 self.brain.get_entity_by_name(&h.object)?,
             ) {
-                let incompatible = matches!(
-                    (
-                        s_ent.entity_type.as_str(),
-                        o_ent.entity_type.as_str(),
-                        h.predicate.as_str()
-                    ),
-                    ("person", "place", "contemporary_of")
-                        | ("place", "person", "contemporary_of")
-                        | ("concept", "person", "located_near")
-                        | ("person", "concept", "located_near")
-                        | ("technology", "place", "contemporary_of")
-                        | ("place", "technology", "contemporary_of")
-                );
+                let incompatible =
+                    is_type_incompatible(&s_ent.entity_type, &o_ent.entity_type, &h.predicate);
                 if incompatible {
                     h.evidence_against.push(format!(
                         "Type mismatch: {} ({}) → {} → {} ({})",
@@ -14620,6 +14609,62 @@ fn is_contradicting_predicate(a: &str, b: &str) -> bool {
     false
 }
 
+/// Check if an entity-type pair is incompatible with a given predicate.
+/// Returns true when the triple (subject_type, object_type, predicate) is semantically
+/// nonsensical — e.g. a place cannot be "contemporary_of" a concept.
+fn is_type_incompatible(subject_type: &str, object_type: &str, predicate: &str) -> bool {
+    // Predicates that require both entities to be the same broad category
+    let same_type_predicates = [
+        "contemporary_of",
+        "partner_of",
+        "collaborated_with",
+        "rival_of",
+        "successor_of",
+        "predecessor_of",
+    ];
+    if same_type_predicates.contains(&predicate) {
+        // contemporary_of etc. only makes sense between entities of similar kinds
+        let compatible_groups: &[&[&str]] = &[
+            &["person"],
+            &["place", "organization"],
+            &["concept", "technology"],
+        ];
+        let s_group = compatible_groups
+            .iter()
+            .position(|g| g.contains(&subject_type));
+        let o_group = compatible_groups
+            .iter()
+            .position(|g| g.contains(&object_type));
+        if let (Some(sg), Some(og)) = (s_group, o_group) {
+            if sg != og {
+                return true;
+            }
+        }
+    }
+
+    // located_near requires at least one place
+    if predicate == "located_near" {
+        if subject_type != "place" && object_type != "place" {
+            // concept-concept or person-person for located_near is fine if one is a place
+            if subject_type == "concept" || object_type == "concept" {
+                return true;
+            }
+        }
+    }
+
+    // affiliated_with requires person→organization or person→concept
+    if predicate == "affiliated_with" && subject_type == "place" {
+        return true;
+    }
+
+    // pioneered requires person or organization as subject
+    if predicate == "pioneered" && !["person", "organization"].contains(&subject_type) {
+        return true;
+    }
+
+    false
+}
+
 fn predicates_similar(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -15254,5 +15299,40 @@ mod tests {
             infer_predicate("person", "person", Some(&snt)),
             "colleagues_at"
         );
+    }
+
+    #[test]
+    fn test_type_incompatibility() {
+        // contemporary_of requires same-group types
+        assert!(is_type_incompatible("person", "place", "contemporary_of"));
+        assert!(is_type_incompatible("place", "person", "contemporary_of"));
+        assert!(is_type_incompatible(
+            "technology",
+            "place",
+            "contemporary_of"
+        ));
+        assert!(!is_type_incompatible("person", "person", "contemporary_of"));
+        assert!(!is_type_incompatible(
+            "place",
+            "organization",
+            "contemporary_of"
+        ));
+        assert!(!is_type_incompatible(
+            "concept",
+            "technology",
+            "contemporary_of"
+        ));
+
+        // located_near with concept is bad
+        assert!(is_type_incompatible("concept", "person", "located_near"));
+        assert!(!is_type_incompatible("person", "place", "located_near"));
+
+        // pioneered needs person/org subject
+        assert!(is_type_incompatible("place", "concept", "pioneered"));
+        assert!(!is_type_incompatible("person", "concept", "pioneered"));
+
+        // unrelated predicates should be fine
+        assert!(!is_type_incompatible("person", "place", "active_in"));
+        assert!(!is_type_incompatible("person", "concept", "works_on"));
     }
 }

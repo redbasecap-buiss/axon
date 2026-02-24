@@ -2548,6 +2548,24 @@ const GENERIC_SINGLE_WORDS: &[&str] = &[
     "rivalry",
     "decree",
     "thermae",
+    // Added 2026-02-24: more noise from DB cleanup
+    "afterword",
+    "afficionado",
+    "additionally",
+    "rainbow",
+    "insight",
+    "profile",
+    "version",
+    "utilize",
+    "unknown",
+    "water",
+    "saturday",
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
 ];
 
 /// Trailing words that indicate bad phrase boundary (Wikipedia sentence fragments).

@@ -1508,11 +1508,11 @@ pub fn adamic_adar_predict(
     // Sort candidates by degree descending for better coverage of high-value nodes
     let mut sorted_candidates = candidates.clone();
     sorted_candidates.sort_by(|a, b| degree.get(b).unwrap_or(&0).cmp(degree.get(a).unwrap_or(&0)));
-    let limit = sorted_candidates.len().min(500);
-    for i in 0..limit {
+    let scan = sorted_candidates.len().min(500);
+    for i in 0..scan {
         let a = sorted_candidates[i];
         let na = &nb_sets[&a];
-        for b in &sorted_candidates[(i + 1)..limit] {
+        for b in &sorted_candidates[(i + 1)..scan] {
             let b = *b;
             let key = if a < b { (a, b) } else { (b, a) };
             if connected.contains(&key) {
@@ -1580,11 +1580,11 @@ pub fn resource_allocation_predict(
         .collect();
 
     let mut scores: Vec<(i64, i64, f64)> = Vec::new();
-    let limit = candidates.len().min(500);
-    for i in 0..limit {
+    let scan = candidates.len().min(500);
+    for i in 0..scan {
         let a = candidates[i];
         let na = &nb_sets[&a];
-        for b in &candidates[(i + 1)..limit] {
+        for b in &candidates[(i + 1)..scan] {
             let b = *b;
             let key = if a < b { (a, b) } else { (b, a) };
             if connected.contains(&key) {
@@ -1657,12 +1657,12 @@ pub fn type_aware_link_predict(
         .collect();
 
     let mut scores: Vec<(i64, i64, f64)> = Vec::new();
-    let limit = candidates.len().min(500);
-    for i in 0..limit {
+    let scan = candidates.len().min(500);
+    for i in 0..scan {
         let a = candidates[i];
         let na = &nb_sets[&a];
         let type_a = id_to_type.get(&a).cloned().unwrap_or_default();
-        for b in &candidates[(i + 1)..limit] {
+        for b in &candidates[(i + 1)..scan] {
             let b = *b;
             let key = if a < b { (a, b) } else { (b, a) };
             if connected.contains(&key) {
