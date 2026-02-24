@@ -4120,6 +4120,12 @@ impl<'a> Prometheus<'a> {
         // Deep island cleanup (remove low-confidence isolated entities without facts)
         let deep_cleaned = self.deep_island_cleanup(0.8).unwrap_or(0);
 
+        // Prune unsupported contemporary_of relations (no other evidence)
+        let contemporary_pruned = self.prune_unsupported_contemporary().unwrap_or(0);
+
+        // Downgrade isolated contemporary_of relations (weak evidence)
+        let contemporary_downgraded = self.downgrade_isolated_contemporary().unwrap_or(0);
+
         // Predicate normalization (reduce "is" overuse)
         let normalized = self.normalize_predicates().unwrap_or(0);
 
@@ -4311,7 +4317,7 @@ impl<'a> Prometheus<'a> {
              {} exact-name deduped, {} reverse-containment merged, {} bulk-rejected stale, \
              {} fuzzy duplicates ({} auto-merge, {} auto-merged), {} sparse topic domains, \
              {} name subsumptions found, {} types fixed, {} types inferred from neighborhood, {} noise entities purged, \
-             {} bulk cleaned, {} deep cleaned, {} predicates normalized, {} uniform-hub demoted, {} islands reconnected, \
+             {} bulk cleaned, {} deep cleaned, {} contemporary pruned, {} contemporary downgraded, {} predicates normalized, {} uniform-hub demoted, {} islands reconnected, \
              {} fact-inferred relations, {} name cross-references, \
              {} compound relations + {} compound merged, {} concat split ({}r/{}c), {} prefix-merged, {} suffix-merged, {} word-overlap merged, \
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
@@ -4355,6 +4361,8 @@ impl<'a> Prometheus<'a> {
             purged,
             bulk_cleaned,
             deep_cleaned,
+            contemporary_pruned,
+            contemporary_downgraded,
             normalized,
             uniform_demoted,
             reconnected,
@@ -4546,6 +4554,70 @@ impl<'a> Prometheus<'a> {
         bridges.sort_by(|a, b| b.2.cmp(&a.2));
         bridges.truncate(20);
         Ok(bridges)
+    }
+
+    /// Prune `contemporary_of` relations where neither entity has any other
+    /// predicate — these are pure type-default noise with no supporting evidence.
+    pub fn prune_unsupported_contemporary(&self) -> Result<usize> {
+        let pruned = self.brain.with_conn(|conn| {
+            let count = conn.execute(
+                "DELETE FROM relations WHERE predicate = 'contemporary_of'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM relations r2
+                     WHERE (r2.subject_id = relations.subject_id OR r2.object_id = relations.subject_id)
+                     AND r2.predicate != 'contemporary_of' AND r2.id != relations.id
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM relations r3
+                     WHERE (r3.subject_id = relations.object_id OR r3.object_id = relations.object_id)
+                     AND r3.predicate != 'contemporary_of' AND r3.id != relations.id
+                 )",
+                [],
+            )?;
+            Ok(count)
+        })?;
+        Ok(pruned)
+    }
+
+    /// Downgrade low-confidence `contemporary_of` where entities share no
+    /// neighbors at all (not even via contemporary_of chains). These are
+    /// weakest-link relations that inflate the graph without adding signal.
+    pub fn downgrade_isolated_contemporary(&self) -> Result<usize> {
+        let relations = self.brain.all_relations()?;
+        // Build adjacency excluding contemporary_of
+        let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+        for r in &relations {
+            if r.predicate == "contemporary_of" {
+                continue;
+            }
+            adj.entry(r.subject_id).or_default().insert(r.object_id);
+            adj.entry(r.object_id).or_default().insert(r.subject_id);
+        }
+
+        let mut downgraded = 0usize;
+        for r in &relations {
+            if r.predicate != "contemporary_of" || r.confidence <= 0.3 {
+                continue;
+            }
+            let s_neighbors = adj.get(&r.subject_id).map(|s| s.len()).unwrap_or(0);
+            let o_neighbors = adj.get(&r.object_id).map(|s| s.len()).unwrap_or(0);
+            // Both entities have some non-contemporary connections → keep
+            if s_neighbors >= 2 && o_neighbors >= 2 {
+                continue;
+            }
+            // At least one entity is poorly connected outside contemporary_of → downgrade
+            let ok = self.brain.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE relations SET confidence = 0.3 WHERE id = ?1 AND confidence > 0.3",
+                    params![r.id],
+                )?;
+                Ok(true)
+            })?;
+            if ok {
+                downgraded += 1;
+            }
+        }
+        Ok(downgraded)
     }
 
     /// Decay confidence of old unconfirmed hypotheses (meta-learning cleanup).
@@ -15956,6 +16028,49 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         "eastern europe",
         "northern europe",
         "southern europe",
+        "spanish netherlands",
+        "austrian netherlands",
+        "dutch east indies",
+        "french indochina",
+        "british india",
+        "british columbia",
+        "british raj",
+        "ottoman empire",
+        "roman empire",
+        "byzantine empire",
+        "mughal empire",
+        "emi koussi",
+        "tibesti",
+        "galápagos",
+        "galapagos",
+        "crimean peninsula",
+        "iberian peninsula",
+        "korean peninsula",
+        "malay peninsula",
+        "arabian peninsula",
+        "cape of good hope",
+        "cape horn",
+        "tierra del fuego",
+        "papua new guinea",
+        "ivory coast",
+        "costa rica",
+        "puerto rico",
+        "sierra leone",
+        "burkina faso",
+        "south sudan",
+        "north korea",
+        "south korea",
+        "trinidad and tobago",
+        "antigua and barbuda",
+        "saint kitts and nevis",
+        "czech republic",
+        "dominican republic",
+        "central african republic",
+        "equatorial guinea",
+        "timor-leste",
+        "east timor",
+        "west bank",
+        "gaza strip",
     ];
     if current_type == "person" && known_places.contains(&lower) {
         return Some("place");
@@ -16007,6 +16122,121 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         if let Some(last) = words.last() {
             if geo_suffixes.contains(last) {
                 return Some("place");
+            }
+        }
+    }
+
+    // Country-adjective + geographic/political noun → place, not person
+    // E.g., "Spanish Netherlands", "French Congo", "British Guiana"
+    if current_type == "person" && word_count >= 2 {
+        let country_adjectives = [
+            "spanish",
+            "french",
+            "british",
+            "dutch",
+            "portuguese",
+            "german",
+            "italian",
+            "russian",
+            "chinese",
+            "japanese",
+            "ottoman",
+            "persian",
+            "roman",
+            "byzantine",
+            "austrian",
+            "hungarian",
+            "swedish",
+            "danish",
+            "norwegian",
+            "finnish",
+            "polish",
+            "belgian",
+            "swiss",
+            "greek",
+            "turkish",
+            "egyptian",
+            "indian",
+            "thai",
+            "korean",
+            "vietnamese",
+            "iraqi",
+            "iranian",
+            "saudi",
+            "moroccan",
+            "algerian",
+            "tunisian",
+            "libyan",
+            "ethiopian",
+            "somali",
+            "colonial",
+            "imperial",
+            "soviet",
+            "royal",
+        ];
+        let geo_political_nouns = [
+            "empire",
+            "kingdom",
+            "republic",
+            "federation",
+            "confederation",
+            "union",
+            "territory",
+            "colony",
+            "protectorate",
+            "mandate",
+            "dominion",
+            "prefecture",
+            "caliphate",
+            "sultanate",
+            "khanate",
+            "duchy",
+            "principality",
+            "frontier",
+            "lowlands",
+            "highlands",
+            "midlands",
+            "heartland",
+            "hinterland",
+            "borderlands",
+            "congo",
+            "guinea",
+            "guiana",
+            "sahara",
+            "indochina",
+            "indies",
+            "anatolia",
+            "mesopotamia",
+            "balkans",
+            "caucasus",
+            "scandinavia",
+            "siberia",
+            "manchuria",
+            "patagonia",
+            "amazonia",
+            "polynesia",
+            "melanesia",
+            "micronesia",
+            "levant",
+            "maghreb",
+            "raj",
+            "columbia",
+        ];
+        if let Some(first) = words.first() {
+            if country_adjectives.contains(first) {
+                if let Some(last) = words.last() {
+                    if geo_political_nouns.contains(last) {
+                        return Some("place");
+                    }
+                }
+                // Also catch any word in the name being geographic
+                if words
+                    .iter()
+                    .skip(1)
+                    .any(|w| geo_political_nouns.contains(w))
+                {
+                    return Some("place");
+                }
             }
         }
     }
@@ -17348,6 +17578,11 @@ mod tests {
             ("ming dynasty", "person", Some("place")),
             ("soviet union", "person", Some("place")),
             ("trade union", "person", Some("organization")),
+            ("french indochina", "person", Some("place")),
+            ("british guiana", "person", Some("place")),
+            ("dutch east indies", "person", Some("place")),
+            ("emi koussi", "person", Some("place")),
+            ("galápagos", "person", Some("place")),
         ];
         for (name, current_type, expected) in cases {
             let words: Vec<&str> = name.split_whitespace().collect();
