@@ -4515,6 +4515,14 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(ot_hyps);
         }
 
+        // 2dd. Heat-kernel diffusion link prediction (multi-hop reachability)
+        let hk_weight = self.get_pattern_weight("heat_kernel")?;
+        if hk_weight >= 0.05 {
+            let hk_hyps = self.generate_hypotheses_from_heat_kernel()?;
+            eprintln!("[PROMETHEUS] heat_kernel: {} hypotheses", hk_hyps.len());
+            all_hypotheses.extend(hk_hyps);
+        }
+
         // 3. Island entities as gaps
         let islands = self.find_island_entities()?;
 
@@ -13892,6 +13900,99 @@ impl<'a> Prometheus<'a> {
         Ok(hypotheses)
     }
 
+    /// Strategy: Heat-kernel diffusion link prediction.
+    /// Uses random walk diffusion to find entity pairs that are "close" in the
+    /// graph's diffusion geometry but not directly connected. Works well in sparse
+    /// graphs where common-neighbor methods fail due to low overlap.
+    pub fn generate_hypotheses_from_heat_kernel(&self) -> Result<Vec<Hypothesis>> {
+        let predictions = crate::graph::heat_kernel_predict(self.brain, 2.0, 200)?;
+        if predictions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let entities = self.brain.all_entities()?;
+        let name_map: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let type_map: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+        let meaningful = meaningful_ids(self.brain)?;
+
+        let mut hypotheses = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+
+        // Normalize scores: use max score for relative confidence
+        let max_score = predictions.iter().map(|p| p.2).fold(0.0_f64, f64::max);
+        if max_score <= 0.0 {
+            return Ok(Vec::new());
+        }
+
+        for (a_id, b_id, score) in &predictions {
+            if !meaningful.contains(a_id) && !meaningful.contains(b_id) {
+                continue;
+            }
+            let a_name = match name_map.get(a_id) {
+                Some(n) => *n,
+                None => continue,
+            };
+            let b_name = match name_map.get(b_id) {
+                Some(n) => *n,
+                None => continue,
+            };
+            if is_noise_name(a_name) || is_noise_name(b_name) {
+                continue;
+            }
+            let a_type = type_map.get(a_id).copied().unwrap_or("?");
+            let b_type = type_map.get(b_id).copied().unwrap_or("?");
+            if !types_compatible(a_type, b_type) {
+                continue;
+            }
+            let key = if a_name < b_name {
+                (a_name.to_string(), b_name.to_string())
+            } else {
+                (b_name.to_string(), a_name.to_string())
+            };
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+
+            let predicate = infer_predicate(a_type, b_type, None);
+            let norm_score = score / max_score;
+            let base_conf = (0.40 + 0.35 * norm_score).min(0.75);
+            let confidence = self
+                .calibrated_confidence("heat_kernel", base_conf)
+                .unwrap_or(base_conf);
+
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.to_string(),
+                predicate: predicate.to_string(),
+                object: b_name.to_string(),
+                confidence,
+                evidence_for: vec![format!(
+                    "Heat-kernel diffusion score: {:.3} (normalized: {:.3})",
+                    score, norm_score
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![format!(
+                    "Diffusion proximity: {} and {} are close in random-walk geometry despite no direct link",
+                    a_name, b_name
+                )],
+                status: HypothesisStatus::Testing,
+                discovered_at: now_str(),
+                pattern_source: "heat_kernel".to_string(),
+            });
+
+            if hypotheses.len() >= 60 {
+                break;
+            }
+        }
+
+        Ok(hypotheses)
+    }
+
     /// Strategy: Hypothesis recycling — re-evaluate previously rejected hypotheses
     /// from high-performing strategies. The graph may have grown since rejection,
     /// providing new evidence that could flip the verdict.
@@ -17696,6 +17797,89 @@ impl<'a> Prometheus<'a> {
                     .count()
                     >= 2;
 
+            // 10. Foreign-language institutional/article prefixes that indicate non-person entities
+            // "Biblioteca Nazionale" (library), "Det Kongelige Bibliotek" (royal library),
+            // "Het Brandende Eiland" (the burning island), "Museo Chiaramonti" (museum)
+            let institutional_prefixes: &[&str] = &[
+                "biblioteca",
+                "bibliothèque",
+                "bibliothek",
+                "museo",
+                "musée",
+                "société",
+                "académie",
+                "école",
+                "città",
+                "palazzo",
+                "teatro",
+                "basilica",
+                "cattedrale",
+                "château",
+                "abbaye",
+                "monastère",
+                "hospice",
+                "hôpital",
+                "lycée",
+                "collège",
+                "faculté",
+                "istituto",
+                "accademia",
+                "università",
+                "circolo",
+                // Articles / demonstratives (non-English) — these start noun phrases, not names
+                "het",
+                "det",
+                "das",
+                "der",
+                "die",
+                "les",
+                "los",
+                "las",
+            ];
+            let starts_institutional = words.len() >= 2
+                && institutional_prefixes.contains(&lower_words[0].as_str())
+                && e.confidence < 0.8;
+
+            // 11. Ends with place/building suffixes in non-English languages
+            let foreign_place_suffixes: &[&str] = &[
+                "eiland",
+                "insel",
+                "inselsberg",
+                "gebirge",
+                "wald",
+                "fluss",
+                "kloster",
+                "kirche",
+                "schloss",
+                "turm",
+                "brücke",
+                "platz",
+                "strasse",
+                "straße",
+                "gasse",
+                "markt",
+                "hafen",
+                "île",
+                "rivière",
+                "montagne",
+                "forêt",
+                "pont",
+                "porte",
+                "piazza",
+                "ponte",
+                "torre",
+                "porta",
+                "isola",
+                "lago",
+                "mezquita",
+                "alcázar",
+                "catedral",
+                "monasterio",
+                "castillo",
+            ];
+            let ends_foreign_place = words.len() >= 2
+                && foreign_place_suffixes.contains(&lower_words.last().unwrap().as_str());
+
             if has_concept_word
                 || has_place_word
                 || (has_non_english_phrase && e.confidence < 0.8)
@@ -17709,6 +17893,8 @@ impl<'a> Prometheus<'a> {
                 || starts_place_prefix
                 || ends_nonname_suffix
                 || is_latin_doc
+                || starts_institutional
+                || ends_foreign_place
             {
                 eprintln!(
                     "  [mistyped-person-purge] deleting island '{}' (id={})",

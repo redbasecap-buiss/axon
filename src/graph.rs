@@ -5837,6 +5837,112 @@ pub fn open_triangle_predict(
     Ok(predictions)
 }
 
+/// Heat-kernel link prediction: approximate e^{-tL} for random walks.
+/// Returns top entity pairs not yet connected, scored by diffusion proximity.
+/// `t` controls diffusion time (higher = more exploration). Typical: 1.0–5.0.
+/// This captures multi-hop reachability better than common-neighbor methods,
+/// especially in sparse graphs where pairs share no direct neighbors.
+pub fn heat_kernel_predict(
+    brain: &Brain,
+    t: f64,
+    limit: usize,
+) -> Result<Vec<(i64, i64, f64)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let entities = brain.all_entities()?;
+    let id_set: HashSet<i64> = entities.iter().map(|e| e.id).collect();
+
+    // Build adjacency
+    let mut neighbors: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut edge_set: HashSet<(i64, i64)> = HashSet::new();
+    for r in &relations {
+        if !id_set.contains(&r.subject_id) || !id_set.contains(&r.object_id) {
+            continue;
+        }
+        if r.subject_id == r.object_id {
+            continue;
+        }
+        neighbors.entry(r.subject_id).or_default().push(r.object_id);
+        neighbors.entry(r.object_id).or_default().push(r.subject_id);
+        let (lo, hi) = if r.subject_id < r.object_id {
+            (r.subject_id, r.object_id)
+        } else {
+            (r.object_id, r.subject_id)
+        };
+        edge_set.insert((lo, hi));
+    }
+
+    // Select seed nodes: top-degree entities (hubs are most informative for diffusion)
+    let mut degree_list: Vec<(i64, usize)> =
+        neighbors.iter().map(|(&id, ns)| (id, ns.len())).collect();
+    degree_list.sort_by(|a, b| b.1.cmp(&a.1));
+    let seed_count = degree_list.len().min(100); // sample top-100 hubs
+    let seeds: Vec<i64> = degree_list
+        .iter()
+        .take(seed_count)
+        .map(|&(id, _)| id)
+        .collect();
+
+    // For each seed, simulate short random walks (approximate diffusion)
+    // Use lazy random walk: at each step, stay with prob 0.5 or move uniformly
+    let walks_per_seed = 20usize;
+    let walk_length = (t * 3.0).ceil() as usize; // longer t = longer walks
+    let walk_length = walk_length.clamp(2, 8);
+
+    let mut visit_counts: HashMap<(i64, i64), f64> = HashMap::new();
+    let mut rng_state: u64 = 0xdeadbeef_u64;
+    let mut next_rng = || -> u64 {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        rng_state
+    };
+
+    for &seed in &seeds {
+        let seed_deg = neighbors.get(&seed).map(|n| n.len()).unwrap_or(0);
+        if seed_deg == 0 {
+            continue;
+        }
+        for _ in 0..walks_per_seed {
+            let mut current = seed;
+            for step in 0..walk_length {
+                if let Some(ns) = neighbors.get(&current) {
+                    if ns.is_empty() {
+                        break;
+                    }
+                    // Lazy walk: stay with prob 0.5
+                    if next_rng() % 2 == 0 {
+                        continue;
+                    }
+                    current = ns[(next_rng() as usize) % ns.len()];
+                    if current != seed {
+                        let (lo, hi) = if seed < current {
+                            (seed, current)
+                        } else {
+                            (current, seed)
+                        };
+                        // Weight by step distance (closer = higher score)
+                        let decay = (-t * (step + 1) as f64 / walk_length as f64).exp();
+                        *visit_counts.entry((lo, hi)).or_insert(0.0) += decay;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Filter: keep only non-connected pairs with sufficient score
+    let mut results: Vec<(i64, i64, f64)> = visit_counts
+        .into_iter()
+        .filter(|((a, b), _)| !edge_set.contains(&(*a, *b)))
+        .map(|((a, b), score)| (a, b, score))
+        .collect();
+
+    results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    Ok(results)
+}
+
 pub fn predicate_bridge_analysis(brain: &Brain) -> Result<Vec<(String, usize)>, rusqlite::Error> {
     let communities = louvain_communities(brain)?;
     let relations = brain.all_relations()?;
