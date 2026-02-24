@@ -858,6 +858,24 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "ballistics",
     "computation",
     "admiralty",
+    // Added 2026-02-24 (brain cleaner round 6)
+    "neolithic",
+    "inhalt",
+    "tetradrachm",
+    "astroparticle",
+    "cornerstone",
+    "plaque",
+    "imperium",
+    "volksfeste",
+    "caverna",
+    "rechtskonsulent",
+    "cryptanalysis",
+    "racisme",
+    "circassians",
+    "hébertists",
+    "fastnacht",
+    "epigenome",
+    "risorgimento",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -4496,6 +4514,14 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
 fn classify_entity_type(name: &str) -> &'static str {
     let lower = name.to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
+
+    // En-dash/hyphen-joined names without spaces are typically mathematical theorems or
+    // dual-author concepts (e.g. "Riesz–Thorin", "Bohr-Heisenberg", "Gauss-Kuzmin")
+    // Classify as "concept" unless it's a known place pattern
+    if !name.contains(' ') && (name.contains('–') || name.contains('—')) && name.len() > 3 {
+        // These are almost always theorem/concept names (two surnames joined by dash)
+        return "concept";
+    }
 
     // Known company/brand prefixes — "Google Translate", "Apple Music" etc. are products, not people
     const PRODUCT_PREFIXES: &[&str] = &[
