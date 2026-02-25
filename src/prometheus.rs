@@ -3199,6 +3199,31 @@ impl<'a> Prometheus<'a> {
         ];
         let skip_neighbor_boost = NEIGHBOR_BASED_STRATEGIES.contains(&h.pattern_source.as_str());
 
+        // Cache entity lookups — previously done 8+ times per hypothesis
+        let s_ent = if h.object != "?" {
+            self.brain.get_entity_by_name(&h.subject)?
+        } else {
+            None
+        };
+        let o_ent = if h.object != "?" {
+            self.brain.get_entity_by_name(&h.object)?
+        } else {
+            None
+        };
+        let have_both = s_ent.is_some() && o_ent.is_some();
+
+        // Cache relations for both entities (used in multiple checks)
+        let s_rels = if let Some(ref se) = s_ent {
+            self.brain.get_relations_for(se.id)?
+        } else {
+            vec![]
+        };
+        let o_rels = if let Some(ref oe) = o_ent {
+            self.brain.get_relations_for(oe.id)?
+        } else {
+            vec![]
+        };
+
         // Track cumulative boost to apply diminishing returns — each successive
         // piece of evidence contributes less (prevents confidence inflation).
         let base_confidence = h.confidence;
@@ -3214,11 +3239,6 @@ impl<'a> Prometheus<'a> {
 
         // Search for supporting/contradicting evidence in the graph
         let subj = self.brain.search_entities(&h.subject)?;
-        let _obj = if h.object != "?" {
-            self.brain.search_entities(&h.object)?
-        } else {
-            vec![]
-        };
 
         // Check if the relation already exists (confirms the hypothesis)
         let mut direct_evidence = false;
@@ -3242,117 +3262,98 @@ impl<'a> Prometheus<'a> {
 
         // Check for shared neighbors (indirect evidence of relatedness)
         // Skip this boost for strategies that already used neighbor overlap
-        if h.object != "?" && !skip_neighbor_boost {
-            if let (Some(s_ent), Some(o_ent)) = (
-                self.brain.get_entity_by_name(&h.subject)?,
-                self.brain.get_entity_by_name(&h.object)?,
-            ) {
-                let s_rels = self.brain.get_relations_for(s_ent.id)?;
-                let o_rels = self.brain.get_relations_for(o_ent.id)?;
-                let s_neighbors: HashSet<String> = s_rels
-                    .iter()
-                    .flat_map(|(sn, _, on, _)| [sn.clone(), on.clone()])
-                    .collect();
-                let o_neighbors: HashSet<String> = o_rels
-                    .iter()
-                    .flat_map(|(sn, _, on, _)| [sn.clone(), on.clone()])
-                    .collect();
-                let shared: Vec<&String> = s_neighbors
-                    .intersection(&o_neighbors)
-                    .filter(|n| *n != &h.subject && *n != &h.object)
-                    .collect();
-                if shared.len() >= 2 {
-                    h.evidence_for.push(format!(
-                        "Shared {} neighbors: {}",
-                        shared.len(),
-                        shared
-                            .iter()
-                            .take(3)
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                    let raw = 0.05 * shared.len().min(4) as f64; // cap at 4 neighbors
-                    apply_boost(&mut total_boost, raw);
-                    h.confidence = (base_confidence + total_boost).min(1.0);
-                }
+        if have_both && !skip_neighbor_boost {
+            let s_neighbors: HashSet<String> = s_rels
+                .iter()
+                .flat_map(|(sn, _, on, _)| [sn.clone(), on.clone()])
+                .collect();
+            let o_neighbors: HashSet<String> = o_rels
+                .iter()
+                .flat_map(|(sn, _, on, _)| [sn.clone(), on.clone()])
+                .collect();
+            let shared: Vec<&String> = s_neighbors
+                .intersection(&o_neighbors)
+                .filter(|n| *n != &h.subject && *n != &h.object)
+                .collect();
+            if shared.len() >= 2 {
+                h.evidence_for.push(format!(
+                    "Shared {} neighbors: {}",
+                    shared.len(),
+                    shared
+                        .iter()
+                        .take(3)
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                let raw = 0.05 * shared.len().min(4) as f64; // cap at 4 neighbors
+                apply_boost(&mut total_boost, raw);
+                h.confidence = (base_confidence + total_boost).min(1.0);
             }
         }
 
         // For neighbor-based strategies without direct evidence, look for
         // independent corroboration: shared facts or co-occurrence in source URLs
-        if skip_neighbor_boost && !direct_evidence && h.object != "?" {
-            if let (Some(s_ent), Some(o_ent)) = (
-                self.brain.get_entity_by_name(&h.subject)?,
-                self.brain.get_entity_by_name(&h.object)?,
-            ) {
-                // Fact overlap: same key-value pairs across entities
-                let s_facts = self.brain.get_facts_for(s_ent.id)?;
-                let o_facts = self.brain.get_facts_for(o_ent.id)?;
-                let s_keys: HashSet<&str> = s_facts.iter().map(|f| f.key.as_str()).collect();
-                let o_keys: HashSet<&str> = o_facts.iter().map(|f| f.key.as_str()).collect();
-                let shared_keys = s_keys.intersection(&o_keys).count();
+        if skip_neighbor_boost && !direct_evidence && have_both {
+            let se = s_ent.as_ref().unwrap();
+            let oe = o_ent.as_ref().unwrap();
 
-                // Stronger signal: count matching key-value pairs (not just keys)
-                let s_kv: HashSet<(&str, &str)> = s_facts
-                    .iter()
-                    .map(|f| (f.key.as_str(), f.value.as_str()))
-                    .collect();
-                let o_kv: HashSet<(&str, &str)> = o_facts
-                    .iter()
-                    .map(|f| (f.key.as_str(), f.value.as_str()))
-                    .collect();
-                let shared_kv = s_kv.intersection(&o_kv).count();
+            // Fact overlap: same key-value pairs across entities
+            let s_facts = self.brain.get_facts_for(se.id)?;
+            let o_facts = self.brain.get_facts_for(oe.id)?;
+            let s_keys: HashSet<&str> = s_facts.iter().map(|f| f.key.as_str()).collect();
+            let o_keys: HashSet<&str> = o_facts.iter().map(|f| f.key.as_str()).collect();
+            let shared_keys = s_keys.intersection(&o_keys).count();
 
-                if shared_kv >= 1 {
-                    // Exact key-value match is strong evidence (same field, same nationality, etc.)
+            // Stronger signal: count matching key-value pairs (not just keys)
+            let s_kv: HashSet<(&str, &str)> = s_facts
+                .iter()
+                .map(|f| (f.key.as_str(), f.value.as_str()))
+                .collect();
+            let o_kv: HashSet<(&str, &str)> = o_facts
+                .iter()
+                .map(|f| (f.key.as_str(), f.value.as_str()))
+                .collect();
+            let shared_kv = s_kv.intersection(&o_kv).count();
+
+            if shared_kv >= 1 {
+                h.evidence_for
+                    .push(format!("Shared {} exact fact key-value pairs", shared_kv));
+                apply_boost(&mut total_boost, 0.08 * shared_kv.min(3) as f64);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            } else if shared_keys >= 1 {
+                h.evidence_for
+                    .push(format!("Shared {} fact keys across entities", shared_keys));
+                apply_boost(&mut total_boost, 0.05 * shared_keys.min(3) as f64);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            }
+
+            // Source co-occurrence: both entities appear in the same source URL
+            let s_sources: HashSet<String> =
+                self.brain.get_source_urls_for(se.id)?.into_iter().collect();
+            let o_sources: HashSet<String> =
+                self.brain.get_source_urls_for(oe.id)?.into_iter().collect();
+            let shared_sources = s_sources.intersection(&o_sources).count();
+            if shared_sources >= 1 {
+                h.evidence_for
+                    .push(format!("Co-occur in {} source URL(s)", shared_sources));
+                apply_boost(&mut total_boost, 0.03 * shared_sources.min(3) as f64);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            }
+
+            // Temporal proximity: entities first seen within 24h of each other
+            {
+                let delta = (se.first_seen - oe.first_seen).num_hours().unsigned_abs();
+                if delta <= 1 {
                     h.evidence_for
-                        .push(format!("Shared {} exact fact key-value pairs", shared_kv));
-                    apply_boost(&mut total_boost, 0.08 * shared_kv.min(3) as f64);
+                        .push("Entities discovered within 1 hour of each other".to_string());
+                    apply_boost(&mut total_boost, 0.08);
                     h.confidence = (base_confidence + total_boost).min(1.0);
-                } else if shared_keys >= 1 {
+                } else if delta <= 24 {
                     h.evidence_for
-                        .push(format!("Shared {} fact keys across entities", shared_keys));
-                    apply_boost(&mut total_boost, 0.05 * shared_keys.min(3) as f64);
+                        .push("Entities discovered within 24 hours of each other".to_string());
+                    apply_boost(&mut total_boost, 0.03);
                     h.confidence = (base_confidence + total_boost).min(1.0);
-                }
-
-                // Source co-occurrence: both entities appear in the same source URL
-                let s_sources: HashSet<String> = self
-                    .brain
-                    .get_source_urls_for(s_ent.id)?
-                    .into_iter()
-                    .collect();
-                let o_sources: HashSet<String> = self
-                    .brain
-                    .get_source_urls_for(o_ent.id)?
-                    .into_iter()
-                    .collect();
-                let shared_sources = s_sources.intersection(&o_sources).count();
-                if shared_sources >= 1 {
-                    h.evidence_for
-                        .push(format!("Co-occur in {} source URL(s)", shared_sources));
-                    apply_boost(&mut total_boost, 0.03 * shared_sources.min(3) as f64);
-                    h.confidence = (base_confidence + total_boost).min(1.0);
-                }
-
-                // Temporal proximity: entities first seen within 24h of each other
-                // are likely related (extracted from the same crawl session / topic)
-                {
-                    let delta = (s_ent.first_seen - o_ent.first_seen)
-                        .num_hours()
-                        .unsigned_abs();
-                    if delta <= 1 {
-                        h.evidence_for
-                            .push("Entities discovered within 1 hour of each other".to_string());
-                        apply_boost(&mut total_boost, 0.08);
-                        h.confidence = (base_confidence + total_boost).min(1.0);
-                    } else if delta <= 24 {
-                        h.evidence_for
-                            .push("Entities discovered within 24 hours of each other".to_string());
-                        apply_boost(&mut total_boost, 0.03);
-                        h.confidence = (base_confidence + total_boost).min(1.0);
-                    }
                 }
             }
         }
@@ -3366,7 +3367,6 @@ impl<'a> Prometheus<'a> {
 
         // Path-distance evidence: if a short path (2-3 hops) exists between
         // subject and object, that's independent structural evidence of relatedness.
-        // Uses bounded BFS (max 3 hops) for efficiency — avoids full graph traversal.
         if h.object != "?" && !direct_evidence {
             if let Ok(Some(path)) =
                 crate::graph::shortest_path_bounded(self.brain, &h.subject, &h.object, 3)
@@ -3383,134 +3383,113 @@ impl<'a> Prometheus<'a> {
                     apply_boost(&mut total_boost, 0.05);
                     h.confidence = (base_confidence + total_boost).min(1.0);
                 }
-                // 1-hop means already directly connected — handled by direct evidence above
             }
         }
 
-        // Type compatibility check: penalize hypotheses linking incompatible entity types
-        if h.object != "?" {
-            if let (Some(s_ent), Some(o_ent)) = (
-                self.brain.get_entity_by_name(&h.subject)?,
-                self.brain.get_entity_by_name(&h.object)?,
-            ) {
-                let incompatible =
-                    is_type_incompatible(&s_ent.entity_type, &o_ent.entity_type, &h.predicate);
-                if incompatible {
-                    h.evidence_against.push(format!(
-                        "Type mismatch: {} ({}) → {} → {} ({})",
-                        h.subject, s_ent.entity_type, h.predicate, h.object, o_ent.entity_type
-                    ));
-                    h.confidence = (h.confidence - 0.2).max(0.0);
-                }
-            }
-        }
+        // All remaining checks use cached s_ent/o_ent (no more redundant lookups)
+        if have_both {
+            let se = s_ent.as_ref().unwrap();
+            let oe = o_ent.as_ref().unwrap();
 
-        // Place-place "associated_with" penalty: these have low precision (26%)
-        // unless backed by source co-occurrence or path evidence.
-        // Penalize if no source-overlap evidence was gathered during validation.
-        if h.predicate == "associated_with" && h.object != "?" {
-            if let (Some(s_ent), Some(o_ent)) = (
-                self.brain.get_entity_by_name(&h.subject)?,
-                self.brain.get_entity_by_name(&h.object)?,
-            ) {
-                if s_ent.entity_type == "place" && o_ent.entity_type == "place" {
-                    let has_source_evidence = h
-                        .evidence_for
-                        .iter()
-                        .any(|e| e.contains("source URL") || e.contains("Co-occur"));
-                    if !has_source_evidence {
-                        h.evidence_against.push(
-                            "Place-place 'associated_with' without source co-occurrence"
-                                .to_string(),
-                        );
-                        h.confidence = (h.confidence - 0.15).max(0.0);
-                    }
-                }
+            // Type compatibility check
+            let incompatible = is_type_incompatible(&se.entity_type, &oe.entity_type, &h.predicate);
+            if incompatible {
+                h.evidence_against.push(format!(
+                    "Type mismatch: {} ({}) → {} → {} ({})",
+                    h.subject, se.entity_type, h.predicate, h.object, oe.entity_type
+                ));
+                h.confidence = (h.confidence - 0.2).max(0.0);
             }
-        }
 
-        // Staleness penalty: entities not seen recently are less reliable subjects
-        if h.object != "?" {
-            if let (Some(s_ent), Some(o_ent)) = (
-                self.brain.get_entity_by_name(&h.subject)?,
-                self.brain.get_entity_by_name(&h.object)?,
-            ) {
-                let now = Utc::now().naive_utc();
-                let s_age_days = (now - s_ent.last_seen).num_days();
-                let o_age_days = (now - o_ent.last_seen).num_days();
-                let max_age = s_age_days.max(o_age_days);
-                if max_age > 90 {
-                    h.evidence_against
-                        .push(format!("Entity staleness: {}d since last seen", max_age));
-                    h.confidence = (h.confidence - 0.08).max(0.0);
-                } else if max_age > 30 {
-                    h.confidence = (h.confidence - 0.03).max(0.0);
-                }
-            }
-        }
-
-        // Fragmentation-reduction bonus: hypotheses that would connect isolated
-        // entities to the main graph get a confidence boost, incentivizing the
-        // discovery engine to reduce the 89%+ fragmentation rate.
-        if h.object != "?" {
-            if let (Some(s_ent), Some(o_ent)) = (
-                self.brain.get_entity_by_name(&h.subject)?,
-                self.brain.get_entity_by_name(&h.object)?,
-            ) {
-                let s_rels = self.brain.get_relations_for(s_ent.id)?;
-                let o_rels = self.brain.get_relations_for(o_ent.id)?;
-                let s_isolated = s_rels.is_empty();
-                let o_isolated = o_rels.is_empty();
-                if s_isolated && o_isolated {
-                    // Both isolated: connecting them creates a new component but
-                    // reduces island count by 2 — moderate boost
-                    h.evidence_for.push(
-                        "Both entities are isolated — connection reduces fragmentation".to_string(),
+            // Place-place "associated_with" penalty
+            if h.predicate == "associated_with"
+                && se.entity_type == "place"
+                && oe.entity_type == "place"
+            {
+                let has_source_evidence = h
+                    .evidence_for
+                    .iter()
+                    .any(|e| e.contains("source URL") || e.contains("Co-occur"));
+                if !has_source_evidence {
+                    h.evidence_against.push(
+                        "Place-place 'associated_with' without source co-occurrence".to_string(),
                     );
-                    apply_boost(&mut total_boost, 0.06);
-                    h.confidence = (base_confidence + total_boost).min(1.0);
-                } else if s_isolated || o_isolated {
-                    // One isolated: connecting to a non-isolated entity integrates
-                    // it into the graph — stronger boost (reduces islands by 1)
-                    h.evidence_for.push(
-                        "Connects isolated entity to graph — reduces fragmentation".to_string(),
-                    );
-                    apply_boost(&mut total_boost, 0.10);
-                    h.confidence = (base_confidence + total_boost).min(1.0);
+                    h.confidence = (h.confidence - 0.15).max(0.0);
                 }
+            }
+
+            // Staleness penalty
+            let now = Utc::now().naive_utc();
+            let s_age_days = (now - se.last_seen).num_days();
+            let o_age_days = (now - oe.last_seen).num_days();
+            let max_age = s_age_days.max(o_age_days);
+            if max_age > 90 {
+                h.evidence_against
+                    .push(format!("Entity staleness: {}d since last seen", max_age));
+                h.confidence = (h.confidence - 0.08).max(0.0);
+            } else if max_age > 30 {
+                h.confidence = (h.confidence - 0.03).max(0.0);
+            }
+
+            // Fragmentation-reduction bonus
+            let s_isolated = s_rels.is_empty();
+            let o_isolated = o_rels.is_empty();
+            if s_isolated && o_isolated {
+                h.evidence_for.push(
+                    "Both entities are isolated — connection reduces fragmentation".to_string(),
+                );
+                apply_boost(&mut total_boost, 0.06);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            } else if s_isolated || o_isolated {
+                h.evidence_for
+                    .push("Connects isolated entity to graph — reduces fragmentation".to_string());
+                apply_boost(&mut total_boost, 0.10);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            }
+
+            // Entity importance signal (reuse cached facts for neighbor-based strategies)
+            let combined_access = se.access_count + oe.access_count;
+            let s_facts_len = self.brain.get_facts_for(se.id)?.len();
+            let o_facts_len = self.brain.get_facts_for(oe.id)?.len();
+            let fact_richness = s_facts_len + o_facts_len;
+            if combined_access >= 8 && fact_richness >= 4 {
+                h.evidence_for.push(format!(
+                    "High-importance entities: {} accesses, {} facts",
+                    combined_access, fact_richness
+                ));
+                apply_boost(&mut total_boost, 0.07);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            } else if combined_access >= 4 && fact_richness >= 2 {
+                apply_boost(&mut total_boost, 0.03);
+                h.confidence = (base_confidence + total_boost).min(1.0);
+            }
+
+            // Semantic coherence gate: reject type-incompatible predicates
+            if !predicate_type_compatible(&h.predicate, &se.entity_type, &oe.entity_type) {
+                h.status = HypothesisStatus::Rejected;
+                h.evidence_against.push(format!(
+                    "Type mismatch: {} ({}) vs {} ({})",
+                    h.subject, se.entity_type, h.object, oe.entity_type
+                ));
+                return Ok(());
+            }
+
+            // Bidirectional relation check: if the reverse relation exists,
+            // that's strong corroborating evidence (e.g., A influenced B + B influenced_by A)
+            let reverse_exists: bool = o_rels.iter().any(|(sn, pred, on, _)| {
+                (on == &h.subject || sn == &h.subject)
+                    && (predicates_similar(pred, &h.predicate)
+                        || is_inverse_predicate(pred, &h.predicate))
+            });
+            if reverse_exists {
+                h.evidence_for
+                    .push("Reverse/reciprocal relation exists in graph".to_string());
+                apply_boost(&mut total_boost, 0.10);
+                h.confidence = (base_confidence + total_boost).min(1.0);
             }
         }
 
-        // Entity importance signal: highly accessed entities with rich facts
-        // represent well-established knowledge; boost hypotheses involving them.
-        if h.object != "?" {
-            if let (Some(s_ent), Some(o_ent)) = (
-                self.brain.get_entity_by_name(&h.subject)?,
-                self.brain.get_entity_by_name(&h.object)?,
-            ) {
-                let combined_access = s_ent.access_count + o_ent.access_count;
-                let s_facts = self.brain.get_facts_for(s_ent.id)?.len();
-                let o_facts = self.brain.get_facts_for(o_ent.id)?.len();
-                let fact_richness = s_facts + o_facts;
-                // Only boost if entities are genuinely important (not random noise)
-                if combined_access >= 8 && fact_richness >= 4 {
-                    h.evidence_for.push(format!(
-                        "High-importance entities: {} accesses, {} facts",
-                        combined_access, fact_richness
-                    ));
-                    apply_boost(&mut total_boost, 0.07);
-                    h.confidence = (base_confidence + total_boost).min(1.0);
-                } else if combined_access >= 4 && fact_richness >= 2 {
-                    apply_boost(&mut total_boost, 0.03);
-                    h.confidence = (base_confidence + total_boost).min(1.0);
-                }
-            }
-        }
-
-        // Cross-pattern corroboration: if other hypotheses from different
-        // pattern sources proposed the same (subject, predicate, object) triple,
-        // that's independent evidence — boost confidence proportional to the
-        // number of corroborating sources.
+        // Cross-pattern corroboration
         if h.object != "?" && h.id > 0 {
             let corroborating: usize = self
                 .brain
@@ -3539,9 +3518,7 @@ impl<'a> Prometheus<'a> {
             }
         }
 
-        // Predicate specificity: specific predicates (born_in, invented, founded)
-        // are more reliable signals than vague ones (related_to, associated_with).
-        // Penalize vague predicates to reduce false confirmations.
+        // Predicate specificity: specific predicates are more reliable signals
         {
             const VAGUE_PREDICATES: &[&str] = &[
                 "related_to",
@@ -3576,9 +3553,7 @@ impl<'a> Prometheus<'a> {
             }
         }
 
-        // Predicate frequency signal: predicates that appear many times in the graph
-        // are well-established patterns — boost hypotheses using them.
-        // Rare predicates (< 3 occurrences) may be extraction noise — penalize slightly.
+        // Predicate frequency signal
         {
             let pred_count: i64 = self
                 .brain
@@ -3605,9 +3580,7 @@ impl<'a> Prometheus<'a> {
             }
         }
 
-        // Confirmation cascade: if confirmed hypotheses already exist for either
-        // entity, this is evidence that the entity is well-connected and new
-        // hypotheses involving it are more likely to be valid.
+        // Confirmation cascade
         if h.object != "?" {
             let cascade_count: i64 = self
                 .brain
@@ -3639,27 +3612,7 @@ impl<'a> Prometheus<'a> {
             }
         }
 
-        // Semantic coherence gate: reject type-incompatible predicates
-        // regardless of confidence score
-        if h.object != "?" {
-            if let (Some(ref se), Some(ref oe)) = (
-                self.brain.get_entity_by_name(&h.subject)?,
-                self.brain.get_entity_by_name(&h.object)?,
-            ) {
-                if !predicate_type_compatible(&h.predicate, &se.entity_type, &oe.entity_type) {
-                    h.status = HypothesisStatus::Rejected;
-                    h.evidence_against.push(format!(
-                        "Type mismatch: {} ({}) vs {} ({})",
-                        h.subject, se.entity_type, h.object, oe.entity_type
-                    ));
-                    return Ok(());
-                }
-            }
-        }
-
-        // Update status based on confidence (use defined thresholds)
-        // Vague predicates need higher confidence to avoid confirming noise
-        // (e.g., "Benito Mussolini related_to YouTube" from co-crawl artifacts)
+        // Update status based on confidence
         let effective_threshold = match h.predicate.as_str() {
             "related_to" => 0.85,
             "associated_with" | "relevant_to" | "related_concept" => 0.80,
@@ -3669,7 +3622,6 @@ impl<'a> Prometheus<'a> {
         let was_confirmed = h.status == HypothesisStatus::Confirmed;
         if h.confidence >= effective_threshold {
             h.status = HypothesisStatus::Confirmed;
-            // Record discovery if newly confirmed
             if !was_confirmed && h.id > 0 {
                 let _ = self.save_discovery(h.id, &h.evidence_for);
             }
@@ -26985,6 +26937,42 @@ fn extract_domain(url: &str) -> String {
         .next()
         .unwrap_or(stripped)
         .to_lowercase()
+}
+
+/// Check if two predicates are inverse/reciprocal pairs (e.g., influenced → influenced_by).
+fn is_inverse_predicate(a: &str, b: &str) -> bool {
+    let pairs = [
+        ("influenced", "influenced_by"),
+        ("created", "created_by"),
+        ("founded", "founded_by"),
+        ("taught", "studied_under"),
+        ("mentored", "mentored_by"),
+        ("employed", "works_at"),
+        ("contains", "part_of"),
+        ("parent_of", "child_of"),
+        ("preceded", "succeeded"),
+        ("predecessor_of", "successor_of"),
+        ("discovered", "discovered_by"),
+        ("invented", "invented_by"),
+        ("published", "published_by"),
+        ("developed", "developed_by"),
+        ("capital_of", "has_capital"),
+        ("located_in", "contains"),
+        ("member_of", "has_member"),
+    ];
+    for (p, q) in &pairs {
+        if (a == *p && b == *q) || (a == *q && b == *p) {
+            return true;
+        }
+    }
+    // Also check _by suffix pattern: "X" ↔ "X_by"
+    if a.ends_with("_by") && &a[..a.len() - 3] == b {
+        return true;
+    }
+    if b.ends_with("_by") && &b[..b.len() - 3] == a {
+        return true;
+    }
+    false
 }
 
 fn is_contradicting_predicate(a: &str, b: &str) -> bool {
