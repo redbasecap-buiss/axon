@@ -5779,6 +5779,15 @@ impl<'a> Prometheus<'a> {
         // Refine mismatched "active_in" relations by entity type pairs
         let active_in_refined = self.refine_active_in().unwrap_or(0);
 
+        // Reclassify collaborated_with from tfidf_reconnect (token similarity ≠ collaboration)
+        let tfidf_collab_refined = self.refine_tfidf_collaborated().unwrap_or(0);
+        if tfidf_collab_refined > 0 {
+            eprintln!(
+                "[PROMETHEUS] Refined {} tfidf_reconnect collaborated_with → contextual predicates",
+                tfidf_collab_refined
+            );
+        }
+
         // Demote weak contemporary_of relations lacking shared-neighbor evidence
         let weak_contemporary_demoted = self.demote_weak_contemporary().unwrap_or(0);
 
@@ -16935,6 +16944,69 @@ impl<'a> Prometheus<'a> {
         Ok(updated)
     }
 
+    /// Reclassify `collaborated_with` from `tfidf_reconnect` source to more accurate
+    /// predicates.  TF-IDF token similarity between entity names indicates topical
+    /// relatedness, not actual collaboration.  Person-person → `contemporary_of`,
+    /// and other type pairs get contextually appropriate predicates.
+    pub fn refine_tfidf_collaborated(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let id_to_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        // Fetch all collaborated_with from tfidf_reconnect
+        let to_refine: Vec<(i64, i64, i64)> = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, subject_id, object_id FROM relations
+                 WHERE predicate = 'collaborated_with' AND source_url = 'tfidf_reconnect'",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+        })?;
+
+        let mut updated = 0usize;
+        for (rid, sid, oid) in &to_refine {
+            let s_type = id_to_type.get(sid).copied().unwrap_or("unknown");
+            let o_type = id_to_type.get(oid).copied().unwrap_or("unknown");
+            let new_pred = match (s_type, o_type) {
+                ("person", "person") => "contemporary_of",
+                ("person", "place") | ("place", "person") => "active_in",
+                ("person", "organization") | ("organization", "person") => "affiliated_with",
+                ("place", "place") => "located_near",
+                ("concept", "concept") => "related_concept",
+                ("organization", "organization") => "partner_of",
+                _ => continue,
+            };
+            let ok = self.brain.with_conn(|conn| {
+                let res = conn.execute(
+                    "UPDATE relations SET predicate = ?1 WHERE id = ?2",
+                    params![new_pred, rid],
+                );
+                match res {
+                    Ok(_) => Ok(true),
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        conn.execute("DELETE FROM relations WHERE id = ?1", params![rid])?;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                }
+            })?;
+            if ok {
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
     /// Demote weak `contemporary_of` relations: reduce confidence of person-person
     /// contemporary_of relations that have no shared neighbors (no corroborating evidence).
     /// These were typically inferred from co-occurrence in the same article without
@@ -20367,13 +20439,21 @@ impl<'a> Prometheus<'a> {
                     (target.id, island.id)
                 };
                 if seen_pairs.insert(key) && island.name != target.name {
-                    // Determine predicate based on types
-                    let pred = if island.entity_type == target.entity_type {
-                        "associated_with"
-                    } else if island.entity_type == "person" || target.entity_type == "person" {
-                        "associated_with"
-                    } else {
-                        "related_concept"
+                    // Determine predicate based on types — use type-aware inference
+                    // For person-person TF-IDF matches, use "contemporary_of" instead of
+                    // "associated_with" (token similarity ≠ collaboration; it's more likely
+                    // they share a domain/era). This improves predicate diversity.
+                    let pred = match (island.entity_type.as_str(), target.entity_type.as_str()) {
+                        ("person", "person") => "contemporary_of",
+                        ("person", "place") | ("place", "person") => "active_in",
+                        ("person", "organization") | ("organization", "person") => "affiliated_with",
+                        ("person", "concept") => "contributed_to",
+                        ("concept", "person") => "pioneered_by",
+                        ("organization", "place") | ("place", "organization") => "based_in",
+                        ("place", "place") => "located_near",
+                        ("concept", "concept") => "related_concept",
+                        ("organization", "organization") => "partner_of",
+                        _ => "associated_with",
                     };
                     self.brain
                         .upsert_relation(island.id, pred, target.id, "tfidf_reconnect")?;
