@@ -1460,6 +1460,13 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "handbook",
     "impact",
     "install",
+    // Added 2026-02-25 (brain cleaner): trailing noise words
+    "teacher",
+    "player",
+    "brilliant",
+    "chapitre",
+    "decameron",
+    "enigma",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -7256,9 +7263,13 @@ fn extract_capitalized_inner(
                 if ORG_INDICATORS.contains(&last_clean) || PLACE_INDICATORS.contains(&last_clean) {
                     break;
                 }
+                // Strip trailing journal/citation abbreviations (e.g. "Mathematik Bd", "Physik Heft")
+                const CITATION_TRAIL: &[&str] =
+                    &["bd", "heft", "vol", "nr", "no", "pt", "ser", "fasc", "abt"];
                 if ENTITY_BLACKLIST.contains(&last_lower.as_str())
                     || GENERIC_SINGLE_WORDS.contains(&last_lower.as_str())
                     || CONCEPT_INDICATORS.contains(&last_clean)
+                    || CITATION_TRAIL.contains(&last_clean)
                 {
                     phrase.pop();
                 } else {
