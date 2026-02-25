@@ -341,7 +341,7 @@ fn infer_predicate(
         ("person", "person") => "contemporary_of",
         ("concept", "concept") => "related_concept",
         ("organization", "organization") => "partner_of",
-        ("place", "place") => "located_near",
+        ("place", "place") => "geographically_related_to",
         ("person", "organization") | ("organization", "person") => "affiliated_with",
         ("person", "concept") | ("concept", "person") => "contributed_to",
         ("person", "place") | ("place", "person") => "active_in",
@@ -5140,6 +5140,16 @@ impl<'a> Prometheus<'a> {
 
         // Bulk reject stale testing hypotheses (>5 days, confidence < 0.5)
         let bulk_rejected = self.bulk_reject_stale_testing(5, 0.5).unwrap_or(0);
+
+        // Medium-stale rejection: testing hypotheses >36h old that haven't reached
+        // confirmation threshold are unlikely to ever get there — reject at 0.65
+        let medium_stale_rejected = self.bulk_reject_stale_testing_hours(36, 0.65).unwrap_or(0);
+        if medium_stale_rejected > 0 {
+            eprintln!(
+                "[PROMETHEUS] Medium-stale rejected {} testing hypotheses (>36h, conf<0.65)",
+                medium_stale_rejected
+            );
+        }
 
         // Accelerated rejection for vague predicates stuck in testing:
         // related_to and contemporary_of are low-signal — reject after 2 days
@@ -10943,6 +10953,34 @@ impl<'a> Prometheus<'a> {
         Ok(count)
     }
 
+    /// Medium-stale rejection: reject testing hypotheses older than `max_hours`
+    /// with confidence below `max_confidence`. Fills the gap between the 2-day
+    /// vague-predicate rejection and the 5-day general rejection.
+    pub fn bulk_reject_stale_testing_hours(
+        &self,
+        max_hours: i64,
+        max_confidence: f64,
+    ) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::hours(max_hours))
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let count = self.brain.with_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE hypotheses SET status = 'rejected' \
+                 WHERE status = 'testing' \
+                 AND discovered_at < ?1 \
+                 AND confidence < ?2",
+                params![cutoff, max_confidence],
+            )?;
+            Ok(updated)
+        })?;
+        if count > 0 {
+            let _ = self.record_outcome("medium_stale_reject", false);
+        }
+        Ok(count)
+    }
+
     /// Accelerated rejection for vague predicates (related_to, contemporary_of,
     /// associated_with) stuck in testing. These low-signal predicates rarely get
     /// confirmed at moderate confidence levels, so we reject them faster than
@@ -15553,7 +15591,7 @@ impl<'a> Prometheus<'a> {
 
             // Only handle type pairs that refine_associated_with skips
             let new_pred = match (s_type, o_type) {
-                ("place", "place") => "located_near",
+                ("place", "place") => "geographically_related_to",
                 ("technology", "technology") => "related_technology",
                 ("technology", "concept") | ("concept", "technology") => "implements",
                 ("technology", "person") => "created_by",
@@ -15701,7 +15739,7 @@ impl<'a> Prometheus<'a> {
                 ("organization", "concept") | ("concept", "organization") => "works_on",
                 ("concept", "concept") => "related_concept",
                 ("concept", "place") | ("place", "concept") => "relevant_to",
-                ("place", "place") => "located_near",
+                ("place", "place") => "geographically_related_to",
                 ("event", "place") | ("place", "event") => "held_in",
                 ("event", "event") => "concurrent_with",
                 ("technology", "person") | ("person", "technology") => "created_by",
@@ -16132,7 +16170,7 @@ impl<'a> Prometheus<'a> {
                 ("concept", "concept") => "related_concept",
                 ("concept", "person") => "pioneered_by",
                 ("concept", "place") | ("place", "concept") => "relevant_to",
-                ("place", "place") => "located_near",
+                ("place", "place") => "geographically_related_to",
                 ("place", "person") => "birthplace_of",
                 ("organization", "concept") => "works_on",
                 ("organization", "person") => "employed",
@@ -16283,7 +16321,7 @@ impl<'a> Prometheus<'a> {
 
             let new_pred = match (s_type, o_type) {
                 ("place", "person") => "birthplace_of",
-                ("place", "place") => "located_near",
+                ("place", "place") => "geographically_related_to",
                 ("person", "person") => "contemporary_of",
                 ("person", "organization") => "affiliated_with",
                 ("person", "concept") => "works_on",
@@ -19905,7 +19943,7 @@ impl<'a> Prometheus<'a> {
                     ("concept", "concept") => "related_concept",
                     ("organization", "concept") | ("concept", "organization") => "works_on",
                     ("organization", "organization") => "partner_of",
-                    ("place", "place") => "located_near",
+                    ("place", "place") => "geographically_related_to",
                     _ => "related_to",
                 };
                 let ok = self.brain.with_conn(|conn| {
@@ -21927,7 +21965,7 @@ impl<'a> Prometheus<'a> {
                     ("person", "place") | ("place", "person") => "active_in",
                     ("person", "organization") | ("organization", "person") => "affiliated_with",
                     ("person", "concept") | ("concept", "person") => "related_to",
-                    ("place", "place") => "located_near",
+                    ("place", "place") => "geographically_related_to",
                     _ => "related_to",
                 };
                 self.brain.with_conn(|conn| {
@@ -23275,7 +23313,7 @@ impl<'a> Prometheus<'a> {
                     ("concept", "concept") => "related_concept",
                     ("organization", "concept") | ("concept", "organization") => "works_on",
                     ("organization", "organization") => "partner_of",
-                    ("place", "place") => "located_near",
+                    ("place", "place") => "geographically_related_to",
                     _ => "co_extracted_with",
                 };
                 self.brain.with_conn(|conn| {
@@ -23401,7 +23439,7 @@ impl<'a> Prometheus<'a> {
                         ("concept", "person") => "pioneered_by",
                         ("concept", "concept") => "related_concept",
                         ("organization", "organization") => "partner_of",
-                        ("place", "place") => "located_near",
+                        ("place", "place") => "geographically_related_to",
                         _ => "co_extracted_with",
                     };
                     self.brain.with_conn(|conn| {
@@ -23490,7 +23528,7 @@ impl<'a> Prometheus<'a> {
                     ("person", "organization") | ("organization", "person") => "affiliated_with",
                     ("person", "concept") | ("concept", "person") => "related_to",
                     ("concept", "concept") => "related_concept",
-                    ("place", "place") => "located_near",
+                    ("place", "place") => "geographically_related_to",
                     _ => "co_extracted_with",
                 };
                 self.brain.with_conn(|conn| {
