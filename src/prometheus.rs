@@ -1369,6 +1369,107 @@ pub fn is_noise_name(name: &str) -> bool {
     false
 }
 
+/// Broad geographic entities (countries, continents, large regions) that generate
+/// low-signal hypotheses in link-prediction strategies. These are too general to
+/// produce useful "X related_to Y" discoveries.
+fn is_broad_geographic(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    const BROAD_GEO: &[&str] = &[
+        "africa",
+        "asia",
+        "europe",
+        "america",
+        "australia",
+        "antarctica",
+        "north america",
+        "south america",
+        "latin america",
+        "middle east",
+        "france",
+        "germany",
+        "italy",
+        "spain",
+        "england",
+        "britain",
+        "great britain",
+        "united kingdom",
+        "russia",
+        "china",
+        "japan",
+        "india",
+        "brazil",
+        "mexico",
+        "canada",
+        "argentina",
+        "chile",
+        "colombia",
+        "peru",
+        "egypt",
+        "turkey",
+        "iran",
+        "iraq",
+        "syria",
+        "greece",
+        "rome",
+        "austria",
+        "switzerland",
+        "netherlands",
+        "belgium",
+        "portugal",
+        "sweden",
+        "norway",
+        "denmark",
+        "finland",
+        "poland",
+        "hungary",
+        "czech",
+        "romania",
+        "bulgaria",
+        "serbia",
+        "croatia",
+        "ukraine",
+        "ireland",
+        "scotland",
+        "wales",
+        "korea",
+        "vietnam",
+        "thailand",
+        "indonesia",
+        "malaysia",
+        "philippines",
+        "pakistan",
+        "bangladesh",
+        "saudi arabia",
+        "israel",
+        "morocco",
+        "algeria",
+        "tunisia",
+        "libya",
+        "sudan",
+        "ethiopia",
+        "kenya",
+        "nigeria",
+        "south africa",
+        "tanzania",
+        "new zealand",
+        "cuba",
+        "jamaica",
+        "haiti",
+        "cambodia",
+        "mediterranean",
+        "atlantic",
+        "pacific",
+        "caribbean",
+        "balkans",
+        "scandinavia",
+        "siberia",
+        "caucasus",
+        "mesopotamia",
+        "persia",
+    ];
+    BROAD_GEO.contains(&lower.as_str())
+}
+
 /// Extended first names list for concatenation detection (called rarely, not perf-critical).
 fn first_names_extended() -> HashSet<&'static str> {
     [
@@ -12508,6 +12609,14 @@ impl<'a> Prometheus<'a> {
             if !b.contains(' ') && b.len() < 8 {
                 continue;
             }
+            // Skip broad geographic entities (country↔country = noise, not discovery)
+            if is_broad_geographic(a) || is_broad_geographic(b) {
+                continue;
+            }
+            // Block active_in for place↔place (trivial geographic co-location)
+            if predicate == "active_in" && a_type == "place" && b_type == "place" {
+                continue;
+            }
 
             // Scale confidence with path count, with a type-match bonus
             let type_bonus = if a_type == b_type { 0.05 } else { 0.0 };
@@ -13341,11 +13450,12 @@ impl<'a> Prometheus<'a> {
                 || predicate == "associated_with"
                 || predicate == "related_concept"
                 || predicate == "geographically_related_to"
+                || predicate == "references"
             {
                 continue;
             }
-            // Require higher neighbor overlap for vague predicates
-            if predicate == "associated_with" && shared_neighbors < 5 {
+            // Skip broad geographic entities (country↔country via hub paths = noise)
+            if is_broad_geographic(a_name) || is_broad_geographic(b_name) {
                 continue;
             }
 
