@@ -5084,6 +5084,17 @@ impl<'a> Prometheus<'a> {
         // Bulk reject stale testing hypotheses (>5 days, confidence < 0.5)
         let bulk_rejected = self.bulk_reject_stale_testing(5, 0.5).unwrap_or(0);
 
+        // Accelerated rejection for vague predicates stuck in testing:
+        // related_to and contemporary_of are low-signal — reject after 2 days
+        // if confidence < 0.60 (they rarely get confirmed at that level)
+        let vague_rejected = self.bulk_reject_vague_stale_testing(2, 0.61).unwrap_or(0);
+        if vague_rejected > 0 {
+            eprintln!(
+                "[PROMETHEUS] Accelerated-rejected {} vague-predicate testing hypotheses",
+                vague_rejected
+            );
+        }
+
         // Clean up fragment hypotheses (single-word subject+object = NLP noise, not discoveries)
         let fragment_cleaned = self.cleanup_fragment_hypotheses().unwrap_or(0);
 
@@ -10875,6 +10886,36 @@ impl<'a> Prometheus<'a> {
         Ok(count)
     }
 
+    /// Accelerated rejection for vague predicates (related_to, contemporary_of,
+    /// associated_with) stuck in testing. These low-signal predicates rarely get
+    /// confirmed at moderate confidence levels, so we reject them faster than
+    /// the general stale-testing threshold.
+    pub fn bulk_reject_vague_stale_testing(
+        &self,
+        max_days: i64,
+        max_confidence: f64,
+    ) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::days(max_days))
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let count = self.brain.with_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE hypotheses SET status = 'rejected' \
+                 WHERE status = 'testing' \
+                 AND discovered_at < ?1 \
+                 AND confidence < ?2 \
+                 AND predicate IN ('related_to', 'contemporary_of', 'associated_with', 'relevant_to')",
+                params![cutoff, max_confidence],
+            )?;
+            Ok(updated)
+        })?;
+        if count > 0 {
+            let _ = self.record_outcome("vague_stale_reject", false);
+        }
+        Ok(count)
+    }
+
     /// Reconnect islands using reverse containment: find islands whose name appears
     /// as a significant substring within a connected entity name.
     /// E.g., island "Euler" → connected "Euler's Method" or "Leonhard Euler".
@@ -12808,13 +12849,21 @@ impl<'a> Prometheus<'a> {
             // - contemporary_of: 47% confirmation rate
             // - related_to: 32% confirmation rate
             // - associated_with between two places: trivially true geo connections
-            if predicate == "contemporary_of" || predicate == "related_to" {
+            // - relevant_to: 82% but very vague, no knowledge value
+            if predicate == "contemporary_of"
+                || predicate == "related_to"
+                || predicate == "relevant_to"
+            {
                 continue;
             }
             if predicate == "associated_with"
                 && (a_type == "place" || a_type == "location")
                 && (b_type == "place" || b_type == "location")
             {
+                continue;
+            }
+            // Require higher neighbor overlap for vague predicates
+            if predicate == "associated_with" && shared_neighbors < 5 {
                 continue;
             }
 
