@@ -4746,16 +4746,11 @@ impl<'a> Prometheus<'a> {
         );
         all_hypotheses.extend(bridge_hyps);
 
-        // 2d2. Community homophily (same type + same community + shared neighbors)
-        let t1 = std::time::Instant::now();
-        let ch_weight = self.get_pattern_weight("community_homophily")?;
-        if ch_weight >= 0.05 && !suspended.contains("community_homophily") {
+        // 2d2. Community homophily — DISABLED (19.8% confirmation rate over 334 samples)
+        // Despite tightening to 8 shared neighbors + 0.25 Jaccard, the strategy
+        // remains unreliable. Same-community + same-type is too weak a signal.
+        if false {
             let ch_hyps = self.generate_hypotheses_from_community_homophily()?;
-            eprintln!(
-                "[PROMETHEUS] community_homophily: {} in {:?}",
-                ch_hyps.len(),
-                t1.elapsed()
-            );
             all_hypotheses.extend(ch_hyps);
         }
 
@@ -12336,12 +12331,12 @@ impl<'a> Prometheus<'a> {
                 continue;
             }
 
-            // Require 3+ paths for cross-type pairs, 4+ for same-type
-            // (tightened from 63.5% confirmation rate)
-            if a_type != b_type && *path_count < 3 {
+            // Require 4+ paths for cross-type pairs, 5+ for same-type
+            // (tightened from 63.9% confirmation rate with 3/4 thresholds)
+            if a_type != b_type && *path_count < 4 {
                 continue;
             }
-            if a_type == b_type && *path_count < 4 {
+            if a_type == b_type && *path_count < 5 {
                 continue;
             }
 
@@ -12356,6 +12351,7 @@ impl<'a> Prometheus<'a> {
             if predicate == "contemporary_of"
                 || predicate == "references"
                 || predicate == "related_to"
+                || predicate == "associated_with"
             {
                 continue;
             }
@@ -12983,11 +12979,12 @@ impl<'a> Prometheus<'a> {
                 continue;
             }
 
-            // Require at least 1 shared neighbor for PA hypotheses
+            // Require at least 3 shared neighbors for PA hypotheses
+            // (tightened from 69.1% confirmation rate with 1-neighbor threshold)
             let a_neighbors = adj.get(a).cloned().unwrap_or_default();
             let b_neighbors = adj.get(b).cloned().unwrap_or_default();
             let shared: Vec<i64> = a_neighbors.intersection(&b_neighbors).copied().collect();
-            if shared.is_empty() {
+            if shared.len() < 3 {
                 continue;
             }
 
@@ -13142,7 +13139,7 @@ impl<'a> Prometheus<'a> {
                 .map(|v| v.iter().copied().collect())
                 .unwrap_or_default();
             let shared_neighbors = a_nbrs.intersection(&b_nbrs).count();
-            if shared_neighbors < 6 {
+            if shared_neighbors < 8 {
                 continue;
             }
             let a_type = id_type.get(a).copied().unwrap_or("unknown");
