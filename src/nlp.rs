@@ -1363,6 +1363,23 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "methodological",
     "chronological",
     "ecclesiastical",
+    // Added 2026-02-25 (brain cleaner): broken multi-word extractions, generic phrases
+    "supplementary",
+    "bodleian",
+    "bureaucratic",
+    "fractional",
+    "lagged",
+    "southeast",
+    "northeast",
+    "southwest",
+    "northwest",
+    "kooplui",
+    "lufttransport",
+    "weirdest",
+    "rennbahn",
+    "penerbitan",
+    "perbandingan",
+    "offene",
 ];
 
 /// Common person name prefixes/titles for entity classification.

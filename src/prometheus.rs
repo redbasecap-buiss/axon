@@ -3295,6 +3295,30 @@ impl<'a> Prometheus<'a> {
             }
         }
 
+        // Place-place "associated_with" penalty: these have low precision (26%)
+        // unless backed by source co-occurrence or path evidence.
+        // Penalize if no source-overlap evidence was gathered during validation.
+        if h.predicate == "associated_with" && h.object != "?" {
+            if let (Some(s_ent), Some(o_ent)) = (
+                self.brain.get_entity_by_name(&h.subject)?,
+                self.brain.get_entity_by_name(&h.object)?,
+            ) {
+                if s_ent.entity_type == "place" && o_ent.entity_type == "place" {
+                    let has_source_evidence = h
+                        .evidence_for
+                        .iter()
+                        .any(|e| e.contains("source URL") || e.contains("Co-occur"));
+                    if !has_source_evidence {
+                        h.evidence_against.push(
+                            "Place-place 'associated_with' without source co-occurrence"
+                                .to_string(),
+                        );
+                        h.confidence = (h.confidence - 0.15).max(0.0);
+                    }
+                }
+            }
+        }
+
         // Staleness penalty: entities not seen recently are less reliable subjects
         if h.object != "?" {
             if let (Some(s_ent), Some(o_ent)) = (
@@ -3524,8 +3548,16 @@ impl<'a> Prometheus<'a> {
         }
 
         // Update status based on confidence (use defined thresholds)
+        // Vague predicates need higher confidence to avoid confirming noise
+        // (e.g., "Benito Mussolini related_to YouTube" from co-crawl artifacts)
+        let effective_threshold = match h.predicate.as_str() {
+            "related_to" => 0.85,
+            "associated_with" | "relevant_to" | "related_concept" => 0.80,
+            _ if is_generic_predicate(&h.predicate) => 0.80,
+            _ => CONFIRMATION_THRESHOLD,
+        };
         let was_confirmed = h.status == HypothesisStatus::Confirmed;
-        if h.confidence >= CONFIRMATION_THRESHOLD {
+        if h.confidence >= effective_threshold {
             h.status = HypothesisStatus::Confirmed;
             // Record discovery if newly confirmed
             if !was_confirmed && h.id > 0 {
@@ -12157,6 +12189,11 @@ impl<'a> Prometheus<'a> {
             }
             let a_type = id_type.get(a).copied().unwrap_or("?");
             let b_type = id_type.get(b).copied().unwrap_or("?");
+            // Place-place pairs have 26% confirmation via semantic fingerprint —
+            // require stronger signal (≥3 shared patterns or jaccard ≥ 0.50)
+            if a_type == "place" && b_type == "place" && *shared < 3 && *jaccard < 0.50 {
+                continue;
+            }
             let predicate = infer_predicate(a_type, b_type, None);
             hypotheses.push(Hypothesis {
                 id: 0,
