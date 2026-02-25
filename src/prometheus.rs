@@ -425,6 +425,8 @@ fn infer_predicate(
         ("place", "concept") | ("concept", "place") => "associated_with",
         ("place", "technology") | ("technology", "place") => "deployed_in",
         ("event", "technology") | ("technology", "event") => "showcased_at",
+        ("product", "event") | ("event", "product") => "launched_at",
+        ("product", "place") | ("place", "product") => "manufactured_in",
         _ => "related_to",
     }
 }
@@ -3028,6 +3030,25 @@ impl<'a> Prometheus<'a> {
             }
         }
 
+        // Temporal freshness: penalize hypotheses about entities not seen recently.
+        // Entities last seen >30 days ago are likely stale knowledge areas.
+        if hypothesis.object != "?" {
+            if let (Some(s_ent), Some(o_ent)) = (
+                self.brain.get_entity_by_name(&hypothesis.subject)?,
+                self.brain.get_entity_by_name(&hypothesis.object)?,
+            ) {
+                let now = Utc::now().naive_utc();
+                let s_age = (now - s_ent.last_seen).num_days();
+                let o_age = (now - o_ent.last_seen).num_days();
+                let max_age = s_age.max(o_age);
+                if max_age > 60 {
+                    score -= 0.08; // very stale entities
+                } else if max_age > 30 {
+                    score -= 0.04; // moderately stale
+                }
+            }
+        }
+
         // Predicate specificity penalty: vague predicates carry less information
         // and are more likely to be false positives (nearly anything can be "related_to").
         const VAGUE_PREDICATES: &[&str] = &[
@@ -5037,6 +5058,23 @@ impl<'a> Prometheus<'a> {
                 let o_last = h.object.split_whitespace().last().unwrap_or("");
                 if !s_last.is_empty() && s_last.len() > 3 && s_last == o_last {
                     return false;
+                }
+            }
+            // Skip hypotheses where entities share >50% of name tokens (too similar to be a discovery)
+            // e.g., "Royal Society of London" ↔ "Royal Society of Edinburgh" share 3/4 tokens
+            if h.object != "?" {
+                let s_tokens: HashSet<&str> = h.subject.split_whitespace()
+                    .filter(|w| w.len() > 2)
+                    .collect();
+                let o_tokens: HashSet<&str> = h.object.split_whitespace()
+                    .filter(|w| w.len() > 2)
+                    .collect();
+                if s_tokens.len() >= 2 && o_tokens.len() >= 2 {
+                    let shared = s_tokens.intersection(&o_tokens).count();
+                    let min_len = s_tokens.len().min(o_tokens.len());
+                    if min_len > 0 && shared as f64 / min_len as f64 > 0.5 {
+                        return false;
+                    }
                 }
             }
             !self

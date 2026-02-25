@@ -6098,3 +6098,105 @@ pub fn predicate_bridge_analysis(brain: &Brain) -> Result<Vec<(String, usize)>, 
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
     Ok(sorted)
 }
+
+/// Neighbor type census for an entity: returns a map of entity_type → count
+/// for all neighbors (both incoming and outgoing relations).
+/// Useful for contextual predicate inference in hypothesis generation.
+pub fn neighbor_type_census(
+    brain: &Brain,
+    entity_id: i64,
+) -> Result<HashMap<String, usize>, rusqlite::Error> {
+    brain.with_conn(|conn| {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT e.entity_type, COUNT(*) FROM (
+                SELECT object_id AS eid FROM relations WHERE subject_id = ?1
+                UNION ALL
+                SELECT subject_id AS eid FROM relations WHERE object_id = ?1
+            ) n
+            JOIN entities e ON e.id = n.eid
+            WHERE e.entity_type IS NOT NULL AND e.entity_type != ''
+            GROUP BY e.entity_type",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![entity_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+        })?;
+        for row in rows {
+            let (t, c) = row?;
+            counts.insert(t, c);
+        }
+        Ok(counts)
+    })
+}
+
+/// Reciprocal neighbor overlap: for two entities, count neighbors that point to
+/// BOTH of them (not just shared outgoing neighbors). This captures "co-referenced"
+/// patterns where third entities reference both A and B, indicating topical relatedness.
+/// Returns (shared_incoming, shared_outgoing, shared_bidirectional).
+pub fn reciprocal_neighbor_overlap(
+    brain: &Brain,
+    entity_a: i64,
+    entity_b: i64,
+) -> Result<(usize, usize, usize), rusqlite::Error> {
+    brain.with_conn(|conn| {
+        // Entities that have relations pointing TO both A and B
+        let shared_in: usize = conn.query_row(
+            "SELECT COUNT(DISTINCT a_src.subject_id) FROM relations a_src
+             INNER JOIN relations b_src ON a_src.subject_id = b_src.subject_id
+             WHERE a_src.object_id = ?1 AND b_src.object_id = ?2
+               AND a_src.subject_id != ?1 AND a_src.subject_id != ?2",
+            rusqlite::params![entity_a, entity_b],
+            |row| row.get(0),
+        )?;
+        // Entities that both A and B point TO
+        let shared_out: usize = conn.query_row(
+            "SELECT COUNT(DISTINCT a_tgt.object_id) FROM relations a_tgt
+             INNER JOIN relations b_tgt ON a_tgt.object_id = b_tgt.object_id
+             WHERE a_tgt.subject_id = ?1 AND b_tgt.subject_id = ?2
+               AND a_tgt.object_id != ?1 AND a_tgt.object_id != ?2",
+            rusqlite::params![entity_a, entity_b],
+            |row| row.get(0),
+        )?;
+        // Combined: any neighbor connected to both (regardless of direction)
+        let shared_any: usize = conn.query_row(
+            "SELECT COUNT(DISTINCT n.eid) FROM (
+                SELECT object_id AS eid FROM relations WHERE subject_id = ?1
+                UNION SELECT subject_id FROM relations WHERE object_id = ?1
+            ) n
+            INNER JOIN (
+                SELECT object_id AS eid FROM relations WHERE subject_id = ?2
+                UNION SELECT subject_id FROM relations WHERE object_id = ?2
+            ) m ON n.eid = m.eid
+            WHERE n.eid != ?1 AND n.eid != ?2",
+            rusqlite::params![entity_a, entity_b],
+            |row| row.get(0),
+        )?;
+        Ok((shared_in, shared_out, shared_any))
+    })
+}
+
+/// Entity age in days (from first_seen to now). Returns None if entity not found.
+pub fn entity_age_days(brain: &Brain, entity_id: i64) -> Result<Option<i64>, rusqlite::Error> {
+    brain.with_conn(|conn| {
+        let result: rusqlite::Result<String> = conn.query_row(
+            "SELECT first_seen FROM entities WHERE id = ?1",
+            rusqlite::params![entity_id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(first_seen) => {
+                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&first_seen, "%Y-%m-%d %H:%M:%S") {
+                    let now = chrono::Utc::now().naive_utc();
+                    Ok(Some((now - dt).num_days()))
+                } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&first_seen, "%Y-%m-%dT%H:%M:%S") {
+                    let now = chrono::Utc::now().naive_utc();
+                    Ok(Some((now - dt).num_days()))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    })
+}
