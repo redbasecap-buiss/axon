@@ -422,7 +422,7 @@ fn infer_predicate(
         ("product", "concept") | ("concept", "product") => "embodies",
         ("product", "company") | ("company", "product") => "produced_by",
         ("product", "product") => "competes_with",
-        ("place", "concept") | ("concept", "place") => "associated_with",
+        ("place", "concept") | ("concept", "place") => "relevant_to",
         ("place", "technology") | ("technology", "place") => "deployed_in",
         ("event", "technology") | ("technology", "event") => "showcased_at",
         ("product", "event") | ("event", "product") => "launched_at",
@@ -3437,6 +3437,15 @@ impl<'a> Prometheus<'a> {
                 h.confidence = (h.confidence - 0.08).max(0.0);
             } else if max_age > 30 {
                 h.confidence = (h.confidence - 0.03).max(0.0);
+            }
+
+            // Vague predicate penalty: "associated_with" has 36.4% rejection rate
+            // across all strategies — apply a confidence penalty to raise the bar
+            if h.predicate == "associated_with" {
+                h.evidence_against.push(
+                    "Vague predicate 'associated_with' (historically 36% rejection)".to_string(),
+                );
+                h.confidence = (h.confidence - 0.10).max(0.0);
             }
 
             // Fragmentation-reduction bonus
@@ -12498,6 +12507,15 @@ impl<'a> Prometheus<'a> {
                 continue;
             }
             let predicate = infer_predicate(a_type, b_type, None);
+            // Skip high-rejection predicates for this strategy:
+            // associated_with (71.5% rej), related_concept (52.5% rej),
+            // geographically_related_to (78.4% rej) — confirmed via DB analysis
+            if predicate == "associated_with"
+                || predicate == "related_concept"
+                || predicate == "geographically_related_to"
+            {
+                continue;
+            }
             hypotheses.push(Hypothesis {
                 id: 0,
                 subject: a_name.to_string(),
@@ -12759,6 +12777,8 @@ impl<'a> Prometheus<'a> {
             if predicate == "contemporary_of"
                 || predicate == "related_to"
                 || predicate == "associated_with"
+                || predicate == "geographically_related_to"
+                || predicate == "related_concept"
             {
                 continue;
             }
@@ -13201,11 +13221,14 @@ impl<'a> Prometheus<'a> {
 
             // Skip low-signal predicates that Katz picks up via hub connectivity
             // but rarely produce useful knowledge:
-            // - contemporary_of, related_to, relevant_to, associated_with: vague
+            // - contemporary_of (50.8% rej), related_to (68.2% rej), associated_with (26.8% rej)
+            // - related_concept (35.7% rej), geographically_related_to: vague
             if predicate == "contemporary_of"
                 || predicate == "related_to"
                 || predicate == "relevant_to"
                 || predicate == "associated_with"
+                || predicate == "related_concept"
+                || predicate == "geographically_related_to"
             {
                 continue;
             }
