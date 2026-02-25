@@ -11967,6 +11967,21 @@ impl<'a> Prometheus<'a> {
                 pred.clone()
             };
 
+            // Skip low-signal predicate/type combos that produce noise
+            if predicate == "contemporary_of" {
+                continue;
+            }
+            if predicate == "pioneered" && (a_type == "place" || b_type == "place") {
+                continue;
+            }
+            // Skip single-word entities in near_miss (too ambiguous)
+            if !a.contains(' ') && a.len() < 8 {
+                continue;
+            }
+            if !b.contains(' ') && b.len() < 8 {
+                continue;
+            }
+
             // Scale confidence with path count, with a type-match bonus
             let type_bonus = if a_type == b_type { 0.05 } else { 0.0 };
             let base_conf = 0.45 + (*path_count as f64 * 0.05).min(0.3) + type_bonus;
@@ -14420,6 +14435,10 @@ impl<'a> Prometheus<'a> {
                 continue;
             }
             let etype = type_map.get(eid).copied().unwrap_or("?");
+            // Skip single-word entities (too ambiguous for fact-gap inference)
+            if !name.contains(' ') && name.len() < 10 {
+                continue;
+            }
 
             // Find entities sharing fact key-value pairs
             let mut candidates: HashMap<i64, usize> = HashMap::new();
@@ -14447,6 +14466,9 @@ impl<'a> Prometheus<'a> {
                     None => continue,
                 };
                 if is_noise_name(other_name) {
+                    continue;
+                }
+                if !other_name.contains(' ') && other_name.len() < 10 {
                     continue;
                 }
                 let other_type = type_map.get(&other_id).copied().unwrap_or("?");
