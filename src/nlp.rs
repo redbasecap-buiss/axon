@@ -4310,6 +4310,32 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject single-word concepts that are common English words by suffix pattern
+    // These leak through when not explicitly in GENERIC_SINGLE_WORDS
+    if !lower.contains(' ') && etype == "concept" && lower.len() >= 5 {
+        let common_suffixes = [
+            "tion", "sion", "ment", "ness", "ity", "ence", "ance", "ture", "ible", "able", "ious",
+            "eous", "ical", "ized", "ised", "ling", "ting", "ning", "ring", "ding", "sing", "ming",
+            "ping", "king", "ving", "zing", "ying", "wing", "ful", "less", "ous", "ive", "ary",
+            "ory", "ual", "ial", "ally", "ibly", "ably", "ously", "ively", "ately",
+        ];
+        // Only reject if the word is all-lowercase (proper nouns are capitalized)
+        if trimmed.chars().next().is_some_and(|c| c.is_uppercase())
+            && trimmed
+                .chars()
+                .skip(1)
+                .all(|c| c.is_lowercase() || !c.is_alphabetic())
+            && common_suffixes.iter().any(|s| lower.ends_with(s))
+        {
+            // Allow words that look like proper nouns from specific languages
+            // (e.g. "Réunion" has a suffix match but is a place)
+            // Check: if the word contains non-ASCII chars, it's likely a proper noun — allow it
+            if trimmed.is_ascii() {
+                return false;
+            }
+        }
+    }
+
     // Reject single-word entities that look like truncated citation references (e.g. "Annu", "Beig", "Plut")
     // These are typically 4-char fragments ending in consonant clusters that aren't real words
     if !lower.contains(' ') && trimmed.len() == 4 && etype == "concept" {
