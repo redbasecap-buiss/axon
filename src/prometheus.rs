@@ -4265,6 +4265,32 @@ impl<'a> Prometheus<'a> {
                 );
             }
         }
+        // Also suspend strategies with very low pattern_weights but too few hypotheses
+        // to appear in the rates map above (catches strategies gated by weight thresholds
+        // that still produce poor results in pattern_weights).
+        self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT pattern_type, confirmations, rejections, weight
+                 FROM pattern_weights
+                 WHERE confirmations + rejections >= 100 AND weight < 0.15",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let pt: String = row.get(0)?;
+                let weight: f64 = row.get(3)?;
+                Ok((pt, weight))
+            })?;
+            for row in rows {
+                let (pt, weight) = row?;
+                if !suspended.contains(&pt) && !rates.contains_key(&pt) {
+                    eprintln!(
+                        "[PROMETHEUS] Auto-suspending strategy '{}' via pattern_weights (weight {:.3} < 0.15, 100+ samples)",
+                        pt, weight
+                    );
+                    suspended.insert(pt);
+                }
+            }
+            Ok(())
+        })?;
         Ok(suspended)
     }
 
@@ -4480,7 +4506,7 @@ impl<'a> Prometheus<'a> {
         // 2c. Hub-spoke hypotheses
         let t1 = std::time::Instant::now();
         let hub_weight = self.get_pattern_weight("hub_spoke")?;
-        if hub_weight >= 0.10 {
+        if hub_weight >= 0.15 && !suspended.contains("hub_spoke") {
             let hub_hyps = self.generate_hypotheses_from_hubs()?;
             eprintln!(
                 "[PROMETHEUS] hubs: {} in {:?}",
@@ -9306,8 +9332,8 @@ impl<'a> Prometheus<'a> {
 
             for (cand_id, shared_set) in &two_hop {
                 let shared_count = shared_set.len();
-                if shared_count < 6 {
-                    continue; // Require at least 6 shared meaningful neighbors (raised from 5 to cut false positives)
+                if shared_count < 8 {
+                    continue; // Require at least 8 shared meaningful neighbors (raised from 6 to cut false positives — 14.8% rate)
                 }
                 let cand = match id_to_entity.get(cand_id) {
                     Some(e) => e,
@@ -9329,8 +9355,8 @@ impl<'a> Prometheus<'a> {
                 } else {
                     0.0
                 };
-                if jaccard < 0.45 {
-                    continue; // Require strong overlap ratio (raised from 0.40 to reduce 85% rejection rate)
+                if jaccard < 0.50 {
+                    continue; // Require strong overlap ratio (raised from 0.45 to reduce 85% rejection rate)
                 }
 
                 // Infer predicate from shared neighbors' edge labels
@@ -11162,12 +11188,12 @@ impl<'a> Prometheus<'a> {
                     if !seen.insert(key) {
                         continue;
                     }
-                    // Require at least 2 shared neighbors (structural evidence)
-                    // Raised from 1 to reduce false positives (2.5% → target 15%+)
+                    // Require at least 3 shared neighbors (structural evidence)
+                    // Raised from 2 to reduce false positives (19.9% → target 30%+)
                     let a_nb = adj.get(&a).cloned().unwrap_or_default();
                     let b_nb = adj.get(&b).cloned().unwrap_or_default();
                     let shared_nbrs: Vec<i64> = a_nb.intersection(&b_nb).copied().collect();
-                    if shared_nbrs.len() < 2 {
+                    if shared_nbrs.len() < 3 {
                         continue;
                     }
 
@@ -12927,18 +12953,18 @@ impl<'a> Prometheus<'a> {
                         continue;
                     }
                     let jaccard = shared as f64 / total as f64;
-                    // Tighter thresholds: need high overlap (>=0.65) and at least 5 shared predicates
-                    // to reduce noise — this strategy had only ~4% confirmation rate with looser thresholds
-                    if jaccard < 0.65 || shared < 5 {
+                    // Tighter thresholds: need high overlap (>=0.75) and at least 6 shared predicates
+                    // to reduce noise — this strategy had only ~12% confirmation rate with looser thresholds
+                    if jaccard < 0.75 || shared < 6 {
                         continue;
                     }
 
                     // Find predicates in A but not B — only transfer prevalent predicates
                     for missing_pred in a_preds.difference(b_preds) {
-                        // Skip predicates that aren't common in this type group (< 25% prevalence)
+                        // Skip predicates that aren't common in this type group (< 40% prevalence)
                         if let Some(prev) = prevalence {
                             let pred_count = prev.get(missing_pred.as_str()).copied().unwrap_or(0);
-                            if group_size >= 10 && (pred_count as f64 / group_size as f64) < 0.25 {
+                            if group_size >= 10 && (pred_count as f64 / group_size as f64) < 0.40 {
                                 continue;
                             }
                         }

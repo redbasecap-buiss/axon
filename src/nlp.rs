@@ -1330,6 +1330,39 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "palacio",
     "portuguese",
     "spaniards",
+    // Added 2026-02-25 (brain cleaner round 3): more noise patterns from DB audit
+    "encyclopedique",
+    "diagrams",
+    "austronesians",
+    "transfers",
+    "officially",
+    "encyclopaedic",
+    "notebook",
+    "journeys",
+    "decade",
+    "decades",
+    "theatrical",
+    "siblings",
+    "predecessors",
+    "successors",
+    "achievements",
+    "accomplishments",
+    "inhabitants",
+    "approximately",
+    "predominantly",
+    "significance",
+    "inhabitants",
+    "geographical",
+    "archaeological",
+    "architectural",
+    "philosophical",
+    "astronomical",
+    "economical",
+    "sociological",
+    "technological",
+    "methodological",
+    "chronological",
+    "ecclesiastical",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -6976,6 +7009,8 @@ fn extract_capitalized_inner(
             // Strip leading words that are blacklisted navigation/UI terms
             // (e.g. "Toggle Einstein" → "Einstein") but NOT org/place indicators
             // since those start valid entities ("University of X", "New York")
+            // NOTE: Only strip ENTITY_BLACKLIST from leading position (not GENERIC_SINGLE_WORDS)
+            // because words like "New", "Old", "Great" legitimately start place names.
             while phrase.len() > 1 {
                 let first_lower = phrase[0].to_lowercase();
                 // Don't strip if it's an org/place indicator (starts valid multi-word entities)
@@ -6993,12 +7028,16 @@ fn extract_capitalized_inner(
             let name = phrase.join(" ");
             if name.len() > 1 {
                 // Skip single capitalized gerunds (e.g. "Choosing", "Applying")
+                // and past participles (e.g. "Established", "Founded")
                 // These are almost always sentence-start verbs, not entities.
                 if !name.contains(' ')
-                    && name.ends_with("ing")
                     && name.len() > 4
                     && name.chars().next().is_some_and(|c| c.is_uppercase())
                     && name.chars().skip(1).all(|c| c.is_lowercase())
+                    && (name.ends_with("ing")
+                        || name.ends_with("ated")
+                        || name.ends_with("ized")
+                        || name.ends_with("ised"))
                 {
                     i = j;
                     continue;
