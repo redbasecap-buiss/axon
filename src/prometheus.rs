@@ -20446,7 +20446,9 @@ impl<'a> Prometheus<'a> {
                     let pred = match (island.entity_type.as_str(), target.entity_type.as_str()) {
                         ("person", "person") => "contemporary_of",
                         ("person", "place") | ("place", "person") => "active_in",
-                        ("person", "organization") | ("organization", "person") => "affiliated_with",
+                        ("person", "organization") | ("organization", "person") => {
+                            "affiliated_with"
+                        }
                         ("person", "concept") => "contributed_to",
                         ("concept", "person") => "pioneered_by",
                         ("organization", "place") | ("place", "organization") => "based_in",
