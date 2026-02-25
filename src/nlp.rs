@@ -1310,6 +1310,26 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "magnetismus",
     "hypothesen",
     "toyotism",
+    // Added 2026-02-25 (brain cleaner): generic words, ordinals, demonyms
+    "myths",
+    "gospel",
+    "pebbles",
+    "bloom",
+    "particles",
+    "presentation",
+    "frequentist",
+    "generation",
+    "cyclic",
+    "fourth",
+    "ninth",
+    "float64",
+    "ambassadors",
+    "deutsch",
+    "patronato",
+    "musée",
+    "palacio",
+    "portuguese",
+    "spaniards",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -4084,6 +4104,17 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
                 return false;
             }
         }
+        // Reject "Noun The Noun" mid-entity patterns — almost always sentence fragments
+        // glued together (e.g. "Ecuador The Galápagos Islands", "CNN The Brightest Blast Sky")
+        // Exception: well-known patterns like "Alexander The Great", "Pliny the Elder"
+        for (idx, w) in words.iter().enumerate() {
+            if idx > 0 && idx < words.len() - 1 && (*w == "The" || *w == "the") {
+                // Allow "X the Y" only for 3-word entities (likely "Pliny the Elder" style)
+                if words.len() > 3 {
+                    return false;
+                }
+            }
+        }
         // Also reject "Something After Something" patterns (cross-section title merges)
         for (idx, w) in words.iter().enumerate() {
             if idx > 0
@@ -4433,6 +4464,19 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             "late",
             "law",
             "domestic",
+            // Sentence-start words that create false multi-word entities
+            "protect",
+            "biggest",
+            "earliest",
+            "modern",
+            "total",
+            "positive",
+            "negative",
+            "cipher",
+            "design",
+            "eruption",
+            "pulsar",
+            "galaxy",
         ];
         if lower.contains(' ') && leading_verbs.contains(&first_word) {
             return false;
@@ -6233,7 +6277,13 @@ fn classify_entity_type(name: &str) -> &'static str {
         }
     }
 
-    // Check for organization indicators (last word or any word)
+    // Check for organization indicators (first word for "University of X" patterns, last word, any word)
+    if let Some(first) = words.first() {
+        let clean_first = first.trim_matches(|c: char| !c.is_alphanumeric());
+        if ORG_INDICATORS.contains(&clean_first) && words.len() >= 2 {
+            return "organization";
+        }
+    }
     if let Some(last) = words.last() {
         let clean = last.trim_matches(|c: char| !c.is_alphanumeric());
         if ORG_INDICATORS.contains(&clean) {

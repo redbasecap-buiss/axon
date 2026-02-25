@@ -1816,44 +1816,58 @@ impl<'a> Prometheus<'a> {
         candidates.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
         candidates.truncate(1000);
 
-        let mut patterns = Vec::new();
-        for i in 0..candidates.len() {
-            for j in (i + 1)..candidates.len() {
-                let (a, sa) = candidates[i];
-                let (b, sb) = candidates[j];
-                let key = if a < b { (a, b) } else { (b, a) };
-                if connected.contains(&key) {
-                    continue;
-                }
-                let joint = sa.intersection(sb).count() as f64;
-                if joint < 1.0 {
-                    continue;
-                }
-                let p_ab = joint / n;
-                let p_a = sa.len() as f64 / n;
-                let p_b = sb.len() as f64 / n;
-                let pmi = (p_ab / (p_a * p_b)).log2();
-                if pmi >= min_pmi {
-                    let a_name = self.entity_name(a)?;
-                    let b_name = self.entity_name(b)?;
-                    patterns.push(Pattern {
-                        id: 0,
-                        pattern_type: PatternType::CoOccurrence,
-                        entities_involved: vec![a_name.clone(), b_name.clone()],
-                        frequency: joint as i64,
-                        last_seen: now_str(),
-                        description: format!(
-                            "{} and {} have PMI={:.2} ({} shared sources) — statistically surprising co-occurrence",
-                            a_name, b_name, pmi, joint as i64
-                        ),
-                    });
+        // Build inverted index: source_url → list of candidate indices
+        let mut source_to_cands: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (idx, &(_, sources)) in candidates.iter().enumerate() {
+            for src in sources {
+                source_to_cands.entry(src.as_str()).or_default().push(idx);
+            }
+        }
+
+        // Count co-occurrences via inverted index (avoids O(n²) full scan)
+        let mut pair_joint: HashMap<(usize, usize), usize> = HashMap::new();
+        for posting in source_to_cands.values() {
+            if posting.len() < 2 || posting.len() > 200 {
+                continue;
+            }
+            for i in 0..posting.len() {
+                for j in (i + 1)..posting.len() {
+                    let key = (posting[i].min(posting[j]), posting[i].max(posting[j]));
+                    *pair_joint.entry(key).or_insert(0) += 1;
                 }
             }
         }
-        patterns.sort_by(|a, b| {
-            // Sort by PMI (embedded in description), approximate by frequency for now
-            b.frequency.cmp(&a.frequency)
-        });
+
+        let mut patterns = Vec::new();
+        for ((i, j), joint_count) in &pair_joint {
+            let (a, sa) = candidates[*i];
+            let (b, sb) = candidates[*j];
+            let key = if a < b { (a, b) } else { (b, a) };
+            if connected.contains(&key) {
+                continue;
+            }
+            let joint = *joint_count as f64;
+            let p_ab = joint / n;
+            let p_a = sa.len() as f64 / n;
+            let p_b = sb.len() as f64 / n;
+            let pmi = (p_ab / (p_a * p_b)).log2();
+            if pmi >= min_pmi {
+                let a_name = self.entity_name(a)?;
+                let b_name = self.entity_name(b)?;
+                patterns.push(Pattern {
+                    id: 0,
+                    pattern_type: PatternType::CoOccurrence,
+                    entities_involved: vec![a_name.clone(), b_name.clone()],
+                    frequency: joint as i64,
+                    last_seen: now_str(),
+                    description: format!(
+                        "{} and {} have PMI={:.2} ({} shared sources) — statistically surprising co-occurrence",
+                        a_name, b_name, pmi, joint as i64
+                    ),
+                });
+            }
+        }
+        patterns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
         patterns.truncate(30);
         Ok(patterns)
     }
@@ -3478,8 +3492,10 @@ impl<'a> Prometheus<'a> {
             ) {
                 if !predicate_type_compatible(&h.predicate, &se.entity_type, &oe.entity_type) {
                     h.status = HypothesisStatus::Rejected;
-                    h.evidence_against
-                        .push(format!("Type mismatch: {} ({}) vs {} ({})", h.subject, se.entity_type, h.object, oe.entity_type));
+                    h.evidence_against.push(format!(
+                        "Type mismatch: {} ({}) vs {} ({})",
+                        h.subject, se.entity_type, h.object, oe.entity_type
+                    ));
                     return Ok(());
                 }
             }
@@ -4614,6 +4630,17 @@ impl<'a> Prometheus<'a> {
             let cf_hyps = self.generate_hypotheses_from_co_facts()?;
             eprintln!("[PROMETHEUS] co_fact: {} hypotheses", cf_hyps.len());
             all_hypotheses.extend(cf_hyps);
+        }
+
+        // 2ee. Type-level semantic fingerprint (softer similarity via (pred, obj_type) patterns)
+        let tlf_weight = self.get_pattern_weight("type_level_fingerprint")?;
+        if tlf_weight >= 0.05 {
+            let tlf_hyps = self.generate_hypotheses_from_type_level_fingerprint()?;
+            eprintln!(
+                "[PROMETHEUS] type_level_fingerprint: {} hypotheses",
+                tlf_hyps.len()
+            );
+            all_hypotheses.extend(tlf_hyps);
         }
 
         // 2aa. Structural similarity (typed neighborhood overlap — not directly connected)
@@ -6851,8 +6878,7 @@ impl<'a> Prometheus<'a> {
                 let subj_ent = self.brain.get_entity_by_name(&h.subject)?;
                 let obj_ent = self.brain.get_entity_by_name(&h.object)?;
                 if let (Some(ref se), Some(ref oe)) = (&subj_ent, &obj_ent) {
-                    if !predicate_type_compatible(&h.predicate, &se.entity_type, &oe.entity_type)
-                    {
+                    if !predicate_type_compatible(&h.predicate, &se.entity_type, &oe.entity_type) {
                         self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
                         self.record_outcome(&h.pattern_source, false)?;
                         rejected += 1;
@@ -8493,6 +8519,113 @@ impl<'a> Prometheus<'a> {
                     updated += count as usize;
                 }
             }
+        }
+
+        // Phase 3: refine `active_in` to more specific predicates based on entity types.
+        // `active_in` is overly generic (second most common predicate) and loses information.
+        let id_to_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        for r in &relations {
+            if r.predicate != "active_in" {
+                continue;
+            }
+            let subj_type = id_to_type
+                .get(&r.subject_id)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            let obj_type = id_to_type
+                .get(&r.object_id)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            let obj_name = id_to_name
+                .get(&r.object_id)
+                .copied()
+                .unwrap_or("")
+                .to_lowercase();
+
+            let new_pred = match (subj_type, obj_type) {
+                ("person", "organization") => Some("member_of"),
+                ("person", "place") => Some("based_in"),
+                ("person", "concept") => {
+                    // Distinguish: if concept looks like a field/discipline → "works_in"
+                    // If it looks like a movement/era → "participated_in"
+                    if obj_name.ends_with("ism")
+                        || obj_name.ends_with("ics")
+                        || obj_name.ends_with("ology")
+                        || obj_name.ends_with("istry")
+                        || obj_name.ends_with("nomy")
+                        || obj_name.contains("science")
+                        || obj_name.contains("theory")
+                        || obj_name.contains("engineering")
+                    {
+                        Some("works_in")
+                    } else if obj_name.contains("war")
+                        || obj_name.contains("revolution")
+                        || obj_name.contains("movement")
+                        || obj_name.contains("campaign")
+                    {
+                        Some("participated_in")
+                    } else {
+                        None // keep active_in for ambiguous concepts
+                    }
+                }
+                ("organization", "place") => Some("based_in"),
+                ("organization", "concept") => Some("operates_in"),
+                ("technology", "concept") => Some("applied_in"),
+                _ => None,
+            };
+
+            if let Some(np) = new_pred {
+                self.brain.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE relations SET predicate = ?1 WHERE id = ?2",
+                        params![np, r.id],
+                    )?;
+                    Ok(())
+                })?;
+                updated += 1;
+            }
+        }
+
+        // Phase 4: prune contemporary_of with confidence < 0.4 where both entities
+        // have ≤ 3 non-contemporary relations (weak evidence, inflates graph noise).
+        {
+            let mut degree: HashMap<i64, usize> = HashMap::new();
+            for r in &relations {
+                if r.predicate != "contemporary_of" {
+                    *degree.entry(r.subject_id).or_insert(0) += 1;
+                    *degree.entry(r.object_id).or_insert(0) += 1;
+                }
+            }
+            let pruned = self.brain.with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, subject_id, object_id, confidence FROM relations WHERE predicate = 'contemporary_of' AND confidence < 0.4"
+                )?;
+                let rows: Vec<(i64, i64, i64, f64)> = stmt
+                    .query_map([], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                let mut count = 0usize;
+                eprintln!("[PROMETHEUS] Phase 4: found {} contemporary_of candidates (conf < 0.4)", rows.len());
+                for (id, sid, oid, _conf) in &rows {
+                    let s_deg = degree.get(sid).copied().unwrap_or(0);
+                    let o_deg = degree.get(oid).copied().unwrap_or(0);
+                    if s_deg <= 3 && o_deg <= 3 {
+                        conn.execute("DELETE FROM relations WHERE id = ?1", params![id])?;
+                        count += 1;
+                    }
+                }
+                Ok(count)
+            })?;
+            if pruned > 0 {
+                eprintln!(
+                    "[PROMETHEUS] Phase 4: pruned {} weak contemporary_of relations (conf < 0.4, both entities ≤3 other rels)",
+                    pruned
+                );
+            }
+            updated += pruned;
         }
 
         Ok(updated)
@@ -11783,6 +11916,75 @@ impl<'a> Prometheus<'a> {
                 status: HypothesisStatus::Proposed,
                 discovered_at: now_str(),
                 pattern_source: "semantic_fingerprint".to_string(),
+            });
+        }
+        Ok(hypotheses)
+    }
+
+    /// Generate hypotheses from type-level semantic fingerprint similarity.
+    /// Entities sharing the same (predicate, object_type) patterns are likely
+    /// related even if they connect to different specific entities.
+    pub fn generate_hypotheses_from_type_level_fingerprint(&self) -> Result<Vec<Hypothesis>> {
+        let similar = crate::graph::type_level_fingerprint_similarity(self.brain, 3, 100)?;
+        let meaningful = meaningful_ids(self.brain)?;
+        let entities = self.brain.all_entities()?;
+        let id_name: HashMap<i64, &str> =
+            entities.iter().map(|e| (e.id, e.name.as_str())).collect();
+        let id_type: HashMap<i64, &str> = entities
+            .iter()
+            .map(|e| (e.id, e.entity_type.as_str()))
+            .collect();
+
+        let relations = self.brain.all_relations()?;
+        let mut connected: HashSet<(i64, i64)> = HashSet::new();
+        for r in &relations {
+            let key = if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            };
+            connected.insert(key);
+        }
+
+        let mut hypotheses = Vec::new();
+        for (a, b, shared, jaccard) in &similar {
+            if !meaningful.contains(a) || !meaningful.contains(b) {
+                continue;
+            }
+            let key = if a < b { (*a, *b) } else { (*b, *a) };
+            if connected.contains(&key) {
+                continue;
+            }
+            let a_name = id_name.get(a).copied().unwrap_or("?");
+            let b_name = id_name.get(b).copied().unwrap_or("?");
+            if is_noise_name(a_name) || is_noise_name(b_name) {
+                continue;
+            }
+            let a_type = id_type.get(a).copied().unwrap_or("?");
+            let b_type = id_type.get(b).copied().unwrap_or("?");
+            let predicate = infer_predicate(a_type, b_type, None);
+            hypotheses.push(Hypothesis {
+                id: 0,
+                subject: a_name.to_string(),
+                predicate: predicate.to_string(),
+                object: b_name.to_string(),
+                confidence: 0.35 + (*jaccard * 0.35).min(0.35),
+                evidence_for: vec![format!(
+                    "Type-level fingerprint: {} shared (pred,obj_type) patterns, Jaccard {:.2}",
+                    shared, jaccard
+                )],
+                evidence_against: vec![],
+                reasoning_chain: vec![
+                    format!(
+                        "{} and {} share {} (predicate, object_type) patterns",
+                        a_name, b_name, shared
+                    ),
+                    format!("Type-level Jaccard similarity: {:.2}", jaccard),
+                    "Entities with parallel relational structures are likely related".to_string(),
+                ],
+                status: HypothesisStatus::Proposed,
+                discovered_at: now_str(),
+                pattern_source: "type_level_fingerprint".to_string(),
             });
         }
         Ok(hypotheses)
@@ -22699,15 +22901,15 @@ impl<'a> Prometheus<'a> {
                     connected.insert(eid);
                     reconnected += 1;
                     group_count += 1;
-                    if group_count >= 30 {
+                    if group_count >= 80 {
                         break;
                     }
                 }
-                if reconnected >= 1500 {
+                if reconnected >= 2000 {
                     break;
                 }
             }
-            if reconnected >= 1500 {
+            if reconnected >= 2000 {
                 break;
             }
         }
@@ -26054,11 +26256,7 @@ fn predicate_type_compatible(predicate: &str, subj_type: &str, obj_type: &str) -
     ];
 
     // Predicates that make no sense between concepts/works and organisations
-    const ORG_CONCEPT_BLOCKLIST: &[&str] = &[
-        "partner_of",
-        "affiliated_with",
-        "has_member",
-    ];
+    const ORG_CONCEPT_BLOCKLIST: &[&str] = &["partner_of", "affiliated_with", "has_member"];
 
     let st = subj_type.to_lowercase();
     let ot = obj_type.to_lowercase();
@@ -26066,18 +26264,50 @@ fn predicate_type_compatible(predicate: &str, subj_type: &str, obj_type: &str) -
     // Normalise to broad categories
     let broad = |t: &str| -> &str {
         match t {
-            t if t.contains("person") || t == "scientist" || t == "leader"
-                || t == "philosopher" || t == "author" || t == "artist"
-                || t == "ruler" || t == "military" || t == "politician"
-                || t == "explorer" || t == "mathematician" || t == "historian" => "person",
-            t if t.contains("org") || t.contains("institution") || t.contains("company")
-                || t.contains("university") || t.contains("school")
-                || t.contains("church") || t.contains("empire") => "org",
-            t if t.contains("place") || t.contains("location") || t.contains("city")
-                || t.contains("country") || t.contains("region") => "place",
-            t if t.contains("concept") || t.contains("theory") || t.contains("field")
-                || t.contains("event") || t.contains("work") || t.contains("book")
-                || t.contains("journal") || t.contains("publication") => "concept",
+            t if t.contains("person")
+                || t == "scientist"
+                || t == "leader"
+                || t == "philosopher"
+                || t == "author"
+                || t == "artist"
+                || t == "ruler"
+                || t == "military"
+                || t == "politician"
+                || t == "explorer"
+                || t == "mathematician"
+                || t == "historian" =>
+            {
+                "person"
+            }
+            t if t.contains("org")
+                || t.contains("institution")
+                || t.contains("company")
+                || t.contains("university")
+                || t.contains("school")
+                || t.contains("church")
+                || t.contains("empire") =>
+            {
+                "org"
+            }
+            t if t.contains("place")
+                || t.contains("location")
+                || t.contains("city")
+                || t.contains("country")
+                || t.contains("region") =>
+            {
+                "place"
+            }
+            t if t.contains("concept")
+                || t.contains("theory")
+                || t.contains("field")
+                || t.contains("event")
+                || t.contains("work")
+                || t.contains("book")
+                || t.contains("journal")
+                || t.contains("publication") =>
+            {
+                "concept"
+            }
             _ => "unknown",
         }
     };

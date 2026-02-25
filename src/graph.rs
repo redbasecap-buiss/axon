@@ -2881,6 +2881,106 @@ pub fn semantic_fingerprint_similarity(
 
 /// Predicate co-occurrence matrix: which predicates tend to appear together on the same entity.
 /// Returns (pred_a, pred_b, co_occurrence_count, pmi) sorted by PMI desc.
+/// Type-level semantic fingerprint similarity: entities sharing the same
+/// (predicate, object_type) patterns. Softer than exact fingerprint —
+/// catches entities with parallel relational structures even when they
+/// connect to different specific entities.
+pub fn type_level_fingerprint_similarity(
+    brain: &Brain,
+    min_shared: usize,
+    limit: usize,
+) -> Result<Vec<(i64, i64, usize, f64)>, rusqlite::Error> {
+    let relations = brain.all_relations()?;
+    let entities = brain.all_entities()?;
+    let id_type: HashMap<i64, &str> = entities
+        .iter()
+        .map(|e| (e.id, e.entity_type.as_str()))
+        .collect();
+
+    // Build type-level fingerprint: set of (predicate, object_type) per entity
+    let mut fingerprints: HashMap<i64, HashSet<(String, String)>> = HashMap::new();
+    for r in &relations {
+        if let Some(&obj_type) = id_type.get(&r.object_id) {
+            fingerprints
+                .entry(r.subject_id)
+                .or_default()
+                .insert((r.predicate.clone(), obj_type.to_string()));
+        }
+    }
+
+    // Only consider entities with enough fingerprint entries
+    let candidates: Vec<(i64, &HashSet<(String, String)>)> = fingerprints
+        .iter()
+        .filter(|(_, fp)| fp.len() >= min_shared)
+        .map(|(&id, fp)| (id, fp))
+        .collect();
+
+    // Inverted index: (pred, obj_type) → list of candidate indices
+    let mut inv: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    for (idx, &(_, fp)) in candidates.iter().enumerate() {
+        for key in fp {
+            inv.entry(key.clone()).or_default().push(idx);
+        }
+    }
+
+    // Count shared type-level patterns per pair
+    let mut pair_shared: HashMap<(usize, usize), usize> = HashMap::new();
+    for posting in inv.values() {
+        if posting.len() < 2 || posting.len() > 200 {
+            continue;
+        }
+        for i in 0..posting.len() {
+            for j in (i + 1)..posting.len() {
+                let key = (posting[i].min(posting[j]), posting[i].max(posting[j]));
+                *pair_shared.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Filter by min_shared threshold and compute Jaccard
+    let mut results = Vec::new();
+    // Pre-compute direct edges to exclude already-connected pairs
+    let direct: HashSet<(i64, i64)> = relations
+        .iter()
+        .map(|r| {
+            if r.subject_id < r.object_id {
+                (r.subject_id, r.object_id)
+            } else {
+                (r.object_id, r.subject_id)
+            }
+        })
+        .collect();
+
+    for ((i, j), shared) in &pair_shared {
+        if *shared >= min_shared {
+            let (a, fp_a) = candidates[*i];
+            let (b, fp_b) = candidates[*j];
+            // Skip already-connected pairs
+            let edge_key = if a < b { (a, b) } else { (b, a) };
+            if direct.contains(&edge_key) {
+                continue;
+            }
+            // Skip same entity
+            if a == b {
+                continue;
+            }
+            let union_size = fp_a.union(fp_b).count();
+            let jaccard = if union_size > 0 {
+                *shared as f64 / union_size as f64
+            } else {
+                0.0
+            };
+            // Only include pairs with meaningful similarity
+            if jaccard >= 0.15 {
+                results.push((a, b, *shared, jaccard));
+            }
+        }
+    }
+    results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    Ok(results)
+}
+
 pub fn predicate_co_occurrence(
     brain: &Brain,
     min_count: usize,
