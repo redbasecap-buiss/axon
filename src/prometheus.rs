@@ -3469,6 +3469,22 @@ impl<'a> Prometheus<'a> {
             }
         }
 
+        // Semantic coherence gate: reject type-incompatible predicates
+        // regardless of confidence score
+        if h.object != "?" {
+            if let (Some(ref se), Some(ref oe)) = (
+                self.brain.get_entity_by_name(&h.subject)?,
+                self.brain.get_entity_by_name(&h.object)?,
+            ) {
+                if !predicate_type_compatible(&h.predicate, &se.entity_type, &oe.entity_type) {
+                    h.status = HypothesisStatus::Rejected;
+                    h.evidence_against
+                        .push(format!("Type mismatch: {} ({}) vs {} ({})", h.subject, se.entity_type, h.object, oe.entity_type));
+                    return Ok(());
+                }
+            }
+        }
+
         // Update status based on confidence (use defined thresholds)
         let was_confirmed = h.status == HypothesisStatus::Confirmed;
         if h.confidence >= CONFIRMATION_THRESHOLD {
@@ -6828,6 +6844,20 @@ impl<'a> Prometheus<'a> {
                     self.record_outcome(&h.pattern_source, false)?;
                     rejected += 1;
                     continue;
+                }
+
+                // Semantic coherence: reject predicates that require matching
+                // entity types when the types actually differ
+                let subj_ent = self.brain.get_entity_by_name(&h.subject)?;
+                let obj_ent = self.brain.get_entity_by_name(&h.object)?;
+                if let (Some(ref se), Some(ref oe)) = (&subj_ent, &obj_ent) {
+                    if !predicate_type_compatible(&h.predicate, &se.entity_type, &oe.entity_type)
+                    {
+                        self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                        self.record_outcome(&h.pattern_source, false)?;
+                        rejected += 1;
+                        continue;
+                    }
                 }
 
                 let path = crate::graph::shortest_path(self.brain, &h.subject, &h.object)?;
@@ -25992,6 +26022,95 @@ fn is_type_incompatible(subject_type: &str, object_type: &str, predicate: &str) 
     }
 
     false
+}
+
+/// Check whether a predicate makes semantic sense given the entity types of
+/// subject and object.  Returns `false` for combinations that are almost
+/// certainly NLP/structural noise (e.g. `contemporary_of` between a person
+/// and a concept, or `partner_of` between a book and an organisation).
+fn predicate_type_compatible(predicate: &str, subj_type: &str, obj_type: &str) -> bool {
+    // Predicates that require both entities to be of the same broad category
+    const SAME_TYPE_PREDICATES: &[&str] = &[
+        "contemporary_of",
+        "rival_of",
+        "sibling_of",
+        "spouse_of",
+        "colleague_of",
+        "ally_of",
+        "opponent_of",
+        "predecessor_of",
+        "successor_of",
+    ];
+
+    // Predicates that require at least one entity to be a person
+    const PERSON_REQUIRED: &[&str] = &[
+        "born_in",
+        "died_in",
+        "studied_at",
+        "worked_at",
+        "educated_at",
+        "served_in",
+        "married",
+    ];
+
+    // Predicates that make no sense between concepts/works and organisations
+    const ORG_CONCEPT_BLOCKLIST: &[&str] = &[
+        "partner_of",
+        "affiliated_with",
+        "has_member",
+    ];
+
+    let st = subj_type.to_lowercase();
+    let ot = obj_type.to_lowercase();
+
+    // Normalise to broad categories
+    let broad = |t: &str| -> &str {
+        match t {
+            t if t.contains("person") || t == "scientist" || t == "leader"
+                || t == "philosopher" || t == "author" || t == "artist"
+                || t == "ruler" || t == "military" || t == "politician"
+                || t == "explorer" || t == "mathematician" || t == "historian" => "person",
+            t if t.contains("org") || t.contains("institution") || t.contains("company")
+                || t.contains("university") || t.contains("school")
+                || t.contains("church") || t.contains("empire") => "org",
+            t if t.contains("place") || t.contains("location") || t.contains("city")
+                || t.contains("country") || t.contains("region") => "place",
+            t if t.contains("concept") || t.contains("theory") || t.contains("field")
+                || t.contains("event") || t.contains("work") || t.contains("book")
+                || t.contains("journal") || t.contains("publication") => "concept",
+            _ => "unknown",
+        }
+    };
+
+    let sb = broad(&st);
+    let ob = broad(&ot);
+
+    // If either type is unknown, allow (can't validate)
+    if sb == "unknown" || ob == "unknown" {
+        return true;
+    }
+
+    // Same-type predicates: reject if broad categories differ
+    if SAME_TYPE_PREDICATES.contains(&predicate) && sb != ob {
+        return false;
+    }
+
+    // Person-required predicates: reject if neither entity is a person
+    if PERSON_REQUIRED.contains(&predicate) && sb != "person" && ob != "person" {
+        return false;
+    }
+
+    // Block nonsensical concept-org pairings
+    if ORG_CONCEPT_BLOCKLIST.contains(&predicate) {
+        if (sb == "concept" && ob == "org") || (sb == "org" && ob == "concept") {
+            return false;
+        }
+        if sb == "concept" && ob == "concept" {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn predicates_similar(a: &str, b: &str) -> bool {
