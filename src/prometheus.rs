@@ -5266,6 +5266,10 @@ impl<'a> Prometheus<'a> {
         // Reclassify two-word compound concept persons (e.g., "Aneutronic Fusion")
         let compound_reclassified = self.reclassify_compound_concept_persons().unwrap_or(0);
 
+        // Reclassify connected person entities with obvious geographic/institutional suffixes
+        let geo_connected_reclassified =
+            self.reclassify_geographic_persons_connected().unwrap_or(0);
+
         // Reclassify en-dash compound names (e.g., "Calabi–Yau" → concept)
         let endash_reclassified = self.reclassify_endash_compound_islands().unwrap_or(0);
 
@@ -5491,7 +5495,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} graph-surname-reclassified, {} common-word-purged, {} surname-concepts-reclassified, {} common-english-person-purged, {} geo-person-reclassified, {} place-region-reclassified, {} compound-concept-reclassified, {} endash-reclassified, {} ancient-islands-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} minute-cohort reconnected, {} large-cohort-type reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} hv-cohort-reconnected, {} surname-reconnected, {} source-url-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} graph-surname-reclassified, {} common-word-purged, {} surname-concepts-reclassified, {} common-english-person-purged, {} geo-person-reclassified, {} place-region-reclassified, {} compound-concept-reclassified, {} geo-connected-reclassified, {} endash-reclassified, {} ancient-islands-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} minute-cohort reconnected, {} large-cohort-type reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} hv-cohort-reconnected, {} surname-reconnected, {} source-url-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -5577,6 +5581,7 @@ impl<'a> Prometheus<'a> {
             geo_reclassified,
             place_region_reclassified,
             compound_reclassified,
+            geo_connected_reclassified,
             endash_reclassified,
             ancient_purged,
             abbreviation_merged,
@@ -11062,15 +11067,23 @@ impl<'a> Prometheus<'a> {
                     let a_name = self.entity_name(a)?;
                     let b_name = self.entity_name(b)?;
                     let bridge_name = self.entity_name(node)?;
+
+                    // Count shared neighbours for confidence scaling
+                    let a_nb = adj.get(&a).cloned().unwrap_or_default();
+                    let b_nb = adj.get(&b).cloned().unwrap_or_default();
+                    let shared_count = a_nb.intersection(&b_nb).count();
+                    // Base 0.40, +0.05 per shared neighbour (cap at 0.60)
+                    let base_conf = (0.40 + 0.05 * shared_count as f64).min(0.60);
+
                     hypotheses.push(Hypothesis {
                         id: 0,
                         subject: a_name.clone(),
                         predicate: "related_to".to_string(),
                         object: b_name.clone(),
-                        confidence: 0.45,
+                        confidence: base_conf,
                         evidence_for: vec![format!(
-                            "Both connected to bridge entity '{}' but in different communities ({}≠{})",
-                            bridge_name, ca, cb
+                            "Both connected to bridge entity '{}' but in different communities ({}≠{}), {} shared neighbours",
+                            bridge_name, ca, cb, shared_count
                         )],
                         evidence_against: vec![],
                         reasoning_chain: vec![
@@ -23332,6 +23345,122 @@ impl<'a> Prometheus<'a> {
         if reclassified > 0 {
             eprintln!(
                 "  [compound-concept-reclassify] reclassified {} two-word compound concept persons",
+                reclassified
+            );
+        }
+        Ok(reclassified)
+    }
+
+    /// Reclassify **connected** person entities whose names contain strong geographic
+    /// or institutional markers (Region, Area, Heights, University, etc.).
+    /// Unlike `reclassify_geographic_person_islands` which only handles isolated entities,
+    /// this catches misclassified entities that already have relations, preventing
+    /// nonsensical hypotheses like "Schengen Area related_to Person".
+    pub fn reclassify_geographic_persons_connected(&self) -> Result<usize> {
+        // Suffixes that unambiguously indicate places (not person names)
+        const PLACE_SUFFIXES: &[&str] = &[
+            " Region",
+            " Area",
+            " Heights",
+            " Oasis",
+            " Valley",
+            " Island",
+            " Islands",
+            " Basin",
+            " Peninsula",
+            " Mountain",
+            " Mountains",
+            " Desert",
+            " Forest",
+            " Lake",
+            " River",
+            " Bay",
+            " Gulf",
+            " Strait",
+            " Channel",
+            " Park",
+            " Garden",
+            " Gardens",
+            " Province",
+            " County",
+            " District",
+            " Prefecture",
+            " Territory",
+            " Coast",
+            " Plain",
+            " Plains",
+            " Plateau",
+            " Glacier",
+            " Reef",
+            " Atoll",
+            " Canyon",
+            " Gorge",
+            " Fjord",
+            " Lagoon",
+            " Delta",
+            " Steppe",
+            " Tundra",
+            " Savanna",
+            " Savannah",
+            " Patagonia",
+        ];
+        // Suffixes that indicate organizations
+        const ORG_SUFFIXES: &[&str] = &[
+            " University",
+            " Institute",
+            " College",
+            " School",
+            " Museum",
+            " Academy",
+            " Foundation",
+            " Laboratory",
+            " Hospital",
+            " Corporation",
+            " Association",
+            " Society",
+            " Committee",
+            " Commission",
+            " Agency",
+            " Bureau",
+            " Ministry",
+            " Department",
+            " Conclave",
+        ];
+
+        let mut reclassified = 0usize;
+        self.brain.with_conn(|conn| {
+            // Find person entities matching place suffixes
+            let mut stmt =
+                conn.prepare("SELECT id, name FROM entities WHERE entity_type = 'person'")?;
+            let entities: Vec<(i64, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            for (id, name) in &entities {
+                let is_place = PLACE_SUFFIXES.iter().any(|s| name.ends_with(s));
+                let is_org = ORG_SUFFIXES.iter().any(|s| name.ends_with(s));
+
+                if is_place {
+                    conn.execute(
+                        "UPDATE entities SET entity_type = 'place' WHERE id = ?1",
+                        params![id],
+                    )?;
+                    reclassified += 1;
+                } else if is_org {
+                    conn.execute(
+                        "UPDATE entities SET entity_type = 'organization' WHERE id = ?1",
+                        params![id],
+                    )?;
+                    reclassified += 1;
+                }
+            }
+            Ok(())
+        })?;
+
+        if reclassified > 0 {
+            eprintln!(
+                "  [geo-connected-reclassify] reclassified {} connected person entities to place/org",
                 reclassified
             );
         }
