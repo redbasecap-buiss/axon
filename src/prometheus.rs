@@ -3583,7 +3583,7 @@ impl<'a> Prometheus<'a> {
             }
         }
 
-        // Predicate frequency signal (pred_count reused by concentration penalty below)
+        // Predicate frequency signal (pred_count reused by concentration penalty and type-dist check)
         let pred_count: i64 = self
             .brain
             .with_conn(|conn| {
@@ -3607,6 +3607,38 @@ impl<'a> Prometheus<'a> {
                     h.predicate, pred_count
                 ));
                 h.confidence = (h.confidence - 0.04).max(0.0);
+            }
+        }
+
+        // Predicate-type distribution check: if this predicate has never been
+        // used between these entity types in the graph, it's likely spurious.
+        if have_both && pred_count > 5 {
+            let se = s_ent.as_ref().unwrap();
+            let oe = o_ent.as_ref().unwrap();
+            let type_pair_count: i64 = self
+                .brain
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM relations r
+                         JOIN entities s ON r.subject_id = s.id
+                         JOIN entities o ON r.object_id = o.id
+                         WHERE r.predicate = ?1
+                         AND ((s.entity_type = ?2 AND o.entity_type = ?3)
+                           OR (s.entity_type = ?3 AND o.entity_type = ?2))",
+                        params![h.predicate, se.entity_type, oe.entity_type],
+                        |row| row.get(0),
+                    )
+                })
+                .unwrap_or(0);
+            if type_pair_count == 0 {
+                h.evidence_against.push(format!(
+                    "Predicate '{}' never used between {}↔{} types (0/{} instances)",
+                    h.predicate, se.entity_type, oe.entity_type, pred_count
+                ));
+                h.confidence = (h.confidence - 0.12).max(0.0);
+            } else if type_pair_count >= 5 {
+                apply_boost(&mut total_boost, 0.03);
+                h.confidence = (base_confidence + total_boost).min(1.0);
             }
         }
 
@@ -4808,10 +4840,12 @@ impl<'a> Prometheus<'a> {
             all_hypotheses.extend(rs_hyps);
         }
 
-        // 2o. Predicate pattern transfer (entities with similar predicate profiles missing a predicate)
-        // Auto-suspended if confirmation rate < 20% over 50+ samples
-        let ppt_weight = self.get_pattern_weight("predicate_transfer")?;
-        if ppt_weight >= 0.05 && !suspended.contains("predicate_transfer") {
+        // 2o. Predicate pattern transfer — DISABLED (12% confirmation rate over 184 samples)
+        // The strategy predicts B→pred→specific_object based on A having that relation,
+        // but the specific object is almost always wrong. Would need to predict B→pred→?
+        // (unknown object) to be useful, but that's not validatable.
+        // Keeping the code but skipping execution.
+        if false {
             let ppt_hyps = self.generate_hypotheses_from_predicate_transfer()?;
             eprintln!(
                 "[PROMETHEUS] predicate_transfer: {} hypotheses",
@@ -11471,12 +11505,13 @@ impl<'a> Prometheus<'a> {
                     if !seen.insert(key) {
                         continue;
                     }
-                    // Require at least 5 shared neighbors AND Jaccard neighbor
-                    // overlap ≥ 0.15 to reduce false positives (was 19.7% conf rate)
+                    // Require at least 8 shared neighbors AND Jaccard neighbor
+                    // overlap ≥ 0.25 to reduce false positives (was 19.8% conf rate
+                    // with 5/0.15 thresholds)
                     let a_nb = adj.get(&a).cloned().unwrap_or_default();
                     let b_nb = adj.get(&b).cloned().unwrap_or_default();
                     let shared_nbrs: Vec<i64> = a_nb.intersection(&b_nb).copied().collect();
-                    if shared_nbrs.len() < 5 {
+                    if shared_nbrs.len() < 8 {
                         continue;
                     }
                     let union_size = a_nb.union(&b_nb).count();
@@ -11485,7 +11520,7 @@ impl<'a> Prometheus<'a> {
                     } else {
                         0.0
                     };
-                    if nbr_jaccard < 0.15 {
+                    if nbr_jaccard < 0.25 {
                         continue;
                     }
 
@@ -11514,10 +11549,18 @@ impl<'a> Prometheus<'a> {
                         .map(|(p, _)| p)
                         .unwrap_or_else(|| "collaborated_with".to_string());
 
+                    // Skip vague predicates — community_homophily's main failure mode
+                    if inferred_pred == "related_to"
+                        || inferred_pred == "associated_with"
+                        || inferred_pred == "contemporary_of"
+                    {
+                        continue;
+                    }
+
                     let a_name = self.entity_name(a)?;
                     let b_name = self.entity_name(b)?;
                     let shared = shared_nbrs.len();
-                    let conf = (0.50 + 0.04 * shared.min(8) as f64 + nbr_jaccard * 0.15).min(0.85);
+                    let conf = (0.50 + 0.03 * shared.min(10) as f64 + nbr_jaccard * 0.20).min(0.80);
 
                     hypotheses.push(Hypothesis {
                         id: 0,
@@ -12273,8 +12316,12 @@ impl<'a> Prometheus<'a> {
                 continue;
             }
 
-            // Require 3+ paths for cross-type pairs (higher bar for heterogeneous connections)
+            // Require 3+ paths for cross-type pairs, 4+ for same-type
+            // (tightened from 63.5% confirmation rate)
             if a_type != b_type && *path_count < 3 {
+                continue;
+            }
+            if a_type == b_type && *path_count < 4 {
                 continue;
             }
 
@@ -13075,7 +13122,7 @@ impl<'a> Prometheus<'a> {
                 .map(|v| v.iter().copied().collect())
                 .unwrap_or_default();
             let shared_neighbors = a_nbrs.intersection(&b_nbrs).count();
-            if shared_neighbors < 4 {
+            if shared_neighbors < 6 {
                 continue;
             }
             let a_type = id_type.get(a).copied().unwrap_or("unknown");
@@ -13087,11 +13134,9 @@ impl<'a> Prometheus<'a> {
             let predicate = infer_predicate(a_type, b_type, None);
 
             // Skip low-signal predicates that Katz picks up via hub connectivity
-            // but rarely produce useful knowledge:
-            // - contemporary_of: 47% confirmation rate
-            // - related_to: 32% confirmation rate
+            // but rarely produce useful knowledge (67.9% overall confirmation rate):
+            // - contemporary_of, related_to, relevant_to: vague or low confirmation
             // - associated_with between two places: trivially true geo connections
-            // - relevant_to: 82% but very vague, no knowledge value
             if predicate == "contemporary_of"
                 || predicate == "related_to"
                 || predicate == "relevant_to"
