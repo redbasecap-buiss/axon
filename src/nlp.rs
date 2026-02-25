@@ -1380,6 +1380,17 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "penerbitan",
     "perbandingan",
     "offene",
+    // Added 2026-02-25 (brain cleaner): demonyms, generic words
+    "japanese",
+    "turkish",
+    "mamluk",
+    "yemenite",
+    "newtonian",
+    "babylonian",
+    "propositions",
+    "lettre",
+    "equal",
+    "once",
 ];
 
 /// Common person name prefixes/titles for entity classification.
