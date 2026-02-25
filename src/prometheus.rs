@@ -13300,6 +13300,35 @@ impl<'a> Prometheus<'a> {
             ("inspired_by", "inspired"),
             ("based_in", "headquarters_of"),
             ("headquarters_of", "based_in"),
+            // Additional inverses for higher coverage
+            ("contributed_to", "received_contribution_from"),
+            ("received_contribution_from", "contributed_to"),
+            ("pioneered", "pioneered_by"),
+            ("pioneered_by", "pioneered"),
+            ("named_after", "namesake_of"),
+            ("namesake_of", "named_after"),
+            ("birthplace_of", "born_in"),
+            ("born_in", "birthplace_of"),
+            ("active_in", "home_to"),
+            ("home_to", "active_in"),
+            ("affiliated_with", "has_member"),
+            ("has_member", "affiliated_with"),
+            ("wrote", "written_by"),
+            ("written_by", "wrote"),
+            ("conquered", "conquered_by"),
+            ("conquered_by", "conquered"),
+            ("ruled", "ruled_by"),
+            ("ruled_by", "ruled"),
+            ("subclass_of", "superclass_of"),
+            ("superclass_of", "subclass_of"),
+            ("works_on", "worked_on_by"),
+            ("worked_on_by", "works_on"),
+            // Symmetric relations (A↔B implies B↔A)
+            ("contemporary_of", "contemporary_of"),
+            ("located_near", "located_near"),
+            ("partner_of", "partner_of"),
+            ("associated_with", "associated_with"),
+            ("geographically_related_to", "geographically_related_to"),
         ]
         .iter()
         .copied()
@@ -13372,7 +13401,7 @@ impl<'a> Prometheus<'a> {
                 });
             }
         }
-        hypotheses.truncate(60);
+        hypotheses.truncate(150);
         Ok(hypotheses)
     }
 
@@ -13665,7 +13694,7 @@ impl<'a> Prometheus<'a> {
     /// pointing to same neighbors) that are NOT directly connected.
     /// Uses cosine similarity on predicate-typed neighbor vectors from graph.rs.
     pub fn generate_hypotheses_from_structural_similarity(&self) -> Result<Vec<Hypothesis>> {
-        let pairs = crate::graph::structural_similarity_pairs(self.brain, 3, 0.25, 200)?;
+        let pairs = crate::graph::structural_similarity_pairs(self.brain, 3, 0.20, 400)?;
         let meaningful = meaningful_ids(self.brain)?;
         let entities = self.brain.all_entities()?;
         let name_to_type: HashMap<String, String> = entities
@@ -13704,7 +13733,7 @@ impl<'a> Prometheus<'a> {
             }
 
             let predicate = infer_predicate(a_type, b_type, None);
-            let base_conf = 0.35 + (sim - 0.25) * 0.4; // 0.35 at min sim, up to 0.65
+            let base_conf = 0.30 + (sim - 0.20) * 0.45; // 0.30 at min sim, up to ~0.66
             let confidence = self
                 .calibrated_confidence("structural_similarity", base_conf)
                 .unwrap_or(base_conf);
@@ -22651,6 +22680,71 @@ impl<'a> Prometheus<'a> {
             "putsch",
             "coup",
             "restoration",
+            // Additional concept indicators
+            "walk",
+            "ride",
+            "trail",
+            "path",
+            "incident",
+            "affair",
+            "scandal",
+            "controversy",
+            "disaster",
+            "catastrophe",
+            "messenger",
+            "triumph",
+            "victory",
+            "defeat",
+            "retreat",
+            "advance",
+            "offensive",
+            "forest",
+            "math",
+            "mathematics",
+            "physics",
+            "chemistry",
+            "biology",
+            "geology",
+            "astronomy",
+            "economics",
+            "philosophy",
+            "literature",
+            "history",
+            "archaeology",
+            "linguistics",
+            "anthropology",
+            "sociology",
+            "psychology",
+            "despotate",
+            "khanate",
+            "sultanate",
+            "caliphate",
+            "emirate",
+            "vilayet",
+            "eyalet",
+            "pashalik",
+            "sanjak",
+            "prefecture",
+            "province",
+            "territory",
+            "protectorate",
+            "dominion",
+            "commonwealth",
+            "confederation",
+            "federation",
+            "republic",
+            "monarchy",
+            "theocracy",
+            "mosquito",
+            "hypersaline",
+            "discovery",
+            "exploration",
+            "navigation",
+            "colonization",
+            "industrialization",
+            "modernization",
+            "urbanization",
+            "globalization",
         ]
         .into_iter()
         .collect();
@@ -22665,11 +22759,12 @@ impl<'a> Prometheus<'a> {
                 continue;
             }
             let words: Vec<&str> = e.name.split_whitespace().collect();
-            if words.len() != 2 {
+            if words.len() < 2 {
                 continue;
             }
-            let second_lower = words[1].to_lowercase();
-            if concept_nouns.contains(second_lower.as_str()) {
+            // Check last word of multi-word name (covers 2+ word compounds)
+            let last_lower = words.last().unwrap().to_lowercase();
+            if concept_nouns.contains(last_lower.as_str()) {
                 self.brain.with_conn(|conn| {
                     conn.execute(
                         "UPDATE entities SET entity_type = 'concept' WHERE id = ?1",
