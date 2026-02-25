@@ -4201,6 +4201,20 @@ const TRAILING_JUNK: &[&str] = &[
     "oral",
     // Added 2026-02-25: Wikipedia "See also" cross-reference artifacts
     "see",
+    // Added 2026-02-25 (brain cleaner): broken concatenation trailing words
+    "proof",
+    "theorem",
+    "conjecture",
+    "lemma",
+    "equation",
+    "paradox",
+    "principle",
+    "formula",
+    "algorithm",
+    "problem",
+    "solution",
+    "hypothesis",
+    "approximation",
 ];
 
 fn is_valid_entity(name: &str, etype: &str) -> bool {
@@ -4525,6 +4539,53 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     if let Some(last_word) = lower.split_whitespace().last() {
         if lower.contains(' ') && TRAILING_JUNK.contains(&last_word) {
             return false;
+        }
+    }
+
+    // Reject person entities ending with a country name (broken "City Country" concatenations
+    // like "Novosibirsk Russia", "Versailles France", "Minden Germany")
+    if etype == "person" && lower.contains(' ') {
+        const TRAILING_COUNTRIES: &[&str] = &[
+            "germany",
+            "france",
+            "spain",
+            "italy",
+            "russia",
+            "china",
+            "japan",
+            "india",
+            "britain",
+            "england",
+            "scotland",
+            "ireland",
+            "wales",
+            "turkey",
+            "greece",
+            "egypt",
+            "brazil",
+            "mexico",
+            "canada",
+            "australia",
+            "austria",
+            "switzerland",
+            "netherlands",
+            "belgium",
+            "portugal",
+            "sweden",
+            "norway",
+            "denmark",
+            "finland",
+            "poland",
+            "hungary",
+            "romania",
+            "bulgaria",
+            "serbia",
+            "croatia",
+        ];
+        if let Some(last) = lower.split_whitespace().last() {
+            if TRAILING_COUNTRIES.contains(&last) {
+                return false;
+            }
         }
     }
 

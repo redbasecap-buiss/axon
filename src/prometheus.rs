@@ -3609,7 +3609,9 @@ impl<'a> Prometheus<'a> {
             } else if pred_count >= 10 {
                 apply_boost(&mut total_boost, 0.02);
                 h.confidence = (base_confidence + total_boost).min(1.0);
-            } else if pred_count < 3 {
+            } else if pred_count < 3 && h.predicate != "same_as" {
+                // Exempt same_as from rare predicate penalty — it's inherently rare
+                // but a strong signal when derived from name similarity
                 h.evidence_against.push(format!(
                     "Rare predicate '{}' (only {} occurrences in graph)",
                     h.predicate, pred_count
@@ -3730,6 +3732,7 @@ impl<'a> Prometheus<'a> {
         let effective_threshold = match h.predicate.as_str() {
             "related_to" => 0.85,
             "associated_with" | "relevant_to" | "related_concept" => 0.80,
+            "same_as" => 0.60, // merge signal — name similarity is strong evidence
             _ if is_generic_predicate(&h.predicate) => 0.80,
             _ => CONFIRMATION_THRESHOLD,
         };
@@ -4686,6 +4689,7 @@ impl<'a> Prometheus<'a> {
         let t1 = std::time::Instant::now();
         let shared_weight = self.get_pattern_weight("shared_object")?;
         // DISABLED: 3.1% confirmation rate over 1803 samples — too noisy
+        #[allow(clippy::overly_complex_bool_expr)]
         if false && shared_weight >= 0.10 {
             let shared_hyps = self.generate_hypotheses_from_shared_objects()?;
             eprintln!(
@@ -4734,6 +4738,7 @@ impl<'a> Prometheus<'a> {
         let t1 = std::time::Instant::now();
         let hub_weight = self.get_pattern_weight("hub_spoke")?;
         // DISABLED: 14.8% confirmation rate over 128 samples — below threshold
+        #[allow(clippy::overly_complex_bool_expr)]
         if false && hub_weight >= 0.15 && !suspended.contains("hub_spoke") {
             let hub_hyps = self.generate_hypotheses_from_hubs()?;
             eprintln!(
@@ -13820,7 +13825,13 @@ impl<'a> Prometheus<'a> {
                         continue;
                     }
 
-                    let base_conf = if is_name_fragment { 0.65 } else { 0.55 };
+                    let base_conf = if is_name_fragment {
+                        0.70
+                    } else if norm_dist < 0.15 {
+                        0.70 // very close edit distance (>85% similar)
+                    } else {
+                        0.60
+                    };
                     let confidence = self
                         .calibrated_confidence("isolated_connector", base_conf)
                         .unwrap_or(base_conf);
