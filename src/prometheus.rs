@@ -3447,19 +3447,49 @@ impl<'a> Prometheus<'a> {
                 h.confidence = (base_confidence + total_boost).min(1.0);
             }
 
-            // Entity importance signal (reuse cached facts for neighbor-based strategies)
+            // Near-duplicate name detection: if subject and object names are
+            // trivially similar (one contains the other, or differ only by
+            // parenthetical/suffix), this is likely a duplicate entity, not a
+            // meaningful relation.
+            {
+                let s_lower = h.subject.to_lowercase();
+                let o_lower = h.object.to_lowercase();
+                let s_core = s_lower
+                    .split(&['(', ',', ':'][..])
+                    .next()
+                    .unwrap_or(&s_lower)
+                    .trim();
+                let o_core = o_lower
+                    .split(&['(', ',', ':'][..])
+                    .next()
+                    .unwrap_or(&o_lower)
+                    .trim();
+                if !s_core.is_empty()
+                    && !o_core.is_empty()
+                    && (s_core == o_core
+                        || s_core.starts_with(o_core)
+                        || o_core.starts_with(s_core))
+                {
+                    h.evidence_against.push(format!(
+                        "Near-duplicate names: '{}' vs '{}'",
+                        h.subject, h.object
+                    ));
+                    h.status = HypothesisStatus::Rejected;
+                    return Ok(());
+                }
+            }
+
+            // Entity importance signal (use cached relation counts as proxy)
             let combined_access = se.access_count + oe.access_count;
-            let s_facts_len = self.brain.get_facts_for(se.id)?.len();
-            let o_facts_len = self.brain.get_facts_for(oe.id)?.len();
-            let fact_richness = s_facts_len + o_facts_len;
-            if combined_access >= 8 && fact_richness >= 4 {
+            let connectivity = s_rels.len() + o_rels.len();
+            if combined_access >= 8 && connectivity >= 3 {
                 h.evidence_for.push(format!(
-                    "High-importance entities: {} accesses, {} facts",
-                    combined_access, fact_richness
+                    "High-importance entities: {} accesses, {} relations",
+                    combined_access, connectivity
                 ));
                 apply_boost(&mut total_boost, 0.07);
                 h.confidence = (base_confidence + total_boost).min(1.0);
-            } else if combined_access >= 4 && fact_richness >= 2 {
+            } else if combined_access >= 4 && connectivity >= 1 {
                 apply_boost(&mut total_boost, 0.03);
                 h.confidence = (base_confidence + total_boost).min(1.0);
             }
@@ -3553,18 +3583,18 @@ impl<'a> Prometheus<'a> {
             }
         }
 
-        // Predicate frequency signal
+        // Predicate frequency signal (pred_count reused by concentration penalty below)
+        let pred_count: i64 = self
+            .brain
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM relations WHERE predicate = ?1",
+                    params![h.predicate],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap_or(0);
         {
-            let pred_count: i64 = self
-                .brain
-                .with_conn(|conn| {
-                    conn.query_row(
-                        "SELECT COUNT(*) FROM relations WHERE predicate = ?1",
-                        params![h.predicate],
-                        |row| row.get(0),
-                    )
-                })
-                .unwrap_or(0);
             if pred_count >= 50 {
                 apply_boost(&mut total_boost, 0.05);
                 h.confidence = (base_confidence + total_boost).min(1.0);
@@ -3609,6 +3639,50 @@ impl<'a> Prometheus<'a> {
                 ));
                 apply_boost(&mut total_boost, 0.04);
                 h.confidence = (base_confidence + total_boost).min(1.0);
+            }
+        }
+
+        // Predicate concentration penalty: overrepresented predicates get
+        // a confidence haircut proportional to their excess concentration.
+        // This encourages predicate diversity in the knowledge graph.
+        // Reuse pred_count from the predicate frequency signal above.
+        {
+            let total_rels: i64 = self
+                .brain
+                .with_conn(|conn| {
+                    conn.query_row("SELECT COUNT(*) FROM relations", [], |row| row.get(0))
+                })
+                .unwrap_or(1)
+                .max(1);
+            let concentration = pred_count as f64 / total_rels as f64;
+            if concentration > 0.20 {
+                // Excess concentration beyond 20% threshold
+                let excess = concentration - 0.20;
+                let penalty = (excess * 0.5).min(0.15); // max 15% penalty
+                h.evidence_against.push(format!(
+                    "Predicate '{}' is overrepresented ({:.1}% of graph)",
+                    h.predicate,
+                    concentration * 100.0
+                ));
+                h.confidence = (h.confidence - penalty).max(0.0);
+            }
+        }
+
+        // Strategy weight confidence ceiling: prevent low-weight strategies
+        // from easily confirming by capping max achievable confidence.
+        // High-weight strategies (>0.9) have no ceiling; low-weight (<0.3)
+        // are capped around 0.65, making confirmation harder.
+        {
+            let weight = self.get_pattern_weight(&h.pattern_source).unwrap_or(1.0);
+            if weight < 0.90 {
+                let ceiling = 0.50 + 0.50 * weight; // 0.50 at weight=0, 0.95 at weight=0.90
+                if h.confidence > ceiling {
+                    h.evidence_against.push(format!(
+                        "Strategy '{}' confidence capped at {:.2} (weight {:.3})",
+                        h.pattern_source, ceiling, weight
+                    ));
+                    h.confidence = ceiling;
+                }
             }
         }
 
@@ -13000,7 +13074,7 @@ impl<'a> Prometheus<'a> {
                 .map(|v| v.iter().copied().collect())
                 .unwrap_or_default();
             let shared_neighbors = a_nbrs.intersection(&b_nbrs).count();
-            if shared_neighbors < 3 {
+            if shared_neighbors < 4 {
                 continue;
             }
             let a_type = id_type.get(a).copied().unwrap_or("unknown");
@@ -13595,7 +13669,128 @@ impl<'a> Prometheus<'a> {
             }
         }
 
-        hypotheses.truncate(60);
+        // Phase 3: Name-similarity matching for isolated entities.
+        // Many isolated entities are near-duplicates or variants of connected
+        // entities (e.g., "Niels Bohr" vs "Bohr", "MIT" vs "Massachusetts Institute of Technology").
+        // Use Levenshtein distance and substring matching to find merge candidates.
+        if hypotheses.len() < 80 {
+            let mut name_matches = 0usize;
+            for iso in &isolated {
+                if hypotheses.len() >= 80 || name_matches >= 20 {
+                    break;
+                }
+                let iso_lower = iso.name.to_lowercase();
+                // Skip very short names (too many false positives)
+                if iso_lower.len() < 5 {
+                    continue;
+                }
+                // Find connected entities with similar names
+                for &cid in connected_ids.iter() {
+                    if !meaningful.contains(&cid) {
+                        continue;
+                    }
+                    let pair = if iso.id < cid {
+                        (iso.id, cid)
+                    } else {
+                        (cid, iso.id)
+                    };
+                    if seen_pairs.contains(&pair) {
+                        continue;
+                    }
+                    let cand_name = match id_name.get(&cid) {
+                        Some(n) => *n,
+                        None => continue,
+                    };
+                    if is_noise_name(cand_name) || cand_name == iso.name {
+                        continue;
+                    }
+                    let cand_lower = cand_name.to_lowercase();
+                    // Skip if same type and check similarity
+                    let cand_type = id_type.get(&cid).copied().unwrap_or("unknown");
+
+                    // Check: one name is a suffix/prefix of the other (e.g., "Bohr" in "Niels Bohr")
+                    let is_name_fragment = (iso_lower.len() >= 4
+                        && cand_lower.contains(&iso_lower))
+                        || (cand_lower.len() >= 4 && iso_lower.contains(&cand_lower));
+
+                    // Check: low normalized Levenshtein distance
+                    let max_len = iso_lower.len().max(cand_lower.len());
+                    let dist = levenshtein(&iso_lower, &cand_lower);
+                    let norm_dist = dist as f64 / max_len as f64;
+                    let is_close_edit = norm_dist < 0.25 && max_len >= 6;
+
+                    if !is_name_fragment && !is_close_edit {
+                        continue;
+                    }
+
+                    if !seen_pairs.insert(pair) {
+                        continue;
+                    }
+
+                    // Only suggest merge if same or compatible type
+                    if iso.entity_type != cand_type
+                        && !(iso.entity_type == "company" && cand_type == "organization")
+                        && !(iso.entity_type == "organization" && cand_type == "company")
+                    {
+                        continue;
+                    }
+
+                    let base_conf = if is_name_fragment { 0.65 } else { 0.55 };
+                    let confidence = self
+                        .calibrated_confidence("isolated_connector", base_conf)
+                        .unwrap_or(base_conf);
+
+                    let reason = if is_name_fragment {
+                        format!(
+                            "'{}' is a name fragment of '{}' — likely same entity",
+                            if iso_lower.len() < cand_lower.len() {
+                                &iso.name
+                            } else {
+                                cand_name
+                            },
+                            if iso_lower.len() < cand_lower.len() {
+                                cand_name
+                            } else {
+                                &iso.name
+                            }
+                        )
+                    } else {
+                        format!(
+                            "'{}' and '{}' have {:.0}% name similarity (edit distance {})",
+                            iso.name,
+                            cand_name,
+                            (1.0 - norm_dist) * 100.0,
+                            dist
+                        )
+                    };
+
+                    hypotheses.push(Hypothesis {
+                        id: 0,
+                        subject: iso.name.clone(),
+                        predicate: "same_as".to_string(),
+                        object: cand_name.to_string(),
+                        confidence,
+                        evidence_for: vec![reason.clone()],
+                        evidence_against: vec![],
+                        reasoning_chain: vec![
+                            format!(
+                                "{} ({}) is isolated with name similar to connected {} ({})",
+                                iso.name, iso.entity_type, cand_name, cand_type
+                            ),
+                            reason,
+                            "Name similarity suggests these may be the same entity or closely related".to_string(),
+                        ],
+                        status: HypothesisStatus::Proposed,
+                        discovered_at: now_str(),
+                        pattern_source: "isolated_connector".to_string(),
+                    });
+                    name_matches += 1;
+                    break; // one match per isolated entity
+                }
+            }
+        }
+
+        hypotheses.truncate(80);
         Ok(hypotheses)
     }
 
