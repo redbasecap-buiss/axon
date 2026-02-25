@@ -4092,6 +4092,8 @@ const TRAILING_JUNK: &[&str] = &[
     "submarines",
     "meteorite",
     "oral",
+    // Added 2026-02-25: Wikipedia "See also" cross-reference artifacts
+    "see",
 ];
 
 fn is_valid_entity(name: &str, etype: &str) -> bool {
@@ -4225,7 +4227,10 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         for (idx, w) in words.iter().enumerate() {
             if idx > 0
                 && idx < words.len() - 1
-                && matches!(*w, "After" | "Before" | "During" | "Between" | "Throughout")
+                && matches!(
+                    *w,
+                    "After" | "Before" | "During" | "Between" | "Throughout" | "For"
+                )
             {
                 return false;
             }
@@ -4371,6 +4376,12 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         if noun_suffixes.iter().any(|s| lower.ends_with(s)) {
             return false;
         }
+    }
+
+    // Reject entities ending with "See" (Wikipedia cross-reference artifacts like "Giza See")
+    // Exception: "Holy See" is legitimate
+    if lower.ends_with(" see") && lower != "holy see" {
+        return false;
     }
 
     // Reject entities ending with trailing junk words
