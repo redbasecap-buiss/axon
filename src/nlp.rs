@@ -4275,11 +4275,15 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return true;
     }
 
-    // Reject entities containing math/code symbols (likely formula fragments)
+    // Reject entities containing math/code symbols or code operators
     if trimmed
         .chars()
         .any(|c| "Σ→←≈≤≥∈∀∃∫∂∇∆∞±÷×∝∑∏√∩∪⊂⊃⊆⊇∧∨¬⟨⟩{}[]|\\".contains(c))
     {
+        return false;
+    }
+    // Reject code-like patterns (arrows, assignment operators)
+    if trimmed.contains("->") || trimmed.contains("=>") || trimmed.contains("::") {
         return false;
     }
 
@@ -6576,6 +6580,25 @@ fn classify_entity_type(name: &str) -> &'static str {
         let clean = first.trim_matches('.');
         if PERSON_TITLES.contains(&clean) {
             return "person";
+        }
+    }
+
+    // Historical polities are places, not organizations — check before org indicators
+    const POLITY_WORDS: &[&str] = &[
+        "empire",
+        "kingdom",
+        "dynasty",
+        "caliphate",
+        "sultanate",
+        "khanate",
+        "principality",
+        "duchy",
+        "dominion",
+    ];
+    for w in &words {
+        let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
+        if POLITY_WORDS.contains(&clean) {
+            return "place";
         }
     }
 

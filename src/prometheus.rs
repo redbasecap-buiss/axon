@@ -3063,6 +3063,12 @@ impl<'a> Prometheus<'a> {
         if VAGUE_PREDICATES.contains(&hypothesis.predicate.as_str()) {
             score -= 0.10;
         }
+        // contemporary_of is the most over-generated predicate — it's the
+        // default for person-person pairs with no further signal. Penalize it
+        // to require stronger evidence before confirmation.
+        if hypothesis.predicate == "contemporary_of" {
+            score -= 0.08;
+        }
 
         // Apply pattern weight
         let weight = self.get_pattern_weight(&hypothesis.pattern_source)?;
@@ -4679,7 +4685,8 @@ impl<'a> Prometheus<'a> {
 
         let t1 = std::time::Instant::now();
         let shared_weight = self.get_pattern_weight("shared_object")?;
-        if shared_weight >= 0.10 {
+        // DISABLED: 3.1% confirmation rate over 1803 samples — too noisy
+        if false && shared_weight >= 0.10 {
             let shared_hyps = self.generate_hypotheses_from_shared_objects()?;
             eprintln!(
                 "[PROMETHEUS] shared_objects: {} in {:?}",
@@ -4726,7 +4733,8 @@ impl<'a> Prometheus<'a> {
         // 2c. Hub-spoke hypotheses
         let t1 = std::time::Instant::now();
         let hub_weight = self.get_pattern_weight("hub_spoke")?;
-        if hub_weight >= 0.15 && !suspended.contains("hub_spoke") {
+        // DISABLED: 14.8% confirmation rate over 128 samples — below threshold
+        if false && hub_weight >= 0.15 && !suspended.contains("hub_spoke") {
             let hub_hyps = self.generate_hypotheses_from_hubs()?;
             eprintln!(
                 "[PROMETHEUS] hubs: {} in {:?}",
@@ -12462,6 +12470,12 @@ impl<'a> Prometheus<'a> {
             if a_type == "place" && b_type == "place" && *shared < 3 {
                 continue;
             }
+            // Person-person pairs default to contemporary_of which is trivially
+            // confirmed. Require ≥3 shared patterns to ensure genuine structural
+            // similarity, not just "both are persons with 1 relation each".
+            if a_type == "person" && b_type == "person" && *shared < 3 {
+                continue;
+            }
             let predicate = infer_predicate(a_type, b_type, None);
             hypotheses.push(Hypothesis {
                 id: 0,
@@ -12710,9 +12724,23 @@ impl<'a> Prometheus<'a> {
             if is_noise_name(a_name) || is_noise_name(b_name) {
                 continue;
             }
+            // Require minimum Jaccard score to reduce noise
+            if *score < 0.15 {
+                continue;
+            }
             let a_type = id_type.get(a).copied().unwrap_or("unknown");
             let b_type = id_type.get(b).copied().unwrap_or("unknown");
+            if !types_compatible(a_type, b_type) {
+                continue;
+            }
             let predicate = infer_predicate(a_type, b_type, None);
+            // Skip vague predicates that inflate false positives
+            if predicate == "contemporary_of"
+                || predicate == "related_to"
+                || predicate == "associated_with"
+            {
+                continue;
+            }
             let confidence = self
                 .calibrated_confidence("jaccard", 0.35 + (score * 0.5).min(0.45))
                 .unwrap_or(0.5);
@@ -13139,7 +13167,7 @@ impl<'a> Prometheus<'a> {
                 .map(|v| v.iter().copied().collect())
                 .unwrap_or_default();
             let shared_neighbors = a_nbrs.intersection(&b_nbrs).count();
-            if shared_neighbors < 8 {
+            if shared_neighbors < 12 {
                 continue;
             }
             let a_type = id_type.get(a).copied().unwrap_or("unknown");
@@ -13151,18 +13179,12 @@ impl<'a> Prometheus<'a> {
             let predicate = infer_predicate(a_type, b_type, None);
 
             // Skip low-signal predicates that Katz picks up via hub connectivity
-            // but rarely produce useful knowledge (67.9% overall confirmation rate):
-            // - contemporary_of, related_to, relevant_to: vague or low confirmation
-            // - associated_with between two places: trivially true geo connections
+            // but rarely produce useful knowledge:
+            // - contemporary_of, related_to, relevant_to, associated_with: vague
             if predicate == "contemporary_of"
                 || predicate == "related_to"
                 || predicate == "relevant_to"
-            {
-                continue;
-            }
-            if predicate == "associated_with"
-                && (a_type == "place" || a_type == "location")
-                && (b_type == "place" || b_type == "location")
+                || predicate == "associated_with"
             {
                 continue;
             }
