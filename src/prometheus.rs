@@ -2715,7 +2715,9 @@ impl<'a> Prometheus<'a> {
                         .intersection(&b_nbrs)
                         .filter(|n| *n != &a && *n != &b && *n != &obj_name)
                         .count();
-                    if extra_shared == 0 {
+                    // Require 2+ extra shared neighbors — single shared neighbor
+                    // had only ~3% confirmation rate (too noisy)
+                    if extra_shared < 2 {
                         continue;
                     }
 
@@ -3770,24 +3772,42 @@ impl<'a> Prometheus<'a> {
                     if confirmed { 0 } else { 1 },
                 ],
             )?;
-            // Use EMA-blended weight: 80% historical ratio + 20% recent outcome.
-            // This lets recovering strategies bounce back faster than pure cumulative.
+            // Temporal decay: periodically shrink old counts so recent performance
+            // matters more. Every 500 total samples, apply 10% decay to both
+            // confirmations and rejections — prevents ancient history from
+            // permanently anchoring the weight.
             let (conf, rej): (i64, i64) = conn.query_row(
                 "SELECT confirmations, rejections FROM pattern_weights WHERE pattern_type = ?1",
                 params![pattern_type],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             let total = conf + rej;
+            if total > 500 && total % 500 < 2 {
+                // Apply 10% decay
+                let new_conf = (conf as f64 * 0.90).round() as i64;
+                let new_rej = (rej as f64 * 0.90).round() as i64;
+                conn.execute(
+                    "UPDATE pattern_weights SET confirmations = ?1, rejections = ?2
+                     WHERE pattern_type = ?3",
+                    params![new_conf, new_rej, pattern_type],
+                )?;
+                eprintln!(
+                    "[META-LEARN] Temporal decay applied to '{}': {}→{} conf, {}→{} rej",
+                    pattern_type, conf, new_conf, rej, new_rej
+                );
+            }
+
             let historical = if total > 0 {
                 conf as f64 / total as f64
             } else {
                 1.0
             };
             let recent = if confirmed { 1.0 } else { 0.0 };
-            // Blend factor: with few samples trust historical ratio more,
+            // EMA blend: with few samples trust historical ratio more,
             // as samples grow allow recent signal to nudge the weight.
-            // recency_factor ranges from ~0.03 (3 samples) to ~0.10 (100+ samples)
-            let recency_factor = (10.0 / (total as f64 + 30.0)).min(0.15);
+            // Increased recency factor to 0.20 max so strategies can recover
+            // faster from initial poor performance (was 0.15).
+            let recency_factor = (10.0 / (total as f64 + 30.0)).min(0.20);
             let ema_weight = historical * (1.0 - recency_factor) + recent * recency_factor;
             conn.execute(
                 "UPDATE pattern_weights SET weight = ?1 WHERE pattern_type = ?2",
@@ -9553,7 +9573,7 @@ impl<'a> Prometheus<'a> {
         let mut hypotheses = Vec::new();
         for (hub_id, hub_degree) in &hubs {
             // Skip very high degree hubs (too generic, e.g. "Zurich", "France")
-            if *hub_degree > 30 {
+            if *hub_degree > 25 {
                 continue;
             }
             let hub = match id_to_entity.get(hub_id) {
@@ -9591,8 +9611,8 @@ impl<'a> Prometheus<'a> {
 
             for (cand_id, shared_set) in &two_hop {
                 let shared_count = shared_set.len();
-                if shared_count < 8 {
-                    continue; // Require at least 8 shared meaningful neighbors (raised from 6 to cut false positives — 14.8% rate)
+                if shared_count < 10 {
+                    continue; // Require at least 10 shared meaningful neighbors (raised from 8 — was 14.8% conf rate)
                 }
                 let cand = match id_to_entity.get(cand_id) {
                     Some(e) => e,
@@ -9614,8 +9634,8 @@ impl<'a> Prometheus<'a> {
                 } else {
                     0.0
                 };
-                if jaccard < 0.50 {
-                    continue; // Require strong overlap ratio (raised from 0.45 to reduce 85% rejection rate)
+                if jaccard < 0.55 {
+                    continue; // Require strong overlap ratio (raised from 0.50 — was 14.8% conf rate)
                 }
 
                 // Infer predicate from shared neighbors' edge labels

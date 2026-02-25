@@ -6204,3 +6204,132 @@ pub fn entity_age_days(brain: &Brain, entity_id: i64) -> Result<Option<i64>, rus
         }
     })
 }
+
+/// Compute a composite importance score for entities, combining degree centrality,
+/// access count, fact richness, and predicate diversity. Returns top-k entities
+/// sorted by descending importance.
+pub fn entity_importance_scores(
+    brain: &Brain,
+    top_k: usize,
+) -> Result<Vec<(i64, String, f64)>, rusqlite::Error> {
+    brain.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.name, e.access_count,
+                    COALESCE(r.degree, 0) as degree,
+                    COALESCE(f.fact_count, 0) as fact_count,
+                    COALESCE(p.pred_diversity, 0) as pred_diversity
+             FROM entities e
+             LEFT JOIN (
+                 SELECT id, SUM(cnt) as degree FROM (
+                     SELECT subject_id as id, COUNT(*) as cnt FROM relations GROUP BY subject_id
+                     UNION ALL
+                     SELECT object_id as id, COUNT(*) as cnt FROM relations GROUP BY object_id
+                 ) GROUP BY id
+             ) r ON e.id = r.id
+             LEFT JOIN (
+                 SELECT entity_id, COUNT(*) as fact_count FROM facts GROUP BY entity_id
+             ) f ON e.id = f.entity_id
+             LEFT JOIN (
+                 SELECT id, COUNT(DISTINCT pred) as pred_diversity FROM (
+                     SELECT subject_id as id, predicate as pred FROM relations
+                     UNION ALL
+                     SELECT object_id as id, predicate as pred FROM relations
+                 ) GROUP BY id
+             ) p ON e.id = p.id
+             ORDER BY e.id",
+        )?;
+
+        let mut scores: Vec<(i64, String, f64)> = Vec::new();
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let access: i64 = row.get(2)?;
+            let degree: i64 = row.get(3)?;
+            let facts: i64 = row.get(4)?;
+            let pred_div: i64 = row.get(5)?;
+            Ok((id, name, access, degree, facts, pred_div))
+        })?;
+
+        for row in rows {
+            let (id, name, access, degree, facts, pred_div) = row?;
+            let deg_score = (1.0 + degree as f64).ln();
+            let access_score = (1.0 + access as f64).ln() * 0.5;
+            let fact_score = (1.0 + facts as f64).ln() * 0.8;
+            let div_score = (1.0 + pred_div as f64).ln() * 1.2;
+            let importance = deg_score + access_score + fact_score + div_score;
+            scores.push((id, name, importance));
+        }
+
+        scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        scores.truncate(top_k);
+        Ok(scores)
+    })
+}
+
+/// Identify "knowledge gaps": well-connected entities with significantly fewer
+/// facts than peers of the same type — high-value enrichment targets.
+pub fn knowledge_gap_entities(
+    brain: &Brain,
+    top_k: usize,
+) -> Result<Vec<(i64, String, String, i64, f64)>, rusqlite::Error> {
+    brain.with_conn(|conn| {
+        let mut type_avg: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT e.entity_type, AVG(COALESCE(f.fc, 0)) FROM entities e
+             LEFT JOIN (SELECT entity_id, COUNT(*) as fc FROM facts GROUP BY entity_id) f
+               ON e.id = f.entity_id
+             WHERE e.id IN (
+                 SELECT subject_id FROM relations
+                 UNION SELECT object_id FROM relations
+             )
+             GROUP BY e.entity_type
+             HAVING COUNT(*) >= 5",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        for row in rows {
+            let (etype, avg) = row?;
+            type_avg.insert(etype, avg);
+        }
+
+        let mut stmt2 = conn.prepare(
+            "SELECT e.id, e.name, e.entity_type, COALESCE(f.fc, 0) as fact_count,
+                    COALESCE(r.degree, 0) as degree
+             FROM entities e
+             LEFT JOIN (SELECT entity_id, COUNT(*) as fc FROM facts GROUP BY entity_id) f
+               ON e.id = f.entity_id
+             LEFT JOIN (
+                 SELECT id, SUM(cnt) as degree FROM (
+                     SELECT subject_id as id, COUNT(*) as cnt FROM relations GROUP BY subject_id
+                     UNION ALL
+                     SELECT object_id as id, COUNT(*) as cnt FROM relations GROUP BY object_id
+                 ) GROUP BY id
+             ) r ON e.id = r.id
+             WHERE COALESCE(r.degree, 0) >= 3
+             ORDER BY COALESCE(r.degree, 0) DESC",
+        )?;
+        let mut gaps: Vec<(i64, String, String, i64, f64)> = Vec::new();
+        let rows2 = stmt2.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let etype: String = row.get(2)?;
+            let facts: i64 = row.get(3)?;
+            let degree: i64 = row.get(4)?;
+            Ok((id, name, etype, facts, degree))
+        })?;
+        for row in rows2 {
+            let (id, name, etype, facts, degree) = row?;
+            if let Some(&avg) = type_avg.get(&etype) {
+                if avg > 1.0 && (facts as f64) < avg * 0.3 {
+                    let deficit = (avg - facts as f64) / avg;
+                    let gap_score = deficit * (degree as f64).ln();
+                    gaps.push((id, name, etype, facts, gap_score));
+                }
+            }
+        }
+        gaps.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+        gaps.truncate(top_k);
+        Ok(gaps)
+    })
+}
