@@ -13280,8 +13280,16 @@ impl<'a> Prometheus<'a> {
 
             let predicate = infer_predicate(a_type, b_type, None);
 
+            // Skip broad geographic entities (country↔country via hub degrees = noise)
+            if is_broad_geographic(a_name) || is_broad_geographic(b_name) {
+                continue;
+            }
             // Skip contemporary_of — PA via hub connectivity produces noise
-            if predicate == "contemporary_of" {
+            if predicate == "contemporary_of"
+                || predicate == "associated_with"
+                || predicate == "geographically_related_to"
+                || predicate == "related_to"
+            {
                 continue;
             }
 
@@ -15585,6 +15593,10 @@ impl<'a> Prometheus<'a> {
             }
             seen.insert(key);
 
+            // Skip broad geographic entities (country-level noise)
+            if is_broad_geographic(a_name) || is_broad_geographic(c_name) {
+                continue;
+            }
             let predicate = infer_predicate(a_type, c_type, None);
             // Skip high-rejection predicates for open_triangle:
             // geographically_related_to (80% rej), contemporary_of, related_to, associated_with
