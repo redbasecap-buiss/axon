@@ -5943,6 +5943,42 @@ pub fn heat_kernel_predict(
     Ok(results)
 }
 
+/// Component bridge score: for each entity, count how many different connected components
+/// it could bridge if hypotheses involving it were confirmed. Higher scores indicate
+/// entities whose hypotheses would reduce fragmentation most.
+pub fn component_bridge_scores(brain: &Brain) -> Result<HashMap<i64, usize>, rusqlite::Error> {
+    let components = connected_components(brain)?;
+
+    // Map entity id → component index
+    let mut entity_to_component: HashMap<i64, usize> = HashMap::new();
+    for (idx, component) in components.iter().enumerate() {
+        for &eid in component {
+            entity_to_component.insert(eid, idx);
+        }
+    }
+
+    // For each entity, count distinct components in its neighborhood
+    let relations = brain.all_relations()?;
+    let mut neighbors: HashMap<i64, HashSet<usize>> = HashMap::new();
+    for r in &relations {
+        if let Some(&comp) = entity_to_component.get(&r.object_id) {
+            neighbors.entry(r.subject_id).or_default().insert(comp);
+        }
+        if let Some(&comp) = entity_to_component.get(&r.subject_id) {
+            neighbors.entry(r.object_id).or_default().insert(comp);
+        }
+    }
+
+    let mut scores: HashMap<i64, usize> = HashMap::new();
+    for (eid, comps) in &neighbors {
+        if comps.len() > 1 {
+            scores.insert(*eid, comps.len());
+        }
+    }
+
+    Ok(scores)
+}
+
 pub fn predicate_bridge_analysis(brain: &Brain) -> Result<Vec<(String, usize)>, rusqlite::Error> {
     let communities = louvain_communities(brain)?;
     let relations = brain.all_relations()?;

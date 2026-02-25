@@ -20682,9 +20682,17 @@ impl<'a> Prometheus<'a> {
             }
             let deg = degree.get(&e.id).copied().unwrap_or(0);
             surname_to_connected
-                .entry(surname)
+                .entry(surname.clone())
                 .or_default()
                 .push((e.id, deg));
+            // Also index under diacritics-stripped form for fuzzy matching
+            let stripped = strip_diacritics(&surname);
+            if stripped != surname {
+                surname_to_connected
+                    .entry(stripped)
+                    .or_default()
+                    .push((e.id, deg));
+            }
         }
 
         // Common surnames to skip (too many false positives)
@@ -20782,7 +20790,16 @@ impl<'a> Prometheus<'a> {
                 continue;
             }
 
-            if let Some(candidates) = surname_to_connected.get(&surname) {
+            // Try exact surname match first, then diacritics-stripped fallback
+            let candidates = surname_to_connected.get(&surname).or_else(|| {
+                let stripped = strip_diacritics(&surname);
+                if stripped != surname {
+                    surname_to_connected.get(&stripped)
+                } else {
+                    None
+                }
+            });
+            if let Some(candidates) = candidates {
                 // Pick the highest-degree connected person with this surname
                 if let Some(&(best_id, _deg)) = candidates.iter().max_by_key(|(_, d)| *d) {
                     let pair = (e.id.min(best_id), e.id.max(best_id));
@@ -24836,6 +24853,53 @@ fn is_common_english_word(lower: &str) -> bool {
 
 /// Normalize common abbreviations in entity names for better fuzzy matching.
 /// Maps: St→Saint, Mt→Mount, Ft→Fort, Dr→Doctor, Prof→Professor, etc.
+/// Strip diacritics/accents from a string for fuzzy matching.
+/// Maps common accented characters to their ASCII equivalents.
+fn strip_diacritics(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' | 'ą' => 'a',
+            'Á' | 'À' | 'Â' | 'Ä' | 'Ã' | 'Å' | 'Ą' => 'A',
+            'ć' | 'č' | 'ç' => 'c',
+            'Ć' | 'Č' | 'Ç' => 'C',
+            'ð' | 'đ' => 'd',
+            'Ð' | 'Đ' => 'D',
+            'é' | 'è' | 'ê' | 'ë' | 'ę' | 'ě' => 'e',
+            'É' | 'È' | 'Ê' | 'Ë' | 'Ę' | 'Ě' => 'E',
+            'ğ' => 'g',
+            'Ğ' => 'G',
+            'í' | 'ì' | 'î' | 'ï' | 'ı' => 'i',
+            'Í' | 'Ì' | 'Î' | 'Ï' | 'İ' => 'I',
+            'ł' => 'l',
+            'Ł' => 'L',
+            'ñ' | 'ń' | 'ň' => 'n',
+            'Ñ' | 'Ń' | 'Ň' => 'N',
+            'ó' | 'ò' | 'ô' | 'ö' | 'õ' | 'ø' | 'ő' => 'o',
+            'Ó' | 'Ò' | 'Ô' | 'Ö' | 'Õ' | 'Ø' | 'Ő' => 'O',
+            'ř' => 'r',
+            'Ř' => 'R',
+            'ś' | 'š' | 'ş' => 's',
+            'Ś' | 'Š' | 'Ş' => 'S',
+            'ß' => 's',
+            'ť' => 't',
+            'Ť' => 'T',
+            'ú' | 'ù' | 'û' | 'ü' | 'ů' | 'ű' => 'u',
+            'Ú' | 'Ù' | 'Û' | 'Ü' | 'Ů' | 'Ű' => 'U',
+            'ý' | 'ÿ' => 'y',
+            'Ý' | 'Ÿ' => 'Y',
+            'ź' | 'ž' | 'ż' => 'z',
+            'Ź' | 'Ž' | 'Ż' => 'Z',
+            'æ' => 'a', // simplified
+            'Æ' => 'A',
+            'œ' => 'o', // simplified
+            'Œ' => 'O',
+            'þ' => 't',
+            'Þ' => 'T',
+            _ => c,
+        })
+        .collect()
+}
+
 fn normalize_abbreviations(name: &str) -> String {
     let mappings: &[(&str, &str)] = &[
         ("St ", "Saint "),

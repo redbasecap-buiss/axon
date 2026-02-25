@@ -1974,6 +1974,24 @@ const CONCEPT_INDICATORS: &[&str] = &[
     "discretization",
     "linearization",
     "diagonalization",
+    // Added 2026-02-25 (brain cleaner): generic single-word concepts, demonyms
+    "christianization",
+    "colonisation",
+    "visualization",
+    "kontext",
+    "europeans",
+    "objects",
+    "algorithmic",
+    "otherwise",
+    "heavy",
+    "loincloths",
+    "illustrations",
+    "sixth",
+    "unfortunately",
+    "scribes",
+    "radial",
+    "simply",
+    "warriors",
 ];
 
 /// Common organization suffixes for entity classification.
@@ -4069,7 +4087,7 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         let noun_suffixes = [
             "ility", "ment", "ness", "ence", "ance", "ting", "ings", "ures", "isms", "ists",
             "ents", "ates", "ives", "ries", "ties", "ples", "sion", "cope", "ally", "enly", "edly",
-            "erly", "ibly", "ably",
+            "erly", "ibly", "ably", "isation", "ization",
         ];
         if noun_suffixes.iter().any(|s| lower.ends_with(s)) {
             return false;
