@@ -3069,6 +3069,7 @@ impl<'a> Prometheus<'a> {
             "connected_to",
             "linked_to",
             "geographically_related_to", // 67.3% — too vague for geography
+            "deployed_in",               // 80% rejection — tech-place mismatch
         ];
         if VAGUE_PREDICATES.contains(&hypothesis.predicate.as_str()) {
             score -= 0.10;
@@ -14341,6 +14342,13 @@ impl<'a> Prometheus<'a> {
             }
             let a_type = id_type.get(a).copied().unwrap_or("unknown");
             let predicate = infer_predicate(a_type, a_type, None);
+            // Block high-rejection predicates
+            if predicate == "geographically_related_to"
+                || predicate == "related_to"
+                || predicate == "contemporary_of"
+            {
+                continue;
+            }
             let base_conf = 0.35 + (cosine - 0.85) * 2.0; // 0.85→0.35, 1.0→0.65
             let confidence = self
                 .calibrated_confidence("predicate_profile", base_conf)
@@ -14679,6 +14687,14 @@ impl<'a> Prometheus<'a> {
                 continue;
             }
             let predicate = infer_predicate(a_type, b_type, None);
+            // Skip vague predicates with high rejection rates
+            if predicate == "geographically_related_to"
+                || predicate == "related_to"
+                || predicate == "contemporary_of"
+                || predicate == "associated_with"
+            {
+                continue;
+            }
             let base_conf = 0.35 + (score - 0.3) * 0.5; // 0.3→0.35, 1.0→0.70
             let confidence = self
                 .calibrated_confidence("overlap_coefficient", base_conf)
@@ -15182,6 +15198,13 @@ impl<'a> Prometheus<'a> {
             }
 
             let predicate = infer_predicate(a_type, b_type, None);
+            // Block high-rejection predicates for structural_similarity
+            if predicate == "geographically_related_to"
+                || predicate == "related_to"
+                || predicate == "contemporary_of"
+            {
+                continue;
+            }
             let base_conf = 0.30 + (sim - 0.20) * 0.45; // 0.30 at min sim, up to ~0.66
             let confidence = self
                 .calibrated_confidence("structural_similarity", base_conf)
