@@ -4050,6 +4050,20 @@ const TRAILING_JUNK: &[&str] = &[
     "traveler",
     "transparency",
     "timeline",
+    // Added 2026-02-25 (brain cleaner): city/academic trailing fragments
+    "oxford",
+    "cambridge",
+    "leiden",
+    "berlin",
+    "paris",
+    "vienna",
+    "companion",
+    "discourse",
+    "forecast",
+    "station",
+    "submarines",
+    "meteorite",
+    "oral",
 ];
 
 fn is_valid_entity(name: &str, etype: &str) -> bool {

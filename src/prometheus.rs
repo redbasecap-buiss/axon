@@ -6955,16 +6955,31 @@ impl<'a> Prometheus<'a> {
 
             // Check if a path exists between subject and object (evidence of relation)
             if h.object != "?" {
-                // Reject single-word fragment pairs (NLP noise like "Grace" → "Hopper")
+                // Reject single-word fragment pairs ONLY when both are short
+                // generic words (not high-value entity types like person/place/org).
+                // Previous blanket rejection was killing 2000+ valid entities.
                 if !h.subject.contains(' ')
                     && h.subject.len() <= 12
                     && !h.object.contains(' ')
                     && h.object.len() <= 12
                 {
-                    self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
-                    self.record_outcome(&h.pattern_source, false)?;
-                    rejected += 1;
-                    continue;
+                    // Check if either entity is a known high-value type — if so, keep it
+                    let subj_high_value = self
+                        .brain
+                        .get_entity_by_name(&h.subject)?
+                        .map(|e| HIGH_VALUE_TYPES.contains(&e.entity_type.as_str()))
+                        .unwrap_or(false);
+                    let obj_high_value = self
+                        .brain
+                        .get_entity_by_name(&h.object)?
+                        .map(|e| HIGH_VALUE_TYPES.contains(&e.entity_type.as_str()))
+                        .unwrap_or(false);
+                    if !subj_high_value && !obj_high_value {
+                        self.update_hypothesis_status(h.id, HypothesisStatus::Rejected)?;
+                        self.record_outcome(&h.pattern_source, false)?;
+                        rejected += 1;
+                        continue;
+                    }
                 }
 
                 // Skip substring pairs — these are merge candidates, not discoveries
@@ -13258,7 +13273,106 @@ impl<'a> Prometheus<'a> {
                 });
             }
         }
-        hypotheses.truncate(30);
+        // Phase 2: Source-URL-based island connection
+        // Isolated entities sharing a source URL with connected entities are very
+        // likely related — they were extracted from the same page/article.
+        if hypotheses.len() < 60 {
+            // Build source → connected entities index
+            let mut source_to_connected: HashMap<String, Vec<i64>> = HashMap::new();
+            for &eid in connected_ids.iter().take(5000) {
+                if !meaningful.contains(&eid) {
+                    continue;
+                }
+                if let Ok(sources) = self.brain.get_source_urls_for(eid) {
+                    for src in sources {
+                        if !src.is_empty() {
+                            source_to_connected.entry(src).or_default().push(eid);
+                        }
+                    }
+                }
+            }
+
+            for iso in &isolated {
+                if hypotheses.len() >= 60 {
+                    break;
+                }
+                let iso_sources = self.brain.get_source_urls_for(iso.id).unwrap_or_default();
+                if iso_sources.is_empty() {
+                    continue;
+                }
+
+                // Find connected entities sharing sources
+                let mut source_matches: HashMap<i64, usize> = HashMap::new();
+                for src in &iso_sources {
+                    if let Some(connected) = source_to_connected.get(src) {
+                        for &cid in connected {
+                            if cid == iso.id {
+                                continue;
+                            }
+                            *source_matches.entry(cid).or_insert(0) += 1;
+                        }
+                    }
+                }
+
+                // Rank by number of shared sources
+                let mut ranked: Vec<(i64, usize)> = source_matches.into_iter().collect();
+                ranked.sort_by(|a, b| b.1.cmp(&a.1));
+
+                for (cand_id, shared_count) in ranked.into_iter().take(3) {
+                    let pair = if iso.id < cand_id {
+                        (iso.id, cand_id)
+                    } else {
+                        (cand_id, iso.id)
+                    };
+                    if !seen_pairs.insert(pair) {
+                        continue;
+                    }
+                    let cand_name = id_name.get(&cand_id).copied().unwrap_or("?");
+                    let cand_type = id_type.get(&cand_id).copied().unwrap_or("unknown");
+                    if is_noise_name(cand_name) || cand_name == iso.name {
+                        continue;
+                    }
+                    // Skip same-first-word or substring pairs
+                    let sl = iso.name.to_lowercase();
+                    let cl = cand_name.to_lowercase();
+                    if sl.contains(&cl) || cl.contains(&sl) {
+                        continue;
+                    }
+
+                    let predicate = infer_predicate(&iso.entity_type, cand_type, None);
+                    let base_conf = (0.35 + shared_count as f64 * 0.15).min(0.75);
+                    let confidence = self
+                        .calibrated_confidence("isolated_connector", base_conf)
+                        .unwrap_or(base_conf);
+
+                    hypotheses.push(Hypothesis {
+                        id: 0,
+                        subject: iso.name.clone(),
+                        predicate: predicate.to_string(),
+                        object: cand_name.to_string(),
+                        confidence,
+                        evidence_for: vec![format!(
+                            "Isolated entity {} co-occurs in {} source(s) with connected entity {}",
+                            iso.name, shared_count, cand_name
+                        )],
+                        evidence_against: vec![],
+                        reasoning_chain: vec![
+                            format!(
+                                "{} ({}) is isolated but shares {} source URL(s) with {} ({})",
+                                iso.name, iso.entity_type, shared_count, cand_name, cand_type
+                            ),
+                            "Source co-occurrence strongly suggests real-world connection"
+                                .to_string(),
+                        ],
+                        status: HypothesisStatus::Proposed,
+                        discovered_at: now_str(),
+                        pattern_source: "isolated_connector".to_string(),
+                    });
+                }
+            }
+        }
+
+        hypotheses.truncate(60);
         Ok(hypotheses)
     }
 
@@ -19960,7 +20074,32 @@ impl<'a> Prometheus<'a> {
                         continue;
                     }
 
-                    let conf = (0.6 - constraint * 0.5).max(0.25).min(0.75);
+                    // Type-compatibility boost: same-type or known-compatible type pairs
+                    // get higher confidence; incompatible pairs get penalized
+                    let type_a = entities
+                        .iter()
+                        .find(|e| e.id == a)
+                        .map(|e| e.entity_type.as_str())
+                        .unwrap_or("unknown");
+                    let type_b = entities
+                        .iter()
+                        .find(|e| e.id == b)
+                        .map(|e| e.entity_type.as_str())
+                        .unwrap_or("unknown");
+                    let type_bonus: f64 = if type_a == type_b && HIGH_VALUE_TYPES.contains(&type_a)
+                    {
+                        0.10 // Same high-value type — strong signal
+                    } else if HIGH_VALUE_TYPES.contains(&type_a)
+                        && HIGH_VALUE_TYPES.contains(&type_b)
+                    {
+                        0.05 // Both high-value but different — moderate
+                    } else if is_noise_type(type_a) || is_noise_type(type_b) {
+                        -0.15 // One is noise type — penalize
+                    } else {
+                        0.0
+                    };
+
+                    let conf = ((0.6 - constraint * 0.5) + type_bonus).max(0.20).min(0.80);
                     hypotheses.push(Hypothesis {
                         id: 0,
                         subject: name_a.to_string(),
