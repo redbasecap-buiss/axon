@@ -11968,10 +11968,17 @@ impl<'a> Prometheus<'a> {
             };
 
             // Skip low-signal predicate/type combos that produce noise
-            if predicate == "contemporary_of" {
+            if predicate == "contemporary_of"
+                || predicate == "references"
+                || predicate == "related_to"
+            {
                 continue;
             }
             if predicate == "pioneered" && (a_type == "place" || b_type == "place") {
+                continue;
+            }
+            // related_concept at 50% confirmation — require more evidence
+            if predicate == "related_concept" && *path_count < 4 {
                 continue;
             }
             // Skip single-word entities in near_miss (too ambiguous)
@@ -12242,8 +12249,23 @@ impl<'a> Prometheus<'a> {
             if is_noise_name(a_name) || is_noise_name(c_name) {
                 continue;
             }
+            if !types_compatible(a_type, c_type) {
+                continue;
+            }
 
             let predicate = infer_predicate(a_type, c_type, None);
+
+            // Skip low-precision predicates (contemporary_of ~60%, related_to ~60%)
+            if predicate == "contemporary_of" || predicate == "related_to" {
+                continue;
+            }
+            // Skip trivial geo-geo associations
+            if predicate == "associated_with"
+                && (a_type == "place" || a_type == "location")
+                && (c_type == "place" || c_type == "location")
+            {
+                continue;
+            }
 
             let intermediary_names: Vec<String> = pair_intermediaries[&(a, c)]
                 .iter()
@@ -12580,6 +12602,11 @@ impl<'a> Prometheus<'a> {
 
             let predicate = infer_predicate(a_type, b_type, None);
 
+            // Skip contemporary_of — PA via hub connectivity produces noise
+            if predicate == "contemporary_of" {
+                continue;
+            }
+
             // Normalize score: PA scores can be very large (degree_a * degree_b)
             let norm_score = score.ln().max(1.0) / 15.0;
             let neighbor_bonus = (shared.len() as f64 * 0.05).min(0.15);
@@ -12735,9 +12762,18 @@ impl<'a> Prometheus<'a> {
             }
             let predicate = infer_predicate(a_type, b_type, None);
 
-            // Skip low-signal contemporary_of between persons — Katz picks these
-            // up via hub connectivity but they rarely add knowledge
-            if predicate == "contemporary_of" {
+            // Skip low-signal predicates that Katz picks up via hub connectivity
+            // but rarely produce useful knowledge:
+            // - contemporary_of: 47% confirmation rate
+            // - related_to: 32% confirmation rate
+            // - associated_with between two places: trivially true geo connections
+            if predicate == "contemporary_of" || predicate == "related_to" {
+                continue;
+            }
+            if predicate == "associated_with"
+                && (a_type == "place" || a_type == "location")
+                && (b_type == "place" || b_type == "location")
+            {
                 continue;
             }
 

@@ -4037,6 +4037,37 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject BC/AD prefixed fragments (e.g. "BC Marcellus", "AD Vespasian")
+    {
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        if words.len() >= 2 {
+            let first = words[0];
+            if matches!(first, "BC" | "AD" | "A.D" | "A.M" | "BCE" | "CE")
+                && etype != "date"
+                && etype != "year"
+            {
+                return false;
+            }
+        }
+    }
+
+    // Reject multi-word concepts containing sentence-like function words (article/citation fragments)
+    if etype == "concept" {
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        if words.len() >= 4 {
+            let function_words = [
+                "of", "in", "for", "the", "a", "an", "and", "or", "to", "with", "from",
+            ];
+            let func_count = words
+                .iter()
+                .filter(|w| function_words.contains(&w.to_lowercase().as_str()))
+                .count();
+            if func_count >= 2 {
+                return false;
+            }
+        }
+    }
+
     // Reject fragments where any word is a single letter (e.g. "B It", "K It", "Q Pa")
     {
         let words: Vec<&str> = trimmed.split_whitespace().collect();
