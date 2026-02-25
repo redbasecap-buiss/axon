@@ -1396,6 +1396,12 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "memoirs",
     "workflow",
     "operator",
+    "reprinted",
+    "passport",
+    "keeper",
+    "radius",
+    "adds support",
+    "further",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -1543,6 +1549,11 @@ const PLACE_INDICATORS: &[&str] = &[
     "canal",
     "straits",
     "archipelago",
+    "tunnel",
+    "dam",
+    "harbour",
+    "aqueduct",
+    "basilica",
     "headland",
     "promontory",
     "isthmus",
@@ -4991,6 +5002,32 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         || trimmed.contains('=')
     {
         return false;
+    }
+
+    // Reject reversed citation-format names (e.g. "Golub G.H", "Graaff M.A", "Jacobi C.G.J")
+    // These are "Surname Initials" patterns from bibliography references
+    {
+        let ws: Vec<&str> = trimmed.split_whitespace().collect();
+        if ws.len() == 2 {
+            let last = ws[1];
+            // Check if last token is initials: all chars are uppercase letters or dots
+            let is_initials = last.len() >= 2
+                && last.len() <= 8
+                && last.chars().all(|c| c.is_uppercase() || c == '.')
+                && last.chars().any(|c| c == '.');
+            if is_initials {
+                return false;
+            }
+            // Also check reversed: "A.K Popov" — first token is initials
+            let first = ws[0];
+            let first_is_initials = first.len() >= 2
+                && first.len() <= 8
+                && first.chars().all(|c| c.is_uppercase() || c == '.')
+                && first.chars().any(|c| c == '.');
+            if first_is_initials {
+                return false;
+            }
+        }
     }
 
     // Reject single long words (code identifiers, not knowledge entities)
