@@ -1628,6 +1628,12 @@ const PLACE_INDICATORS: &[&str] = &[
     "highlands",
     "wetland",
     "wetlands",
+    "governorate",
+    "governorates",
+    "municipality",
+    "prefecture",
+    "voivodeship",
+    "shire",
     // German/Swiss place terms
     "stadt",
     "altstadt",
@@ -4250,6 +4256,12 @@ const TRAILING_JUNK: &[&str] = &[
     "solution",
     "hypothesis",
     "approximation",
+    // Added 2026-02-25 (brain cleaner): academic/foreign trailing fragments
+    "inventario",
+    "fractal",
+    "disaster",
+    "deep",
+    "set",
 ];
 
 fn is_valid_entity(name: &str, etype: &str) -> bool {
@@ -5535,6 +5547,28 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         || lower.contains("mathpages")
     {
         return false;
+    }
+
+    // Reject academic journal/publication names (e.g. "Acta Mathematica", "Comptes Rendus")
+    {
+        let journal_prefixes = [
+            "acta",
+            "annales",
+            "annali",
+            "comptes",
+            "gazette",
+            "rivista",
+            "revista",
+            "zeitschrift",
+            "archiv",
+            "archivio",
+            "cahiers",
+            "bollettino",
+        ];
+        let first_word = lower.split_whitespace().next().unwrap_or("");
+        if lower.contains(' ') && journal_prefixes.contains(&first_word) {
+            return false;
+        }
     }
 
     // Reject entities containing Wikipedia reference/citation fragments
