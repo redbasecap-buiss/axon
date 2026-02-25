@@ -531,6 +531,46 @@ async fn main() -> anyhow::Result<()> {
                             println!();
                         }
                     }
+                    // Strategy momentum (recent vs historical performance)
+                    if let Ok(momentum) = p.strategy_momentum(7, 5) {
+                        let mut improving: Vec<_> =
+                            momentum.iter().filter(|(_, (_, _, m))| *m > 0.10).collect();
+                        let mut degrading: Vec<_> = momentum
+                            .iter()
+                            .filter(|(_, (_, _, m))| *m < -0.10)
+                            .collect();
+                        improving.sort_by(|a, b| {
+                            b.1 .2
+                                .partial_cmp(&a.1 .2)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        degrading.sort_by(|a, b| {
+                            a.1 .2
+                                .partial_cmp(&b.1 .2)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        if !improving.is_empty() || !degrading.is_empty() {
+                            println!("Strategy momentum (7-day trend):");
+                            for (strategy, (recent, _alltime, m)) in improving.iter().take(5) {
+                                println!(
+                                    "  🔼 {} — recent {:.0}%, momentum +{:.1}%",
+                                    strategy,
+                                    recent * 100.0,
+                                    m * 100.0
+                                );
+                            }
+                            for (strategy, (recent, _alltime, m)) in degrading.iter().take(5) {
+                                println!(
+                                    "  🔽 {} — recent {:.0}%, momentum {:.1}%",
+                                    strategy,
+                                    recent * 100.0,
+                                    m * 100.0
+                                );
+                            }
+                            println!();
+                        }
+                    }
+
                     // Crawl suggestions
                     let suggestions = p.suggest_crawl_topics().unwrap_or_default();
                     if !suggestions.is_empty() {

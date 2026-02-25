@@ -2621,12 +2621,34 @@ impl<'a> Prometheus<'a> {
                         continue;
                     }
 
+                    // Require at least 1 additional shared neighbor beyond the
+                    // shared object — pure shared-object alone has a 3% confirm rate
+                    let a_rels = self.brain.get_relations_for(sid_a)?;
+                    let b_rels = self.brain.get_relations_for(sid_b)?;
+                    let a_nbrs: HashSet<String> = a_rels
+                        .iter()
+                        .flat_map(|(sn, _, on, _)| [sn.clone(), on.clone()])
+                        .collect();
+                    let b_nbrs: HashSet<String> = b_rels
+                        .iter()
+                        .flat_map(|(sn, _, on, _)| [sn.clone(), on.clone()])
+                        .collect();
+                    let extra_shared = a_nbrs
+                        .intersection(&b_nbrs)
+                        .filter(|n| *n != &a && *n != &b && *n != &obj_name)
+                        .count();
+                    if extra_shared == 0 {
+                        continue;
+                    }
+
+                    let boosted_conf = (base_conf + 0.05 * extra_shared.min(3) as f64).min(0.85);
+
                     hypotheses.push(Hypothesis {
                         id: 0,
                         subject: a.clone(),
                         predicate: inferred_pred.to_string(),
                         object: b.clone(),
-                        confidence: base_conf,
+                        confidence: boosted_conf,
                         evidence_for: vec![format!(
                             "Both {} and {} share '{}' relationship to '{}'",
                             a, b, pred, obj_name
@@ -3937,6 +3959,7 @@ impl<'a> Prometheus<'a> {
     pub fn adaptive_thresholds(&self) -> Result<HashMap<String, f64>> {
         let roi = self.strategy_roi()?;
         let confirmation_rates = self.strategy_confirmation_rates(30).unwrap_or_default();
+        let momentum_map = self.strategy_momentum(7, 5).unwrap_or_default();
         let mut thresholds = HashMap::new();
         for (strategy, total, _confirmed, _rejected, roi_val, _) in &roi {
             // Use confirmation rate to further penalize unreliable strategies
@@ -3968,7 +3991,22 @@ impl<'a> Prometheus<'a> {
                 0.0
             };
 
-            let combined: f64 = base_threshold + conf_penalty;
+            // Momentum adjustment: strategies improving recently get a threshold
+            // reduction (more exploratory); degrading strategies get penalized.
+            let momentum_adj = momentum_map
+                .get(strategy)
+                .map(|&(_, _, m)| {
+                    if m > 0.10 {
+                        -0.05 // Improving: lower threshold
+                    } else if m < -0.15 {
+                        0.05 // Degrading: raise threshold
+                    } else {
+                        0.0
+                    }
+                })
+                .unwrap_or(0.0);
+
+            let combined: f64 = base_threshold + conf_penalty + momentum_adj;
             thresholds.insert(strategy.clone(), combined.min(0.85));
         }
         Ok(thresholds)
@@ -4129,13 +4167,96 @@ impl<'a> Prometheus<'a> {
         })
     }
 
+    /// Compute strategy momentum: compare recent (last N days) confirmation rate
+    /// against all-time rate. Returns map of strategy → (recent_rate, alltime_rate, momentum).
+    /// Positive momentum means the strategy is improving; negative means degrading.
+    pub fn strategy_momentum(
+        &self,
+        recent_days: i64,
+        min_recent_samples: i64,
+    ) -> Result<HashMap<String, (f64, f64, f64)>> {
+        let cutoff = (Utc::now() - chrono::Duration::days(recent_days))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        self.brain.with_conn(|conn| {
+            // Recent rates
+            let mut stmt = conn.prepare(
+                "SELECT pattern_source,
+                        COUNT(*) as total,
+                        SUM(CASE WHEN status='confirmed' THEN 1 ELSE 0 END) as confirmed
+                 FROM hypotheses
+                 WHERE discovered_at >= ?1
+                 GROUP BY pattern_source
+                 HAVING total >= ?2",
+            )?;
+            let recent: HashMap<String, (i64, i64)> = stmt
+                .query_map(params![cutoff, min_recent_samples], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .map(|(s, t, c)| (s, (t, c)))
+                .collect();
+
+            // All-time rates
+            let mut stmt2 = conn.prepare(
+                "SELECT pattern_source,
+                        COUNT(*) as total,
+                        SUM(CASE WHEN status='confirmed' THEN 1 ELSE 0 END) as confirmed
+                 FROM hypotheses
+                 GROUP BY pattern_source
+                 HAVING total >= 10",
+            )?;
+            let alltime: HashMap<String, (i64, i64)> = stmt2
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .map(|(s, t, c)| (s, (t, c)))
+                .collect();
+
+            let mut result = HashMap::new();
+            for (strategy, (rt, rc)) in &recent {
+                let recent_rate = if *rt > 0 {
+                    *rc as f64 / *rt as f64
+                } else {
+                    0.0
+                };
+                let (at, ac) = alltime.get(strategy).copied().unwrap_or((0, 0));
+                let alltime_rate = if at > 0 { ac as f64 / at as f64 } else { 0.0 };
+                let momentum = recent_rate - alltime_rate;
+                result.insert(strategy.clone(), (recent_rate, alltime_rate, momentum));
+            }
+            Ok(result)
+        })
+    }
+
     /// Returns set of strategy names that should be suspended (confirmation rate
     /// below threshold with sufficient samples). These strategies waste compute.
     pub fn suspended_strategies(&self) -> Result<HashSet<String>> {
         let rates = self.strategy_confirmation_rates(50)?;
+        let momentum_map = self.strategy_momentum(7, 5).unwrap_or_default();
         let mut suspended = HashSet::new();
         for (strategy, (_total, _confirmed, rate)) in &rates {
             if *rate < 0.20 {
+                // Check momentum: if the strategy is recently improving significantly,
+                // give it a second chance instead of suspending
+                if let Some(&(recent_rate, _, momentum)) = momentum_map.get(strategy) {
+                    if momentum > 0.15 && recent_rate >= 0.30 {
+                        eprintln!(
+                            "[PROMETHEUS] Strategy '{}' below threshold ({:.1}%) but showing positive momentum ({:.1}% recent) — keeping active",
+                            strategy, rate * 100.0, recent_rate * 100.0
+                        );
+                        continue;
+                    }
+                }
                 suspended.insert(strategy.clone());
                 eprintln!(
                     "[PROMETHEUS] Auto-suspending strategy '{}' (confirmation rate {:.1}% < 20%)",
@@ -5327,9 +5448,8 @@ impl<'a> Prometheus<'a> {
             crate::graph::graph_quality_score(self.brain).unwrap_or((0.0, HashMap::new()));
 
         // Track discovery velocity (include auto-resolved counts for accurate metrics)
-        let total_confirmed = confirmed + auto_confirmed as usize + excl_promoted as usize;
-        let total_rejected =
-            rejected + auto_rejected as usize + excl_rejected as usize + bulk_rejected as usize;
+        let total_confirmed = confirmed + auto_confirmed + excl_promoted;
+        let total_rejected = rejected + auto_rejected + excl_rejected + bulk_rejected;
         let _ = self.track_discovery_velocity(
             all_patterns.len(),
             all_hypotheses.len(),
@@ -9181,8 +9301,8 @@ impl<'a> Prometheus<'a> {
 
             for (cand_id, shared_set) in &two_hop {
                 let shared_count = shared_set.len();
-                if shared_count < 4 {
-                    continue; // Require at least 4 shared meaningful neighbors (raised from 3 to cut false positives)
+                if shared_count < 6 {
+                    continue; // Require at least 6 shared meaningful neighbors (raised from 5 to cut false positives)
                 }
                 let cand = match id_to_entity.get(cand_id) {
                     Some(e) => e,
@@ -9204,8 +9324,8 @@ impl<'a> Prometheus<'a> {
                 } else {
                     0.0
                 };
-                if jaccard < 0.35 {
-                    continue; // Require strong overlap ratio (raised from 0.30 to reduce 85% rejection rate)
+                if jaccard < 0.45 {
+                    continue; // Require strong overlap ratio (raised from 0.40 to reduce 85% rejection rate)
                 }
 
                 // Infer predicate from shared neighbors' edge labels
@@ -11029,22 +11149,49 @@ impl<'a> Prometheus<'a> {
                     if !seen.insert(key) {
                         continue;
                     }
-                    // Require at least 1 shared neighbor (structural evidence)
+                    // Require at least 2 shared neighbors (structural evidence)
+                    // Raised from 1 to reduce false positives (2.5% → target 15%+)
                     let a_nb = adj.get(&a).cloned().unwrap_or_default();
                     let b_nb = adj.get(&b).cloned().unwrap_or_default();
-                    let shared: usize = a_nb.intersection(&b_nb).count();
-                    if shared == 0 {
+                    let shared_nbrs: Vec<i64> = a_nb.intersection(&b_nb).copied().collect();
+                    if shared_nbrs.len() < 2 {
                         continue;
                     }
 
+                    // Infer a specific predicate from the edges to shared neighbors
+                    // instead of always using the vague "related_to"
+                    let mut pred_votes: HashMap<String, usize> = HashMap::new();
+                    for &nbr in &shared_nbrs {
+                        for r in &relations {
+                            if (r.subject_id == a && r.object_id == nbr)
+                                || (r.subject_id == nbr && r.object_id == a)
+                                || (r.subject_id == b && r.object_id == nbr)
+                                || (r.subject_id == nbr && r.object_id == b)
+                            {
+                                if !GENERIC_PREDICATES.contains(&r.predicate.as_str())
+                                    && r.predicate != "related_to"
+                                    && r.predicate != "associated_with"
+                                {
+                                    *pred_votes.entry(r.predicate.clone()).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                    }
+                    let inferred_pred = pred_votes
+                        .into_iter()
+                        .max_by_key(|(_, c)| *c)
+                        .map(|(p, _)| p)
+                        .unwrap_or_else(|| "collaborated_with".to_string());
+
                     let a_name = self.entity_name(a)?;
                     let b_name = self.entity_name(b)?;
-                    let conf = (0.50 + 0.05 * shared.min(6) as f64).min(0.85);
+                    let shared = shared_nbrs.len();
+                    let conf = (0.55 + 0.05 * shared.min(6) as f64).min(0.85);
 
                     hypotheses.push(Hypothesis {
                         id: 0,
                         subject: a_name.clone(),
-                        predicate: "related_to".to_string(),
+                        predicate: inferred_pred,
                         object: b_name.clone(),
                         confidence: conf,
                         evidence_for: vec![format!(
@@ -12406,7 +12553,7 @@ impl<'a> Prometheus<'a> {
             let predicate = infer_predicate(a_type, b_type, None);
 
             // Normalize score: PA scores can be very large (degree_a * degree_b)
-            let norm_score = (*score as f64).ln().max(1.0) / 15.0;
+            let norm_score = score.ln().max(1.0) / 15.0;
             let neighbor_bonus = (shared.len() as f64 * 0.05).min(0.15);
             let base_conf = (0.3 + norm_score * 0.3 + neighbor_bonus).min(0.80);
             let confidence = self
