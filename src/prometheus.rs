@@ -318,9 +318,22 @@ fn infer_predicate(
     b_type: &str,
     shared_neighbor_types: Option<&HashMap<String, usize>>,
 ) -> &'static str {
-    // If we have shared-neighbor evidence, use it for person-person refinement
-    if a_type == "person" && b_type == "person" {
-        if let Some(snt) = shared_neighbor_types {
+    // Normalize types: treat "company" as "organization" for matching
+    let a_norm = if a_type == "company" {
+        "organization"
+    } else {
+        a_type
+    };
+    let b_norm = if b_type == "company" {
+        "organization"
+    } else {
+        b_type
+    };
+
+    // Shared-neighbor-type refinement for multiple type pairs
+    if let Some(snt) = shared_neighbor_types {
+        // person-person refinement
+        if a_norm == "person" && b_norm == "person" {
             if snt.get("organization").copied().unwrap_or(0) > 0 {
                 return "colleagues_at";
             }
@@ -334,13 +347,56 @@ fn infer_predicate(
                 return "co_researchers";
             }
         }
+        // organization-organization refinement
+        if a_norm == "organization" && b_norm == "organization" {
+            if snt.get("person").copied().unwrap_or(0) >= 2 {
+                return "collaborates_with";
+            }
+            if snt.get("place").copied().unwrap_or(0) > 0 {
+                return "co_located_with";
+            }
+            if snt.get("concept").copied().unwrap_or(0) >= 2
+                || snt.get("technology").copied().unwrap_or(0) >= 2
+            {
+                return "competes_with";
+            }
+        }
+        // concept-concept refinement
+        if a_norm == "concept" && b_norm == "concept" {
+            if snt.get("person").copied().unwrap_or(0) >= 2 {
+                return "studied_alongside";
+            }
+            if snt.get("technology").copied().unwrap_or(0) > 0 {
+                return "applied_in_same_tech";
+            }
+        }
+        // place-place refinement
+        if a_norm == "place" && b_norm == "place" {
+            if snt.get("person").copied().unwrap_or(0) >= 2 {
+                return "historically_linked_to";
+            }
+            if snt.get("organization").copied().unwrap_or(0) > 0 {
+                return "geographically_related_to";
+            }
+            if snt.get("event").copied().unwrap_or(0) > 0 {
+                return "connected_by_event";
+            }
+        }
+        // person-concept refinement via shared technology neighbors
+        if (a_norm == "person" && b_norm == "concept")
+            || (a_norm == "concept" && b_norm == "person")
+        {
+            if snt.get("technology").copied().unwrap_or(0) > 0 {
+                return "pioneered";
+            }
+        }
     }
 
     // Type-pair defaults — prefer specific predicates over vague ones
     match (a_type, b_type) {
         ("person", "person") => "contemporary_of",
         ("concept", "concept") => "related_concept",
-        ("organization", "organization") => "partner_of",
+        ("organization", "organization") | ("company", "company") => "partner_of",
         ("place", "place") => "geographically_related_to",
         ("person", "organization") | ("organization", "person") => "affiliated_with",
         ("person", "concept") | ("concept", "person") => "contributed_to",
@@ -358,9 +414,17 @@ fn infer_predicate(
         ("event", "place") | ("place", "event") => "held_in",
         ("event", "concept") | ("concept", "event") => "addresses",
         ("event", "event") => "precedes",
-        ("company", "company") => "partner_of",
         ("company", "technology") | ("technology", "company") => "develops",
         ("company", "place") | ("place", "company") => "headquartered_in",
+        ("company", "concept") | ("concept", "company") => "focuses_on",
+        ("company", "event") | ("event", "company") => "participated_in",
+        ("product", "technology") | ("technology", "product") => "built_with",
+        ("product", "concept") | ("concept", "product") => "embodies",
+        ("product", "company") | ("company", "product") => "produced_by",
+        ("product", "product") => "competes_with",
+        ("place", "concept") | ("concept", "place") => "associated_with",
+        ("place", "technology") | ("technology", "place") => "deployed_in",
+        ("event", "technology") | ("technology", "event") => "showcased_at",
         _ => "related_to",
     }
 }
@@ -11000,7 +11064,7 @@ impl<'a> Prometheus<'a> {
                  WHERE status = 'testing' \
                  AND discovered_at < ?1 \
                  AND confidence < ?2 \
-                 AND predicate IN ('related_to', 'contemporary_of', 'associated_with', 'relevant_to')",
+                 AND predicate IN ('related_to', 'contemporary_of', 'associated_with', 'relevant_to', 'references')",
                 params![cutoff, max_confidence],
             )?;
             Ok(updated)
