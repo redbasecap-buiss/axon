@@ -12393,9 +12393,10 @@ impl<'a> Prometheus<'a> {
             }
             let a_type = id_type.get(a).copied().unwrap_or("?");
             let b_type = id_type.get(b).copied().unwrap_or("?");
-            // Place-place pairs have 26% confirmation via semantic fingerprint —
-            // require stronger signal (≥3 shared patterns or jaccard ≥ 0.50)
-            if a_type == "place" && b_type == "place" && *shared < 3 && *jaccard < 0.50 {
+            // Place-place pairs have high rejection rate via semantic fingerprint —
+            // Jaccard=1.0 with only 1 shared pattern is meaningless (both just have 1 relation).
+            // Require ≥3 shared patterns regardless of Jaccard.
+            if a_type == "place" && b_type == "place" && *shared < 3 {
                 continue;
             }
             let predicate = infer_predicate(a_type, b_type, None);
@@ -14290,6 +14291,16 @@ impl<'a> Prometheus<'a> {
             if is_generic_predicate(&r.predicate) {
                 continue;
             }
+            // Skip predicates that create spurious peer connections:
+            // co_extracted_with is an extraction artifact, not a semantic relation;
+            // birthplace_of links places to a person (Brazil+England sharing a birth
+            // doesn't mean they're geographically related).
+            if matches!(
+                r.predicate.as_str(),
+                "co_extracted_with" | "birthplace_of" | "co-extracted_with"
+            ) {
+                continue;
+            }
             pred_obj_subjects
                 .entry((r.predicate.clone(), r.object_id))
                 .or_default()
@@ -14346,6 +14357,11 @@ impl<'a> Prometheus<'a> {
                                 // Extra signal: multiple shared objects
                             }
                         }
+                    }
+                    // Place-place pairs with only 1 shared predicate-object have
+                    // high rejection rates — require at least 2 shared objects.
+                    if a_type == "place" && b_type == "place" && shared_count < 2 {
+                        continue;
                     }
                     let base_conf = (0.35 + 0.10 * shared_count as f64).min(0.75);
                     let confidence = self
