@@ -5184,6 +5184,9 @@ impl<'a> Prometheus<'a> {
         // Auto-seed frontier with Wikipedia URLs for high-value isolated entities
         let frontier_seeded = self.seed_frontier_for_isolated_entities(50).unwrap_or(0);
 
+        // Seed frontier for connected but fact-poor entities (enrichment targets)
+        let enrichment_seeded = self.seed_frontier_for_fact_poor_entities(20).unwrap_or(0);
+
         // Detect discovery plateau and log recommendation
         let (is_plateau, _plateau_metric, plateau_rec) = self
             .detect_discovery_plateau(10)
@@ -5490,8 +5493,12 @@ impl<'a> Prometheus<'a> {
         } else {
             String::new()
         };
-        let frontier_line = if frontier_seeded > 0 {
-            format!(", {} frontier URLs seeded", frontier_seeded)
+        let frontier_line = if frontier_seeded > 0 || enrichment_seeded > 0 {
+            format!(
+                ", {} frontier URLs seeded ({} enrichment)",
+                frontier_seeded + enrichment_seeded,
+                enrichment_seeded
+            )
         } else {
             String::new()
         };
@@ -7660,6 +7667,62 @@ impl<'a> Prometheus<'a> {
         if seeded > 0 {
             eprintln!(
                 "[PROMETHEUS] Seeded frontier with {} Wikipedia URLs for isolated entities",
+                seeded
+            );
+        }
+        Ok(seeded)
+    }
+
+    /// Seed frontier URLs for connected but fact-poor entities.
+    /// These are high-PageRank entities with many relations but zero facts —
+    /// crawling their Wikipedia pages would add structured knowledge (birth/death
+    /// dates, descriptions, key facts).
+    pub fn seed_frontier_for_fact_poor_entities(&self, max_seeds: usize) -> Result<usize> {
+        // Find connected entities with ≥3 relations but 0 facts, ordered by relation count
+        let candidates: Vec<(String, String, i64)> = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT e.name, e.entity_type,
+                        (SELECT COUNT(*) FROM relations r WHERE r.subject_id = e.id OR r.object_id = e.id) as rel_count
+                 FROM entities e
+                 WHERE e.entity_type IN ('person', 'place', 'organization', 'technology', 'concept')
+                   AND (SELECT COUNT(*) FROM facts f WHERE f.entity_id = e.id) = 0
+                   AND rel_count >= 3
+                 ORDER BY rel_count DESC
+                 LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![max_seeds * 2], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        })?;
+
+        let mut seeded = 0usize;
+        for (name, entity_type, _rel_count) in &candidates {
+            if seeded >= max_seeds {
+                break;
+            }
+            if is_noise_name(name) || name.len() < 3 {
+                continue;
+            }
+            let wiki_title = name.replace(' ', "_");
+            let url = format!("https://en.wikipedia.org/wiki/{}", wiki_title);
+            let priority = match entity_type.as_str() {
+                "person" => 9, // Higher than isolated entity seeds
+                "place" => 8,
+                "organization" => 7,
+                _ => 6,
+            };
+            if self.brain.add_to_frontier(&url, priority).is_ok() {
+                seeded += 1;
+            }
+        }
+
+        if seeded > 0 {
+            eprintln!(
+                "[PROMETHEUS] Seeded frontier with {} Wikipedia URLs for fact-poor connected entities",
                 seeded
             );
         }
@@ -24406,8 +24469,60 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
                 "process",
                 "model",
                 "system",
+                "discovery",
+                "discoveries",
+                "invention",
+                "inventions",
+                "revolution",
+                "movement",
+                "crisis",
+                "massacre",
+                "rebellion",
+                "revolt",
+                "campaign",
+                "conquest",
+                "expedition",
+                "voyage",
+                "migration",
+                "diaspora",
             ];
             if concept_suffixes.contains(last) {
+                return Some("concept");
+            }
+            // Political entities ending with these are places/polities, not persons
+            let polity_suffixes = [
+                "empire",
+                "kingdom",
+                "republic",
+                "dynasty",
+                "caliphate",
+                "sultanate",
+                "khanate",
+                "duchy",
+                "principality",
+                "confederation",
+                "federation",
+                "commonwealth",
+            ];
+            if polity_suffixes.contains(last) {
+                return Some("place");
+            }
+            // Creative works / titles misclassified as person
+            let work_indicators = [
+                "bride",
+                "saga",
+                "chronicle",
+                "chronicles",
+                "manuscript",
+                "codex",
+                "testament",
+                "gospel",
+                "epic",
+                "odyssey",
+                "trilogy",
+                "anthology",
+            ];
+            if work_indicators.contains(last) {
                 return Some("concept");
             }
         }
@@ -24589,6 +24704,11 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         "coral sea",
         "north sea",
         "irish sea",
+        "machu picchu",
+        "huayna picchu",
+        "angkor wat",
+        "mont blanc",
+        "monte carlo",
     ];
     if current_type == "person" && known_places.contains(&lower) {
         return Some("place");
@@ -24653,6 +24773,14 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
             "prairie",
             "tundra",
             "wetlands",
+            "range",
+            "ranges",
+            "highlands",
+            "lowlands",
+            "foothills",
+            "headwaters",
+            "estuary",
+            "confluence",
             "waterfall",
         ];
         if let Some(last) = words.last() {

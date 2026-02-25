@@ -1254,6 +1254,62 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "pamphlet",
     "brochure",
     "epitome",
+    // Added 2026-02-25 (brain cleaner round 2): generic adjectives/nouns from DB audit
+    "american",
+    "asian",
+    "australian",
+    "beyond",
+    "compact",
+    "comparison",
+    "connected",
+    "cosmic",
+    "differential",
+    "doctoral",
+    "documentary",
+    "environmental",
+    "exotic",
+    "formation",
+    "future",
+    "gallery",
+    "geographic",
+    "german",
+    "gravitational",
+    "heritage",
+    "high-energy",
+    "history",
+    "horses",
+    "linear",
+    "lutheran",
+    "magnetismus",
+    "mathematics",
+    "observations",
+    "operation",
+    "radiation",
+    "rotation",
+    "scientific",
+    "scientist",
+    "soldier",
+    "warrior",
+    "weaponry",
+    "website",
+    "chinese",
+    "canadian",
+    "chemistry",
+    "protestant",
+    "acrobats",
+    "averages",
+    "glitches",
+    "transcripted",
+    "twentieth",
+    "unusual",
+    "elektrizität",
+    "darstellbarkeit",
+    "habilitationsschrift",
+    "vorlesungen",
+    "wissenschaften",
+    "magnetismus",
+    "hypothesen",
+    "toyotism",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -3992,6 +4048,28 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject wiki namespace prefixes (e.g. "Help:FTP", "Talk:Foo", "Category:Bar")
+    {
+        const WIKI_NAMESPACES: &[&str] = &[
+            "Help:",
+            "Talk:",
+            "User:",
+            "Template:",
+            "Special:",
+            "Portal:",
+            "Category:",
+            "File:",
+            "Wikipedia:",
+            "Module:",
+            "Draft:",
+        ];
+        for ns in WIKI_NAMESPACES {
+            if trimmed.starts_with(ns) {
+                return false;
+            }
+        }
+    }
+
     // Reject citation-like patterns (e.g. "I:361 Robert Millikan", "Tacitus Annales IV.5")
     if trimmed.contains(':') && trimmed.chars().any(|c| c.is_ascii_digit()) {
         return false;
@@ -4056,6 +4134,27 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
             .any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
     {
         return false;
+    }
+
+    // Reject journal/paper title fragments glued to entity names
+    // e.g. "Stars The Astrophysical Journal Letters", "Survey The Astrophysical"
+    {
+        const JOURNAL_FRAGMENTS: &[&str] = &[
+            "the astrophysical",
+            "the journal",
+            "journal letters",
+            "review letters",
+            "physical review",
+            "the conversation",
+            "the secret codes",
+            "the first emperor",
+        ];
+        let lower_check = trimmed.to_lowercase();
+        for frag in JOURNAL_FRAGMENTS {
+            if lower_check.contains(frag) && trimmed.split_whitespace().count() > 3 {
+                return false;
+            }
+        }
     }
 
     // Blacklist check (case-insensitive)
