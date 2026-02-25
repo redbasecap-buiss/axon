@@ -844,6 +844,74 @@ pub fn is_noise_name(name: &str) -> bool {
         "editions",
         "galleries",
         "collections",
+        // Generic nouns that indicate NLP extraction noise when trailing
+        "lecture",
+        "lectures",
+        "kinship",
+        "child",
+        "children",
+        "down",
+        "up",
+        "out",
+        "off",
+        "away",
+        "back",
+        "forward",
+        "together",
+        "apart",
+        "inside",
+        "outside",
+        "above",
+        "below",
+        "across",
+        "through",
+        "along",
+        "behind",
+        "movement",
+        "movements",
+        "rebellion",
+        "uprising",
+        "revolt",
+        "campaign",
+        "campaigns",
+        "controversy",
+        "conspiracy",
+        "hypothesis",
+        "thesis",
+        "dissertation",
+        "manuscript",
+        "manuscripts",
+        "transcript",
+        "transcripts",
+        "memorial",
+        "memorials",
+        "monument",
+        "monuments",
+        "testimony",
+        "analysis",
+        "overview",
+        "summary",
+        "introduction",
+        "conclusion",
+        "discussion",
+        "comparison",
+        "reference",
+        "references",
+        "bibliography",
+        "footnote",
+        "footnotes",
+        "appendix",
+        "index",
+        "glossary",
+        "catalog",
+        "catalogue",
+        "inventory",
+        "directory",
+        "handbook",
+        "manual",
+        "guide",
+        "tutorial",
+        "textbook",
     ];
     if word_count >= 2 {
         let last_word = lower_trimmed.split_whitespace().last().unwrap_or("");
@@ -869,6 +937,20 @@ pub fn is_noise_name(name: &str) -> bool {
         "annual",
         "monthly",
         "weekly",
+        // Source/website names that get concatenated with entities
+        "sciencedaily",
+        "wikipedia",
+        "britannica",
+        "jstor",
+        "springer",
+        "wiley",
+        "elsevier",
+        "arxiv",
+        "doi",
+        "isbn",
+        "issn",
+        "oclc",
+        "pmid",
     ];
     if word_count >= 2 {
         let last_word = lower_trimmed.split_whitespace().last().unwrap_or("");
@@ -1174,6 +1256,36 @@ pub fn is_noise_name(name: &str) -> bool {
             if has_person_word {
                 return true;
             }
+        }
+    }
+    // Names containing source/website indicators anywhere (e.g. "Comet ScienceDaily")
+    let source_indicators = [
+        "sciencedaily",
+        "phys.org",
+        "livescience",
+        "newscientist",
+        "nationalgeographic",
+        "smithsonian",
+        "bbc",
+    ];
+    if source_indicators.iter().any(|s| lower_trimmed.contains(s)) {
+        return true;
+    }
+    // Two-word names where both words are all-caps abbreviations or very short generic words
+    // (e.g. "Two Child", "Women Kinship")
+    if word_count == 2 {
+        let words: Vec<&str> = lower_trimmed.split_whitespace().collect();
+        let generic_first = [
+            "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "many", "some",
+            "few", "several", "most", "all", "each", "every", "women", "men", "people", "human",
+            "humans", "comet", "planet",
+        ];
+        let generic_second = [
+            "child", "children", "kinship", "down", "up", "theory", "policy", "problem", "paradox",
+            "question", "answer", "rule", "law", "bride", "groom", "lecture", "speech", "talk",
+        ];
+        if generic_first.contains(&words[0]) && generic_second.contains(&words[1]) {
+            return true;
         }
     }
     false

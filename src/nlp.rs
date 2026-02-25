@@ -6617,6 +6617,65 @@ pub fn extract_entities(sentences: &[String]) -> Vec<(String, String)> {
     }
     // Apply quality filter
     entities.retain(|(name, etype)| is_valid_entity(name, etype));
+
+    // Normalize: strip profession/title prefixes from person entities
+    // e.g. "Egyptologist Wolfgang Helck" → "Wolfgang Helck"
+    const PROFESSION_PREFIXES: &[&str] = &[
+        "egyptologist",
+        "archaeologist",
+        "assyriologist",
+        "topologist",
+        "mathematician",
+        "physicist",
+        "chemist",
+        "biologist",
+        "historian",
+        "philosopher",
+        "geographer",
+        "astronomer",
+        "geologist",
+        "botanist",
+        "zoologist",
+        "linguist",
+        "anthropologist",
+        "sociologist",
+        "economist",
+        "psychologist",
+        "theologian",
+        "meteorologist",
+        "paleontologist",
+        "entomologist",
+        "ornithologist",
+        "ichthyologist",
+        "mineralogist",
+        "cartographer",
+        "lexicographer",
+        "musicologist",
+        "sinologist",
+        "orientalist",
+        "classicist",
+        "byzantinist",
+        "medievalist",
+        "numismatist",
+        "epigrapher",
+        "philologist",
+        "ethnographer",
+    ];
+    for (name, etype) in entities.iter_mut() {
+        if etype == "person" || etype == "concept" {
+            let first_word = name.split_whitespace().next().unwrap_or("");
+            if PROFESSION_PREFIXES.contains(&first_word.to_lowercase().as_str()) {
+                let rest = name[first_word.len()..].trim().to_string();
+                if rest.split_whitespace().count() >= 2
+                    && rest.chars().next().is_some_and(|c| c.is_uppercase())
+                {
+                    *name = rest;
+                    *etype = "person".to_string();
+                }
+            }
+        }
+    }
+
     entities
 }
 
