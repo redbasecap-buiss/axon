@@ -4743,6 +4743,32 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
         return false;
     }
 
+    // Reject "Topic University/Institute/College" concatenations where the prefix is
+    // a generic concept word, not a place or proper name for the institution.
+    // E.g. "Blackbody Radiation University", "Galileo Trial University" — these arise when
+    // the entity extractor chains a topic phrase with an institution name across boundaries.
+    {
+        const INST_SUFFIXES: &[&str] = &["university", "institute", "college"];
+        if let Some(last) = words.last() {
+            if INST_SUFFIXES.contains(last) && words.len() >= 2 {
+                let prefix_words = &words[..words.len() - 1];
+                // Check if any prefix word is in the blacklist or concept indicators
+                // (real universities are named after places or people, not generic topics)
+                let has_concept_prefix = prefix_words.iter().any(|w| {
+                    let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
+                    // Don't flag place indicators as concept prefixes (e.g. "New" in "New York University")
+                    if PLACE_INDICATORS.contains(&clean) || ORG_INDICATORS.contains(&clean) {
+                        return false;
+                    }
+                    CONCEPT_INDICATORS.contains(&clean) || ENTITY_BLACKLIST.contains(&clean)
+                });
+                if has_concept_prefix {
+                    return false;
+                }
+            }
+        }
+    }
+
     // Reject publisher/journal names (citation noise, not knowledge entities)
     const PUBLISHER_NAMES: &[&str] = &[
         "routledge",
