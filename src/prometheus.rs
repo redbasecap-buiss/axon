@@ -12720,6 +12720,12 @@ impl<'a> Prometheus<'a> {
             }
             let predicate = infer_predicate(a_type, b_type, None);
 
+            // Skip low-signal contemporary_of between persons — Katz picks these
+            // up via hub connectivity but they rarely add knowledge
+            if predicate == "contemporary_of" {
+                continue;
+            }
+
             // Boost confidence by shared neighbor count (starts at 2 now)
             let neighbor_boost = (shared_neighbors as f64 * 0.03).min(0.15);
             let base_conf = (0.35 + (sim.ln().max(-5.0) + 5.0) * 0.08 + neighbor_boost).min(0.75);
@@ -24077,6 +24083,54 @@ fn is_extraction_noise(name: &str, entity_type: &str) -> bool {
         return true;
     }
 
+    // Multi-word entities containing words that indicate concatenation artifacts
+    // e.g., "Sicily Result Spartan", "Valium Velcro", "Champollion Lettre"
+    if word_count >= 2 {
+        let concat_noise_words = [
+            "result",
+            "results",
+            "lettre",
+            "lettres",
+            "velcro",
+            "semiorder",
+            "versus",
+            "chapter",
+            "chapters",
+            "volume",
+            "volumes",
+            "edition",
+            "appendix",
+            "index",
+            "table",
+            "tables",
+            "figure",
+            "figures",
+            "section",
+            "sections",
+            "page",
+            "pages",
+            "footnote",
+            "footnotes",
+            "bibliography",
+            "glossary",
+            "preface",
+            "prologue",
+            "epilogue",
+            "abstract",
+            "summary",
+            "overview",
+            "introduction",
+            "conclusion",
+        ];
+        let words_lower: Vec<String> = lower.split_whitespace().map(|s| s.to_string()).collect();
+        if words_lower
+            .iter()
+            .any(|w| concat_noise_words.contains(&w.as_str()))
+        {
+            return true;
+        }
+    }
+
     // Single generic words that got capitalized by NLP extractors
     let generic_singles = [
         "actor",
@@ -25311,6 +25365,16 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
             "lagoon",
         ];
         if words.iter().any(|w| strong_geo_words.contains(w)) {
+            return Some("place");
+        }
+        // Geographic prefixes: "Stadt X", "Wadi X", "Monte X", "Rio X", "Sierra X", etc.
+        let geo_prefixes = [
+            "stadt", "wadi", "monte", "rio", "sierra", "cerro", "lago", "cabo", "isla", "punta",
+            "bahia", "golfo", "valle", "selva", "col", "pic", "massif", "fort", "camp", "san",
+            "santa", "santo", "bahr", "jebel", "jabal", "tel", "ain", "ras", "khor", "bir",
+            "banteay", "wat", "kampong", "phnom",
+        ];
+        if words.len() >= 2 && geo_prefixes.contains(&words[0]) {
             return Some("place");
         }
     }
