@@ -12598,6 +12598,17 @@ impl<'a> Prometheus<'a> {
             let a_type = id_type.get(a).copied().unwrap_or("?");
             let b_type = id_type.get(b).copied().unwrap_or("?");
             let predicate = infer_predicate(a_type, b_type, None);
+            // Skip high-rejection predicates:
+            // geographically_related_to (31.3%), located_near (33.3%),
+            // associated_with (30%), contemporary_of, related_to
+            if predicate == "geographically_related_to"
+                || predicate == "located_near"
+                || predicate == "associated_with"
+                || predicate == "contemporary_of"
+                || predicate == "related_to"
+            {
+                continue;
+            }
             hypotheses.push(Hypothesis {
                 id: 0,
                 subject: a_name.to_string(),
@@ -14515,6 +14526,16 @@ impl<'a> Prometheus<'a> {
                         .calibrated_confidence("shared_predicate_object", base_conf)
                         .unwrap_or(base_conf);
                     let inferred_pred = infer_predicate(a_type, b_type, None);
+                    // Skip high-rejection predicates for this strategy:
+                    // associated_with (42% rej), geographically_related_to (64% rej),
+                    // contemporary_of, related_to
+                    if inferred_pred == "associated_with"
+                        || inferred_pred == "geographically_related_to"
+                        || inferred_pred == "contemporary_of"
+                        || inferred_pred == "related_to"
+                    {
+                        continue;
+                    }
                     hypotheses.push(Hypothesis {
                         id: 0,
                         subject: a_name.to_string(),
@@ -14716,6 +14737,11 @@ impl<'a> Prometheus<'a> {
                 let subj_name = id_name.get(&r.object_id).copied().unwrap_or("?");
                 let obj_name = id_name.get(&r.subject_id).copied().unwrap_or("?");
                 if is_noise_name(subj_name) || is_noise_name(obj_name) {
+                    continue;
+                }
+                // Skip superclass_of — 67% rejection rate; the underlying
+                // subclass_of relations are often wrong (place→place misclassified)
+                if inverse == "superclass_of" {
                     continue;
                 }
 
@@ -15340,6 +15366,15 @@ impl<'a> Prometheus<'a> {
             seen.insert(key);
 
             let predicate = infer_predicate(a_type, c_type, None);
+            // Skip high-rejection predicates for open_triangle:
+            // geographically_related_to (80% rej), contemporary_of, related_to, associated_with
+            if predicate == "geographically_related_to"
+                || predicate == "contemporary_of"
+                || predicate == "related_to"
+                || predicate == "associated_with"
+            {
+                continue;
+            }
             // Base confidence scales with intermediary count: 3→0.55, 5→0.65, 10→0.75
             let base_conf = (0.45 + 0.05 * (*shared_count as f64).min(6.0)).min(0.80);
             let confidence = self
@@ -15433,6 +15468,16 @@ impl<'a> Prometheus<'a> {
             seen.insert(key);
 
             let predicate = infer_predicate(a_type, b_type, None);
+            // Skip high-rejection predicates:
+            // geographically_related_to (21.7% rej), located_near (33.3% rej),
+            // associated_with (23.7% rej), contemporary_of, related_to
+            if predicate == "geographically_related_to"
+                || predicate == "located_near"
+                || predicate == "contemporary_of"
+                || predicate == "related_to"
+            {
+                continue;
+            }
             let norm_score = score / max_score;
             let base_conf = (0.40 + 0.35 * norm_score).min(0.75);
             let confidence = self
