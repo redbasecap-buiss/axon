@@ -1238,6 +1238,22 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "cryptologia",
     "chessgames",
     "dulcarnon",
+    // Added 2026-02-25 (brain cleaner): broken extraction patterns, generics
+    "sustainable",
+    "physicists",
+    "prospector",
+    "feathered",
+    "concise",
+    "polonica",
+    "virginis",
+    "enumeratio",
+    "memoriam",
+    "antiquity",
+    "manuscript",
+    "manuscripts",
+    "pamphlet",
+    "brochure",
+    "epitome",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -4789,6 +4805,32 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
     // Reject single-word entities classified as "person" — real people have at least two words
     if etype == "person" && !lower.contains(' ') {
         return false;
+    }
+
+    // Reject 2-word "person" entities where second word is a blacklisted entity
+    // (e.g. "Helios Sun", "Apollo Moon", "Water Regime")
+    if etype == "person" && lower.contains(' ') {
+        let w: Vec<&str> = lower.split_whitespace().collect();
+        if w.len() == 2 {
+            let second = w[1];
+            let generic_second_words = [
+                "sun",
+                "moon",
+                "star",
+                "regime",
+                "soviet",
+                "rouge",
+                "agriculture",
+                "prospector",
+                "royale",
+                "serpent",
+                "kush",
+                "tristia",
+            ];
+            if generic_second_words.contains(&second) {
+                return false;
+            }
+        }
     }
 
     // Reject "person" entities containing publishing/academic/concept terms
