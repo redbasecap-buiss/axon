@@ -3053,12 +3053,22 @@ impl<'a> Prometheus<'a> {
 
         // Predicate specificity penalty: vague predicates carry less information
         // and are more likely to be false positives (nearly anything can be "related_to").
+        // Predicates with historically terrible confirmation rates — block outright
+        const DEAD_PREDICATES: &[&str] = &[
+            "references", // 12.2% confirmation — nearly always wrong
+        ];
+        if DEAD_PREDICATES.contains(&hypothesis.predicate.as_str()) {
+            hypothesis.confidence = 0.0;
+            return Ok(0.0);
+        }
+
         const VAGUE_PREDICATES: &[&str] = &[
             "related_to",
             "associated_with",
             "relevant_to",
             "connected_to",
             "linked_to",
+            "geographically_related_to", // 67.3% — too vague for geography
         ];
         if VAGUE_PREDICATES.contains(&hypothesis.predicate.as_str()) {
             score -= 0.10;
@@ -3068,6 +3078,10 @@ impl<'a> Prometheus<'a> {
         // to require stronger evidence before confirmation.
         if hypothesis.predicate == "contemporary_of" {
             score -= 0.08;
+        }
+        // pioneered has marginal confirmation (53.8%) — penalize lightly
+        if hypothesis.predicate == "pioneered" {
+            score -= 0.06;
         }
 
         // Apply pattern weight
@@ -3588,7 +3602,6 @@ impl<'a> Prometheus<'a> {
                 "studied_at",
                 "works_at",
                 "developed",
-                "pioneered",
                 "capital_of",
                 "part_of",
             ];
@@ -25654,6 +25667,11 @@ fn detect_correct_type(lower: &str, words: &[&str], current_type: &str) -> Optio
         "swamp",
         "oasis",
         "inlet",
+        "town",
+        "village",
+        "port",
+        "fort",
+        "park",
     ];
     if (current_type == "person" || current_type == "concept")
         && word_count >= 2
