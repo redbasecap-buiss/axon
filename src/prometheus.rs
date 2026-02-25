@@ -336,19 +336,31 @@ fn infer_predicate(
         }
     }
 
-    // Type-pair defaults
+    // Type-pair defaults — prefer specific predicates over vague ones
     match (a_type, b_type) {
         ("person", "person") => "contemporary_of",
         ("concept", "concept") => "related_concept",
         ("organization", "organization") => "partner_of",
-        ("place", "place") => "associated_with",
+        ("place", "place") => "located_near",
         ("person", "organization") | ("organization", "person") => "affiliated_with",
         ("person", "concept") | ("concept", "person") => "contributed_to",
         ("person", "place") | ("place", "person") => "active_in",
         ("person", "technology") | ("technology", "person") => "works_on",
-        ("organization", "concept") | ("concept", "organization") => "relevant_to",
+        ("person", "event") | ("event", "person") => "participated_in",
+        ("person", "product") | ("product", "person") => "created",
+        ("person", "company") | ("company", "person") => "affiliated_with",
+        ("organization", "concept") | ("concept", "organization") => "focuses_on",
         ("organization", "place") | ("place", "organization") => "based_in",
-        ("technology", "concept") | ("concept", "technology") => "relevant_to",
+        ("organization", "technology") | ("technology", "organization") => "develops",
+        ("organization", "event") | ("event", "organization") => "organized",
+        ("technology", "concept") | ("concept", "technology") => "implements",
+        ("technology", "technology") => "integrates_with",
+        ("event", "place") | ("place", "event") => "held_in",
+        ("event", "concept") | ("concept", "event") => "addresses",
+        ("event", "event") => "precedes",
+        ("company", "company") => "partner_of",
+        ("company", "technology") | ("technology", "company") => "develops",
+        ("company", "place") | ("place", "company") => "headquartered_in",
         _ => "related_to",
     }
 }
@@ -2950,6 +2962,19 @@ impl<'a> Prometheus<'a> {
                     score += 0.04;
                 }
             }
+        }
+
+        // Predicate specificity penalty: vague predicates carry less information
+        // and are more likely to be false positives (nearly anything can be "related_to").
+        const VAGUE_PREDICATES: &[&str] = &[
+            "related_to",
+            "associated_with",
+            "relevant_to",
+            "connected_to",
+            "linked_to",
+        ];
+        if VAGUE_PREDICATES.contains(&hypothesis.predicate.as_str()) {
+            score -= 0.10;
         }
 
         // Apply pattern weight
@@ -21947,12 +21972,23 @@ impl<'a> Prometheus<'a> {
                     h.predicate.as_str()
                 ),
                 ("person", "person", "contemporary_of")
+                    | ("person", "person", "collaborated_with")
+                    | ("person", "person", "colleagues_at")
+                    | ("person", "person", "co_researchers")
                     | ("person", "concept", "pioneered")
+                    | ("person", "concept", "contributed_to")
                     | ("person", "technology", "pioneered")
+                    | ("person", "technology", "works_on")
                     | ("person", "organization", "affiliated_with")
                     | ("person", "place", "active_in")
+                    | ("person", "event", "participated_in")
                     | ("organization", "place", "based_in")
                     | ("organization", "person", "affiliated_with")
+                    | ("organization", "technology", "develops")
+                    | ("technology", "concept", "implements")
+                    | ("event", "place", "held_in")
+                    | ("company", "technology", "develops")
+                    | ("company", "place", "headquartered_in")
             );
             // Low-affinity pairings (penalize)
             let low_affinity = matches!(
@@ -21966,6 +22002,9 @@ impl<'a> Prometheus<'a> {
                     | ("concept", "concept", "related_concept")
                     | ("place", "place", "contemporary_of")
                     | ("concept", "concept", "contemporary_of")
+                    | ("place", "place", "associated_with")
+                    | ("person", "person", "related_to")
+                    | ("technology", "place", "related_to")
             );
 
             if high_affinity {
