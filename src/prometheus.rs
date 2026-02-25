@@ -4966,6 +4966,14 @@ impl<'a> Prometheus<'a> {
         // Extended concept reclassification (well-known places/tech misclassified as concept)
         let concepts_reclassified = self.reclassify_isolated_concepts_extended().unwrap_or(0);
 
+        // Graph-informed concept reclassification (match island names to connected entity surnames)
+        let graph_surname_reclassified = self
+            .reclassify_concept_islands_by_graph_surnames()
+            .unwrap_or(0);
+
+        // Purge common English word concept islands
+        let common_word_purged = self.purge_common_word_concept_islands().unwrap_or(0);
+
         // Reclassify connected single-word concepts that match known person surnames
         let surname_concepts_reclassified =
             self.reclassify_connected_surname_concepts().unwrap_or(0);
@@ -5205,7 +5213,7 @@ impl<'a> Prometheus<'a> {
              {} fragment-purged, {} prefix-strip merged, {} name-variants merged, {} auto-consolidated, \
              {} fragment-hubs dissolved, {} hc-prefix merged, {} convergence-pass merges, \
              {} connected-containment merged, {} aggressive-prefix deduped, \
-             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} surname-concepts-reclassified, {} common-english-person-purged, {} geo-person-reclassified, {} place-region-reclassified, {} compound-concept-reclassified, {} endash-reclassified, {} ancient-islands-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} minute-cohort reconnected, {} large-cohort-type reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} hv-cohort-reconnected, {} surname-reconnected, {} source-url-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
+             {} generic islands purged, {} multiword noise purged, {} fragment islands purged, {} concept islands purged, {} mistyped-person purged, {} low-conf concepts purged, {} participle-concepts purged, {} concepts→places, {} country-concat fixed, {} topic-prefix purged, {} prefix-noise merged, {} reversed-names merged, {} nickname-merged, {} transliteration-merged, {} concepts-reclassified-ext, {} graph-surname-reclassified, {} common-word-purged, {} surname-concepts-reclassified, {} common-english-person-purged, {} geo-person-reclassified, {} place-region-reclassified, {} compound-concept-reclassified, {} endash-reclassified, {} ancient-islands-purged, {} abbreviation-merged, {} concat-noise purged, {} token-reconnected, {} name-containment reconnected, {} single-word reconnected, {} cross-component merged, {} tfidf-reconnected, {} source-cohort reconnected, {} minute-cohort reconnected, {} large-cohort-type reconnected, {} domain-keyword reconnected, {} fact-value bridged, {} pred-obj-token reconnected, {} token-type reclassified, {} foreign-purged, {} hv-island-reconnected, {} hv-cohort-reconnected, {} surname-reconnected, {} source-url-reconnected, {} known-boosted, {} predicates refined, {} contextual-refined, {} contributed_to refined, {} related_to refined, {} contemporary_of refined, {} pioneered refined, {} active_in refined, {} weak contemporary demoted, {} redundant contemporary pruned, {} hypotheses promoted ({} accelerated), \
              {} fragment hypotheses cleaned, {} concat-entity hypotheses rejected, \
              {} mutual-exclusion ({}✓ {}✗), \
              {} cross-strategy reinforced, {} hypothesis pairs deduped, {} hypotheses capped, k-core: k={} with {} entities in dense backbone, \
@@ -5284,6 +5292,8 @@ impl<'a> Prometheus<'a> {
             nickname_merged,
             translit_merged,
             concepts_reclassified,
+            graph_surname_reclassified,
+            common_word_purged,
             surname_concepts_reclassified,
             common_english_purged,
             geo_reclassified,
@@ -6220,6 +6230,89 @@ impl<'a> Prometheus<'a> {
                         "myth",
                         "tell",
                         "swin",
+                        "administration",
+                        "allies",
+                        "animal",
+                        "attached",
+                        "browser",
+                        "bulbs",
+                        "career",
+                        "century",
+                        "channel",
+                        "chaos",
+                        "choice",
+                        "cities",
+                        "compare",
+                        "comprehensive",
+                        "computational",
+                        "computer",
+                        "concise",
+                        "connected",
+                        "construction",
+                        "copper",
+                        "dates",
+                        "discovery",
+                        "disorder",
+                        "doctoral",
+                        "elementary",
+                        "learn",
+                        "please",
+                        "similarly",
+                        "studies",
+                        "wayback",
+                        "furthermore",
+                        "nevertheless",
+                        "moreover",
+                        "otherwise",
+                        "essentially",
+                        "originally",
+                        "unfortunately",
+                        "hence",
+                        "likewise",
+                        "overview",
+                        "references",
+                        "contents",
+                        "introduction",
+                        "summary",
+                        "volume",
+                        "professor",
+                        "institute",
+                        "university",
+                        "museum",
+                        "temple",
+                        "examples",
+                        "images",
+                        "results",
+                        "resources",
+                        "progress",
+                        "research",
+                        "review",
+                        "guide",
+                        "standard",
+                        "structure",
+                        "pattern",
+                        "procedure",
+                        "practice",
+                        "growth",
+                        "spread",
+                        "controversy",
+                        "contribution",
+                        "cooperation",
+                        "exploration",
+                        "expressed",
+                        "estimate",
+                        "hypothesis",
+                        "literature",
+                        "philosophy",
+                        "religion",
+                        "grammar",
+                        "logic",
+                        "baronet",
+                        "basins",
+                        "beavers",
+                        "chronology",
+                        "combinatorial",
+                        "centers",
                     ];
                     let is_common_non_entity =
                         is_concept_or_unknown && common_non_entities.contains(&lower.as_str());
@@ -21409,6 +21502,17 @@ impl<'a> Prometheus<'a> {
             "sumatra",
             "borneo",
             "java",
+            "bahrain",
+            "balochistan",
+            "belgium",
+            "britain",
+            "china",
+            "india",
+            "atlantic",
+            "caspian",
+            "caucasus",
+            "chandigarh",
+            "bletchley",
         ]
         .iter()
         .copied()
@@ -21541,6 +21645,26 @@ impl<'a> Prometheus<'a> {
             "selim",
             "murad",
             "whittaker",
+            "newton",
+            "gödel",
+            "boltzmann",
+            "bose",
+            "bardeen",
+            "bednorz",
+            "belousov",
+            "besicovitch",
+            "champernowne",
+            "douady",
+            "cooper",
+            "cornell",
+            "asoka",
+            "banerji",
+            "allchin",
+            "clift",
+            "brooke",
+            "adams",
+            "alexander",
+            "barbara",
         ]
         .iter()
         .copied()
@@ -22563,6 +22687,482 @@ impl<'a> Prometheus<'a> {
             );
         }
         Ok(reclassified)
+    }
+
+    /// Reclassify single-word concept islands by matching against surnames of
+    /// well-connected person entities in the graph. If "Boltzmann" is isolated as
+    /// a concept but "Ludwig Boltzmann" exists as a connected person, reclassify
+    /// the island as a person (making it a merge candidate for later passes).
+    pub fn reclassify_concept_islands_by_graph_surnames(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        // Build surname → person-type map from connected entities
+        let mut surname_types: HashMap<String, &str> = HashMap::new();
+        for e in &entities {
+            if !connected.contains(&e.id) {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() >= 2 {
+                let surname = words.last().unwrap().to_lowercase();
+                if surname.len() > 3 {
+                    surname_types
+                        .entry(surname)
+                        .or_insert(match e.entity_type.as_str() {
+                            "person" => "person",
+                            "place" => "place",
+                            "organization" => "organization",
+                            _ => "person",
+                        });
+                }
+            }
+        }
+
+        let mut reclassified = 0usize;
+        for e in &entities {
+            if e.entity_type != "concept" || connected.contains(&e.id) {
+                continue;
+            }
+            let words: Vec<&str> = e.name.split_whitespace().collect();
+            if words.len() != 1 {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            if lower.len() <= 3 {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+
+            if let Some(&new_type) = surname_types.get(&lower) {
+                if new_type != e.entity_type.as_str() {
+                    self.brain.with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE entities SET entity_type = ?1 WHERE id = ?2",
+                            params![new_type, e.id],
+                        )?;
+                        Ok(())
+                    })?;
+                    reclassified += 1;
+                }
+            }
+        }
+
+        Ok(reclassified)
+    }
+
+    /// Purge concept islands that are common English words (capitalized due to
+    /// sentence-start extraction).
+    pub fn purge_common_word_concept_islands(&self) -> Result<usize> {
+        let entities = self.brain.all_entities()?;
+        let relations = self.brain.all_relations()?;
+        let connected: HashSet<i64> = relations
+            .iter()
+            .flat_map(|r| [r.subject_id, r.object_id])
+            .collect();
+
+        let common_words: HashSet<&str> = [
+            "abstract",
+            "academic",
+            "account",
+            "achievement",
+            "acquired",
+            "additional",
+            "advanced",
+            "affairs",
+            "agreement",
+            "analysis",
+            "ancient",
+            "annual",
+            "applied",
+            "approach",
+            "argument",
+            "article",
+            "aspect",
+            "attempt",
+            "attention",
+            "authority",
+            "available",
+            "basic",
+            "beginning",
+            "behind",
+            "between",
+            "biological",
+            "board",
+            "brief",
+            "called",
+            "capable",
+            "capital",
+            "central",
+            "challenge",
+            "characteristic",
+            "chief",
+            "classical",
+            "climate",
+            "colonial",
+            "combined",
+            "commission",
+            "committee",
+            "common",
+            "community",
+            "comparison",
+            "complex",
+            "component",
+            "concept",
+            "conclusion",
+            "condition",
+            "conference",
+            "conflict",
+            "congress",
+            "consequence",
+            "considerable",
+            "considered",
+            "contemporary",
+            "context",
+            "contrast",
+            "control",
+            "conventional",
+            "corresponding",
+            "council",
+            "course",
+            "critical",
+            "cultural",
+            "current",
+            "debate",
+            "decade",
+            "defined",
+            "definition",
+            "degree",
+            "democratic",
+            "department",
+            "described",
+            "description",
+            "designed",
+            "detail",
+            "determined",
+            "developed",
+            "development",
+            "different",
+            "digital",
+            "dimension",
+            "direction",
+            "discussion",
+            "distinct",
+            "division",
+            "document",
+            "domain",
+            "domestic",
+            "dominant",
+            "during",
+            "earlier",
+            "economic",
+            "edition",
+            "education",
+            "effective",
+            "element",
+            "emergence",
+            "empire",
+            "engaged",
+            "engineering",
+            "enterprise",
+            "environment",
+            "episode",
+            "equivalent",
+            "essential",
+            "established",
+            "european",
+            "evidence",
+            "evolution",
+            "examination",
+            "example",
+            "exchange",
+            "executive",
+            "exercise",
+            "exhibition",
+            "existence",
+            "expanded",
+            "experience",
+            "experiment",
+            "explanation",
+            "expression",
+            "extended",
+            "external",
+            "facility",
+            "factor",
+            "feature",
+            "federal",
+            "figure",
+            "finally",
+            "financial",
+            "following",
+            "foreign",
+            "formal",
+            "formation",
+            "former",
+            "foundation",
+            "framework",
+            "function",
+            "fundamental",
+            "general",
+            "generation",
+            "global",
+            "golden",
+            "government",
+            "graduate",
+            "greater",
+            "heritage",
+            "higher",
+            "historical",
+            "however",
+            "identical",
+            "impact",
+            "imperial",
+            "important",
+            "incident",
+            "included",
+            "including",
+            "independent",
+            "indigenous",
+            "individual",
+            "industrial",
+            "influence",
+            "initial",
+            "innovation",
+            "inspired",
+            "institution",
+            "instrument",
+            "intellectual",
+            "intelligence",
+            "intended",
+            "interaction",
+            "interest",
+            "internal",
+            "international",
+            "interpretation",
+            "intervention",
+            "introduced",
+            "invasion",
+            "investigation",
+            "involved",
+            "journal",
+            "knowledge",
+            "largely",
+            "launched",
+            "leading",
+            "legacy",
+            "legislation",
+            "length",
+            "limited",
+            "located",
+            "maintained",
+            "majority",
+            "managed",
+            "management",
+            "manual",
+            "material",
+            "mathematical",
+            "mechanism",
+            "medieval",
+            "meeting",
+            "member",
+            "memorial",
+            "method",
+            "migration",
+            "military",
+            "mineral",
+            "minister",
+            "ministry",
+            "mission",
+            "mobile",
+            "moderate",
+            "modern",
+            "modified",
+            "monarch",
+            "movement",
+            "multiple",
+            "municipal",
+            "national",
+            "natural",
+            "network",
+            "normally",
+            "northern",
+            "notable",
+            "nuclear",
+            "objective",
+            "observation",
+            "obtained",
+            "occurred",
+            "official",
+            "operation",
+            "opinion",
+            "opposition",
+            "ordered",
+            "original",
+            "otherwise",
+            "overall",
+            "pacific",
+            "parallel",
+            "parliament",
+            "particular",
+            "passage",
+            "period",
+            "permanent",
+            "personal",
+            "perspective",
+            "physical",
+            "planned",
+            "platform",
+            "political",
+            "popular",
+            "population",
+            "position",
+            "possible",
+            "potential",
+            "powerful",
+            "practical",
+            "presence",
+            "presented",
+            "previous",
+            "primary",
+            "principal",
+            "principle",
+            "produced",
+            "production",
+            "professional",
+            "program",
+            "project",
+            "prominent",
+            "promoted",
+            "proportion",
+            "proposed",
+            "protected",
+            "province",
+            "published",
+            "purpose",
+            "radical",
+            "reaction",
+            "received",
+            "recognition",
+            "recommended",
+            "recorded",
+            "recovery",
+            "reform",
+            "regional",
+            "regulation",
+            "related",
+            "relation",
+            "relative",
+            "released",
+            "religious",
+            "remained",
+            "remarkable",
+            "removed",
+            "replaced",
+            "reported",
+            "represented",
+            "republic",
+            "required",
+            "response",
+            "responsible",
+            "restored",
+            "resulted",
+            "returned",
+            "revealed",
+            "revolution",
+            "roman",
+            "scientific",
+            "section",
+            "selected",
+            "separate",
+            "sequence",
+            "served",
+            "service",
+            "session",
+            "settlement",
+            "several",
+            "significant",
+            "similar",
+            "situated",
+            "situation",
+            "social",
+            "solution",
+            "southern",
+            "special",
+            "specific",
+            "spirit",
+            "statement",
+            "station",
+            "strategic",
+            "subsequent",
+            "substantial",
+            "successful",
+            "sufficient",
+            "suggested",
+            "superior",
+            "supplied",
+            "supported",
+            "surface",
+            "survey",
+            "survived",
+            "technique",
+            "territory",
+            "theory",
+            "traditional",
+            "transfer",
+            "transition",
+            "treatment",
+            "tribal",
+            "triumph",
+            "typically",
+            "unified",
+            "unique",
+            "united",
+            "universal",
+            "various",
+            "version",
+            "victory",
+            "virtual",
+            "visible",
+            "vision",
+            "wealth",
+            "weapon",
+            "western",
+            "workshop",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let mut purged = 0usize;
+        for e in &entities {
+            if e.entity_type != "concept" || connected.contains(&e.id) {
+                continue;
+            }
+            if e.name.contains(' ') {
+                continue;
+            }
+            let facts = self.brain.get_facts_for(e.id)?;
+            if !facts.is_empty() {
+                continue;
+            }
+            let lower = e.name.to_lowercase();
+            if common_words.contains(lower.as_str()) {
+                self.brain.with_conn(|conn| {
+                    conn.execute("DELETE FROM entities WHERE id = ?1", params![e.id])?;
+                    Ok(())
+                })?;
+                purged += 1;
+            }
+        }
+
+        Ok(purged)
     }
 }
 
