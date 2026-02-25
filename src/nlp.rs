@@ -1391,6 +1391,11 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "lettre",
     "equal",
     "once",
+    // Added 2026-02-25 (brain cleaner round 2): misclassified/noise
+    "memoir",
+    "memoirs",
+    "workflow",
+    "operator",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -7116,7 +7121,10 @@ fn extract_capitalized_inner(
                     && (name.ends_with("ing")
                         || name.ends_with("ated")
                         || name.ends_with("ized")
-                        || name.ends_with("ised"))
+                        || name.ends_with("ised")
+                        || name.ends_with("edly")
+                        || name.ends_with("ably")
+                        || name.ends_with("ibly"))
                 {
                     i = j;
                     continue;

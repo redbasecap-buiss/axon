@@ -4671,7 +4671,7 @@ impl<'a> Prometheus<'a> {
         // 2d2. Community homophily (same type + same community + shared neighbors)
         let t1 = std::time::Instant::now();
         let ch_weight = self.get_pattern_weight("community_homophily")?;
-        if ch_weight >= 0.05 {
+        if ch_weight >= 0.05 && !suspended.contains("community_homophily") {
             let ch_hyps = self.generate_hypotheses_from_community_homophily()?;
             eprintln!(
                 "[PROMETHEUS] community_homophily: {} in {:?}",
@@ -5063,10 +5063,14 @@ impl<'a> Prometheus<'a> {
             // Skip hypotheses where entities share >50% of name tokens (too similar to be a discovery)
             // e.g., "Royal Society of London" ↔ "Royal Society of Edinburgh" share 3/4 tokens
             if h.object != "?" {
-                let s_tokens: HashSet<&str> = h.subject.split_whitespace()
+                let s_tokens: HashSet<&str> = h
+                    .subject
+                    .split_whitespace()
                     .filter(|w| w.len() > 2)
                     .collect();
-                let o_tokens: HashSet<&str> = h.object.split_whitespace()
+                let o_tokens: HashSet<&str> = h
+                    .object
+                    .split_whitespace()
                     .filter(|w| w.len() > 2)
                     .collect();
                 if s_tokens.len() >= 2 && o_tokens.len() >= 2 {
@@ -11441,12 +11445,21 @@ impl<'a> Prometheus<'a> {
                     if !seen.insert(key) {
                         continue;
                     }
-                    // Require at least 3 shared neighbors (structural evidence)
-                    // Raised from 2 to reduce false positives (19.9% → target 30%+)
+                    // Require at least 5 shared neighbors AND Jaccard neighbor
+                    // overlap ≥ 0.15 to reduce false positives (was 19.7% conf rate)
                     let a_nb = adj.get(&a).cloned().unwrap_or_default();
                     let b_nb = adj.get(&b).cloned().unwrap_or_default();
                     let shared_nbrs: Vec<i64> = a_nb.intersection(&b_nb).copied().collect();
-                    if shared_nbrs.len() < 3 {
+                    if shared_nbrs.len() < 5 {
+                        continue;
+                    }
+                    let union_size = a_nb.union(&b_nb).count();
+                    let nbr_jaccard = if union_size > 0 {
+                        shared_nbrs.len() as f64 / union_size as f64
+                    } else {
+                        0.0
+                    };
+                    if nbr_jaccard < 0.15 {
                         continue;
                     }
 
@@ -11478,7 +11491,7 @@ impl<'a> Prometheus<'a> {
                     let a_name = self.entity_name(a)?;
                     let b_name = self.entity_name(b)?;
                     let shared = shared_nbrs.len();
-                    let conf = (0.55 + 0.05 * shared.min(6) as f64).min(0.85);
+                    let conf = (0.50 + 0.04 * shared.min(8) as f64 + nbr_jaccard * 0.15).min(0.85);
 
                     hypotheses.push(Hypothesis {
                         id: 0,
@@ -11487,8 +11500,8 @@ impl<'a> Prometheus<'a> {
                         object: b_name.clone(),
                         confidence: conf,
                         evidence_for: vec![format!(
-                            "Same community, same type ({}), {} shared neighbors",
-                            etype, shared
+                            "Same community, same type ({}), {} shared neighbors, Jaccard={:.2}",
+                            etype, shared, nbr_jaccard
                         )],
                         evidence_against: vec![],
                         reasoning_chain: vec![
@@ -13219,9 +13232,9 @@ impl<'a> Prometheus<'a> {
                         continue;
                     }
                     let jaccard = shared as f64 / total as f64;
-                    // Tighter thresholds: need high overlap (>=0.75) and at least 6 shared predicates
-                    // to reduce noise — this strategy had only ~12% confirmation rate with looser thresholds
-                    if jaccard < 0.75 || shared < 6 {
+                    // Very tight thresholds: need high overlap (>=0.85) and at least 8 shared predicates
+                    // Previous thresholds (0.75/6) still had only 12% confirmation rate
+                    if jaccard < 0.85 || shared < 8 {
                         continue;
                     }
 
@@ -13250,15 +13263,8 @@ impl<'a> Prometheus<'a> {
                             .and_then(|objs| objs.first())
                             .cloned()
                             .unwrap_or_else(|| "?".to_string());
-                        let confidence = self
-                            .calibrated_confidence(
-                                "predicate_transfer",
-                                (0.3 + jaccard * 0.3).min(0.75),
-                            )
-                            .unwrap_or(0.45);
                         // Analogical object inference: if A→pred→obj, try to predict
                         // that B→pred→obj (same object) or B→pred→type-compatible object.
-                        // This dramatically improves validation vs object="?".
                         let all_objects = pred_objects
                             .get(&(a, missing_pred.clone()))
                             .cloned()
@@ -13270,6 +13276,16 @@ impl<'a> Prometheus<'a> {
                             .max_by_key(|o| o.len())
                             .cloned()
                             .unwrap_or_else(|| "?".to_string());
+                        // Skip hypotheses with unknown object — they can't be validated
+                        if best_object == "?" {
+                            continue;
+                        }
+                        let confidence = self
+                            .calibrated_confidence(
+                                "predicate_transfer",
+                                (0.3 + jaccard * 0.3).min(0.75),
+                            )
+                            .unwrap_or(0.45);
 
                         hypotheses.push(Hypothesis {
                             id: 0,
@@ -13319,12 +13335,6 @@ impl<'a> Prometheus<'a> {
                             .and_then(|objs| objs.first())
                             .cloned()
                             .unwrap_or_else(|| "?".to_string());
-                        let confidence = self
-                            .calibrated_confidence(
-                                "predicate_transfer",
-                                (0.3 + jaccard * 0.3).min(0.75),
-                            )
-                            .unwrap_or(0.45);
                         // Analogical object inference for B→A direction
                         let all_objects_b = pred_objects
                             .get(&(b, missing_pred.clone()))
@@ -13336,6 +13346,16 @@ impl<'a> Prometheus<'a> {
                             .max_by_key(|o| o.len())
                             .cloned()
                             .unwrap_or_else(|| "?".to_string());
+                        // Skip hypotheses with unknown object
+                        if best_object_b == "?" {
+                            continue;
+                        }
+                        let confidence = self
+                            .calibrated_confidence(
+                                "predicate_transfer",
+                                (0.3 + jaccard * 0.3).min(0.75),
+                            )
+                            .unwrap_or(0.45);
 
                         hypotheses.push(Hypothesis {
                             id: 0,

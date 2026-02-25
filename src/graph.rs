@@ -6185,10 +6185,14 @@ pub fn entity_age_days(brain: &Brain, entity_id: i64) -> Result<Option<i64>, rus
         );
         match result {
             Ok(first_seen) => {
-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&first_seen, "%Y-%m-%d %H:%M:%S") {
+                if let Ok(dt) =
+                    chrono::NaiveDateTime::parse_from_str(&first_seen, "%Y-%m-%d %H:%M:%S")
+                {
                     let now = chrono::Utc::now().naive_utc();
                     Ok(Some((now - dt).num_days()))
-                } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&first_seen, "%Y-%m-%dT%H:%M:%S") {
+                } else if let Ok(dt) =
+                    chrono::NaiveDateTime::parse_from_str(&first_seen, "%Y-%m-%dT%H:%M:%S")
+                {
                     let now = chrono::Utc::now().naive_utc();
                     Ok(Some((now - dt).num_days()))
                 } else {
