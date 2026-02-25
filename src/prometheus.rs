@@ -3867,6 +3867,67 @@ impl<'a> Prometheus<'a> {
 
     /// Get calibrated initial confidence for a pattern source.
     /// Uses historical confirmation rate as Bayesian prior, with smoothing.
+    /// Check if a specific (strategy, predicate) combination should be blocked
+    /// based on empirical rejection rates. Returns true if the combination has
+    /// ≥10 samples and >30% rejection rate.
+    pub fn should_block_predicate(&self, strategy: &str, predicate: &str) -> bool {
+        let result: Result<(i64, i64)> = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT
+                    SUM(CASE WHEN status='confirmed' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END)
+                 FROM hypotheses
+                 WHERE pattern_source = ?1 AND predicate = ?2
+                   AND status IN ('confirmed','rejected')",
+            )?;
+            let (conf, rej): (i64, i64) = stmt.query_row(params![strategy, predicate], |row| {
+                Ok((
+                    row.get::<_, i64>(0).unwrap_or(0),
+                    row.get::<_, i64>(1).unwrap_or(0),
+                ))
+            })?;
+            Ok((conf, rej))
+        });
+        if let Ok((conf, rej)) = result {
+            let total = conf + rej;
+            if total >= 10 {
+                let rej_rate = rej as f64 / total as f64;
+                return rej_rate > 0.30;
+            }
+        }
+        false
+    }
+
+    /// Get all blocked (strategy, predicate) combinations from empirical data.
+    /// Returns a set for O(1) lookup during hypothesis generation.
+    pub fn blocked_predicate_strategies(&self) -> HashSet<(String, String)> {
+        let result: Result<Vec<(String, String, i64, i64)>> = self.brain.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT pattern_source, predicate,
+                    SUM(CASE WHEN status='confirmed' THEN 1 ELSE 0 END) as conf,
+                    SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) as rej
+                 FROM hypotheses
+                 WHERE status IN ('confirmed','rejected')
+                 GROUP BY pattern_source, predicate
+                 HAVING (conf + rej) >= 10
+                    AND CAST(rej AS REAL) / (conf + rej) > 0.30",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        });
+        match result {
+            Ok(rows) => rows.into_iter().map(|(s, p, _, _)| (s, p)).collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
     /// New/unknown sources get 0.5 (neutral), proven sources get boosted,
     /// unreliable sources get suppressed.
     pub fn calibrated_confidence(&self, pattern_source: &str, base: f64) -> Result<f64> {
@@ -5195,6 +5256,23 @@ impl<'a> Prometheus<'a> {
                 .hypothesis_exists(&h.subject, &h.predicate, &h.object)
                 .unwrap_or(true)
         });
+
+        // Meta-learned predicate blocker: auto-reject (strategy, predicate) combos
+        // with >30% rejection rate over ≥10 samples.
+        let blocked_combos = self.blocked_predicate_strategies();
+        if !blocked_combos.is_empty() {
+            let pre_block = all_hypotheses.len();
+            all_hypotheses.retain(|h| {
+                !blocked_combos.contains(&(h.pattern_source.clone(), h.predicate.clone()))
+            });
+            let blocked_count = pre_block - all_hypotheses.len();
+            if blocked_count > 0 {
+                eprintln!(
+                    "[PROMETHEUS] Meta-learned predicate blocker: filtered {} hypotheses from {} blocked (strategy,predicate) combos",
+                    blocked_count, blocked_combos.len()
+                );
+            }
+        }
 
         // Strategy diversity balancer: cap per-strategy contributions to ensure
         // underrepresented strategies get room. Max 40% from any single strategy.
