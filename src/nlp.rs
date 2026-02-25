@@ -1467,6 +1467,46 @@ const ENTITY_BLACKLIST: &[&str] = &[
     "chapitre",
     "decameron",
     "enigma",
+    // Added 2026-02-25 (brain cleaner): generic/demonym/academic noise
+    "hypothesis",
+    "hypotheses",
+    "ionospheric",
+    "bulgarians",
+    "nachdruck",
+    "jacobian",
+    "colours",
+    "exoplanets",
+    "photography",
+    "airglow",
+    "universe",
+    "thespians",
+    "mathematik",
+    "venusian",
+    "abnormal",
+    "ultraviolet",
+    "aenianes",
+    "converter",
+    "changes",
+    "legends",
+    "wayback",
+    "heliophysics",
+    "inclined",
+    "finnish",
+    "swedish",
+    "norwegian",
+    "auroras",
+    "extrait",
+    "recorded",
+    "keograms",
+    "revontulien",
+    "katharevousa",
+    "perioeci",
+    "lacedaemonians",
+    "pylagorai",
+    "phocians",
+    "corinthians",
+    "amphictyony",
+    "ngarrindjeri",
 ];
 
 /// Common person name prefixes/titles for entity classification.
@@ -5774,6 +5814,24 @@ fn is_valid_entity(name: &str, etype: &str) -> bool {
 fn classify_entity_type(name: &str) -> &'static str {
     let lower = name.to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
+
+    // CVE identifiers → technology
+    if name.starts_with("CVE-") && name.len() > 8 {
+        return "technology";
+    }
+
+    // Patent numbers (e.g. "US11025421B2") → technology
+    if name.len() > 8
+        && (name.starts_with("US") || name.starts_with("EP") || name.starts_with("WO"))
+        && name
+            .chars()
+            .skip(2)
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
+        && name.chars().filter(|c| c.is_ascii_digit()).count() >= 5
+    {
+        return "technology";
+    }
 
     // En-dash/hyphen-joined names without spaces are typically mathematical theorems or
     // dual-author concepts (e.g. "Riesz–Thorin", "Bohr-Heisenberg", "Gauss-Kuzmin")
