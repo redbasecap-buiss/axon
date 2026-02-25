@@ -7199,6 +7199,22 @@ impl<'a> Prometheus<'a> {
                 }
             }
 
+            // Fast-track same_as hypotheses: these are name-similarity-based merge
+            // signals that can't be validated through path/evidence checks (the
+            // isolated entity has no relations by definition). Confirm if confidence
+            // meets the lowered same_as threshold (0.60).
+            if h.predicate == "same_as" && h.confidence >= 0.60 {
+                self.update_hypothesis_status(h.id, HypothesisStatus::Confirmed)?;
+                self.record_outcome(&h.pattern_source, true)?;
+                let evidence = vec![
+                    format!("Name-similarity merge signal: {} ≈ {}", h.subject, h.object),
+                    format!("Pattern source: {}", h.pattern_source),
+                ];
+                let _ = self.save_discovery(h.id, &evidence);
+                confirmed += 1;
+                continue;
+            }
+
             // Age-based stale rejection: hypotheses stuck in testing for >48 hours
             // without accumulating evidence are likely noise. Reject low-confidence
             // stale hypotheses; promote high-confidence ones that haven't been
